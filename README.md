@@ -1,161 +1,193 @@
-# Continuity Studio
+<div align="center">
 
-In-universe image-sequence engine with **bulk prompts**, **bulk character
-sheets**, **Claude-powered script generation**, **prompts-from-video** (Claude
-vision), **scene detection** (ffmpeg), and **audio-aware video editing** (Claude
-plans the cut, ffmpeg assembles the MP4).
+# 🎬 Continuity Studio
 
-Two backends, both via the **derouter** proxy:
+### AI-Powered Image-Sequence & Video Pipeline
 
-| Job | Endpoint | Model |
-|-----|----------|-------|
-| Image generate / edit | `https://api-direct.derouter.network/openai/v1` | `gpt-image-2` |
-| Claude (script, vision, edit planning) | `https://api.derouter.network/proxy` | `claude-sonnet-4-6` (or any 4.x) |
+<p>
+  <a href="#features"><img src="https://img.shields.io/badge/Features-blue?style=for-the-badge" alt="Features"></a>
+  <a href="#tech-stack"><img src="https://img.shields.io/badge/Stack-FastAPI%20%2B%20FFmpeg%20%2B%20Claude-green?style=for-the-badge" alt="Stack"></a>
+  <a href="#quick-start"><img src="https://img.shields.io/badge/Quick_Start-5_min-orange?style=for-the-badge" alt="Quick Start"></a>
+  <a href="https://github.com/sharmiladevi888/continuity-studio-automation"><img src="https://img.shields.io/badge/GitHub-Repo-black?style=for-the-badge&logo=github" alt="Repo"></a>
+</p>
 
----
-
-**Tab order:** `01 Universe · 02 Script Generator · 03 Characters · 04 Sequence · 05 Edit`.
-A **⤓ Export ZIP** button (top-right) bundles the whole project — script, voice-over,
-character prompts, scene prompts, generated character sheets and rendered frames — into
-one downloadable folder.
+<p>
+  <img src="https://img.shields.io/badge/Status-Live-success?style=for-the-badge" alt="Status">
+  <img src="https://img.shields.io/badge/OS-Windows%2010%2F11-blue?style=for-the-badge" alt="OS">
+  <img src="https://img.shields.io/badge/License-Personal%20%2F%20Demo-lightgrey?style=for-the-badge" alt="License">
+</p>
 
 ---
 
-## What's new vs the original
+</div>
 
-0. **Tab 02 — Script Generator** (new)
-   - Give a **title** + a **description of how the video should be**, choose a
-     **Claude model** (default `claude-opus-4-8`), set **pacing** (sec/image) and
-     **target duration**. Claude returns a **voice-over script**, exactly
-     `round(duration / pacing)` **paced scenes** (one image each, with the VO slice
-     for that image), and **packed per-character sheet prompts**.
-   - One click pushes character prompts → Characters bulk gen, and scene prompts →
-     Sequence batch. Everything also exports as a project ZIP.
+## 🧠 What is it?
 
-1. **Tab 03 — Characters**
-   - **Single generate** (as before).
-   - **Bulk generate** — paste many characters separated by blank lines (first
-     line is the name, rest is description). Generates a sheet for each.
-   - **Load existing sheet** — upload your own reference image to use as a
-     character sheet (no generation, no cost).
+**Continuity Studio** is an AI-native creative pipeline for generating consistent image sequences, character sheets, narrated scripts, and fully assembled videos.
 
-2. **Tab 04 — Sequence**
-   - **Single render** (as before).
-   - **Batch mode** — each line (or blank-line-separated block) becomes its
-     own prompt. Each prompt independently re-runs character matching, so
-     swapping `@Kael` for `@Mira` on the next line **swaps the reference sheet
-     automatically**. Continuity (previous frame + style anchors) is preserved
-     across the batch.
+It ties together **Claude (Anthropic)** for reasoning and **DeRouter** for image generation, all wrapped in a polished local web app.
 
-3. **Reference video → prompts** (in the Script tab)
-   - Extract frames in tab 01, Claude reads them and writes N matching image
-     prompts that recreate the look.
-
-4. **Tab 05 — Edit (Audio + Video)** (new)
-   - **🎙 Voice-over (ElevenLabs)** — turn the script's narration into real
-     spoken audio. Pick a voice from your ElevenLabs account, then either:
-     - **Whole script → audio track** — synthesizes one narration track and
-       drops it into the Audio slot; then Plan + Render as usual.
-     - **Per-scene → auto-timed video** — voices each numbered scene
-       separately, measures each clip, and builds a video where sequence frame
-       *N* is held for exactly the length of scene *N*'s line (no manual EDL).
-   - Or **upload audio** (mp3/wav/m4a/…) yourself. Claude looks at every
-     rendered frame + the audio length + your edit notes, returns an EDL (which
-     frame, what order, for how long, what transition).
-   - **Render video** — ffmpeg assembles the cut from your frames and muxes
-     the audio. Cut / fade / crossfade transitions supported.
-
-5. **Scene tools**
-   - **ffmpeg scene detection** in tab 01 (timestamps of cuts in your sample
-     clip).
-   - **Per-frame analyse** — point Claude at any frame and ask "what's the
-     lighting setup here?".
+> Designed for creators who want fast iteration between **prompt → image → voice → video**.
 
 ---
 
-## Setup
+## ⚡ Features
+
+<div align="center">
+
+| Feature | Description |
+|---------|-------------|
+| 🎨 **Bulk Image Generation** | Generate hundreds of frames with prompt batching and previous-frame continuity |
+| 🤖 **AI Script Generator** | Turn a title + concept into a paced script with voice-over lines |
+| 👤 **Character Sheets** | Auto-consistent character sheets for production pipelines |
+| 🎥 **Video → Prompts** | Upload a reference video; Claude Vision creates matching image prompts |
+| ✂️ **Scene Detection** | FFmpeg-powered cut detection and timestamp extraction |
+| 🗣️ **Voice-Over** | ElevenLabs integration for per-scene or full-script narration |
+| 🎞️ **Auto Edit + Render** | Claude plans the EDL, FFmpeg assembles the final MP4 |
+| 📦 **Project Export** | One-click ZIP export of assets, scripts, prompts, and renders |
+
+</div>
+
+---
+
+## 🛠️ Tech Stack
+
+<div align="center">
+
+| Layer | Tooling |
+|-------|---------|
+| **Frontend** | Vanilla JS, 5-tab app |
+| **Backend** | FastAPI + Uvicorn |
+| **Vision / LLM** | Claude Sonnet / Opus via Anthropic SDK + DeRouter proxy |
+| **Image Gen** | GPT-Image-2 via DeRouter |
+| **Audio** | ElevenLabs TTS |
+| **Video** | FFmpeg + FFprobe |
+| **Data** | Local JSON (`users.json`, `vault.json`, `project.json`) |
+| **Hosting** | Localhost + Cloudflare Tunnel (optional VPS deploy) |
+
+</div>
+
+---
+
+## 🧩 Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Continuity Studio                     │
+├──────────┬──────────┬──────────┬──────────┬─────────────┤
+│  01      │  02      │  03      │  04      │  05         │
+│ Universe │ Script   │ Chars    │ Sequence │ Edit        │
+│ & Tools  │ Gen      │          │          │ & Render    │
+└──────────┴──────────┴──────────┴──────────┴─────────────┘
+        ↓           ↓          ↓           ↓           ↓
+   ┌──────────────────────────────────────────────────────┐
+   │  FastAPI (app.py)                                    │
+   │  • derouter.py           Image Generation            │
+   │  • claude_client.py      Claude / Vision             │
+   │  • voice.py              ElevenLabs                  │
+   │  • pipeline.py           Prompts + continuity        │
+   │  • editor.py + video.py  FFmpeg assembly             │
+   └──────────────────────────────────────────────────────┘
+```
+
+---
+
+## 🚀 Quick Start
 
 ```bash
-cd continuity-studio
-python -m venv .venv && source .venv/bin/activate
+# 1. Clone
+git clone https://github.com/sharmiladevi888/continuity-studio-automation.git
+cd continuity-studio-automation
+
+# 2. Env
+cp .env.example .env
+
+# 3. Venv
+python -m venv .venv
+.venv\Scripts\activate   # Windows
+# source .venv/bin/activate   # macOS / Linux
+
+# 4. Install
 pip install -r requirements.txt
 
-cp .env.example .env          # edit and paste your keys
-```
-
-`.env` (the **same derouter key works for both** image + Claude):
-
-```
-DEROUTER_API_KEY=sk-...
-DEROUTER_BASE_URL=https://api-direct.derouter.network/openai/v1
-IMAGE_MODEL=gpt-image-2
-DEFAULT_SIZE=1536x1024
-DEFAULT_QUALITY=high
-MULTI_IMAGE_EDIT=true
-
-CLAUDE_API_KEY=sk-...        # same key as above
-CLAUDE_BASE_URL=https://api.derouter.network/proxy
-CLAUDE_MODEL=claude-opus-4-8
-```
-
-Or paste the key in the in-app **Settings** panel → **Test connection** verifies
-both APIs with a real authenticated call (not just a models list).
-
-You also need **ffmpeg** + **ffprobe** on `PATH` (the video tab, scene
-detection, and the editor all use it).
-
-## Run
-
-Windows — just double-click **`run.bat`** (installs deps on first run), or:
-
-```bash
+# 5. Run
 python -m uvicorn app:app --port 8000
 ```
 
-> ⚠️ Use **`python -m uvicorn`**, not a bare `uvicorn`. A stray `uvicorn.exe` on
-> PATH may belong to a different virtualenv that lacks Pillow and will crash with
-> `ModuleNotFoundError: No module named 'PIL'`.
-
-Open <http://localhost:8000>.
+Open 👉 **http://localhost:8000**
 
 ---
 
-## Pipeline reference
+## ⚙️ Configuration
 
-| Endpoint | Job |
-|---|---|
-| `POST /api/master` | save world bible |
-| `POST /api/video` | upload sample clip → extract frames (ffmpeg) |
-| `POST /api/scene-detect` | timestamps of scene changes (ffmpeg) |
-| `POST /api/style-frames` | mark selected frames as style anchors |
-| `POST /api/characters` | generate one character sheet |
-| `POST /api/characters/batch` | generate many sheets from one block of text |
-| `POST /api/characters/upload` | upload an existing image as a sheet |
-| `POST /api/generate` | render one frame (continuation engine) |
-| `POST /api/generate/batch` | render many frames; each line gets its own char matching |
-| `POST /api/script` | Claude: title+description → JSON script (VO + paced scenes + character prompts) |
-| `GET /api/script/character-prompts` | packed character prompts from current script |
-| `GET /api/export/package` | download whole project as a ZIP folder |
-| `POST /api/prompts-from-video` | Claude vision: reference frames → N image prompts |
-| `POST /api/analyse-scene` | Claude vision: describe one frame |
-| `GET /api/voices` | list the ElevenLabs voices on your account |
-| `POST /api/voiceover` | ElevenLabs: synthesize the whole script VO → one audio track (into the edit audio slot) |
-| `POST /api/voiceover/scenes` | ElevenLabs: one clip per scene → auto-timed MP4 (each frame held for its line) |
-| `POST /api/audio` | upload audio (probes duration with ffprobe) |
-| `POST /api/edit-plan` | Claude: frames + audio length + brief → EDL |
-| `POST /api/render-video` | ffmpeg: assemble final MP4 from EDL + audio |
+All keys are handled via the in-app **Settings** panel and stored locally in `vault.json`.  
+No API keys are committed to Git.
 
-## File map
+```txt
+# Example .env structure (not tracked)
+DEROUTER_API_KEY=sk-...
+CLAUDE_BASE_URL=https://api.derouter.network/proxy
+CLAUDE_MODEL=claude-sonnet-4-6
+ELEVENLABS_API_KEY=...
+```
 
-| File | Role |
-|------|------|
-| `app.py` | FastAPI routes |
-| `derouter.py` | gpt-image-2 client (OpenAI-compatible) |
-| `claude_client.py` | Claude client via Anthropic SDK + derouter proxy |
-| `voice.py` | ElevenLabs text-to-speech client (list voices, synthesize) |
-| `pipeline.py` | name matching, prompt assembly, batch parsing, contact sheet |
-| `editor.py` | ffmpeg scene detection + video assembly |
-| `video.py` | ffmpeg frame extraction |
-| `store.py` | JSON state + media persistence under `data/` |
-| `config.py` | env-driven settings |
-| `static/index.html` | the whole UI (vanilla JS, 5 tabs) |
+---
+
+## 📁 Project Map
+
+```
+├── app.py              # FastAPI routes and auth middleware
+├── derouter.py         # GPT-Image-2 client
+├── claude_client.py    # Anthropic SDK + DeRouter proxy
+├── voice.py            # ElevenLabs client
+├── pipeline.py         # Prompt assembly, batch parsing, continuity
+├── editor.py           # Scene detection and video assembly
+├── video.py            # FFmpeg frame extraction
+├── store.py            # State + asset persistence under data/
+├── config.py           # Env-driven settings
+├── static/
+│   └── index.html      # Full UI (5-tab studio)
+├── data/               # Generated assets, uploads, renders
+├── codes.json          # Beta access codes
+├── users.json          # Registered users
+└── vault.json          # Local API key storage (not committed)
+```
+
+---
+
+## 🔌 API Reference
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| `POST` | `/api/auth` | Gmail login / registration |
+| `POST` | `/api/master` | Save world bible / master prompt |
+| `POST` | `/api/video` | Upload clip → extract frames |
+| `POST` | `/api/scene-detect` | Detect scene changes |
+| `POST` | `/api/characters` | Generate single character sheet |
+| `POST` | `/api/characters/batch` | Bulk character generation |
+| `POST` | `/api/generate` | Render one frame |
+| `POST` | `/api/generate/batch` | Batch render with continuity |
+| `POST` | `/api/script` | Claude script generator |
+| `POST` | `/api/edit-plan` | Claude EDL planning |
+| `POST` | `/api/render-video` | FFmpeg final render |
+| `GET`  | `/api/export/package` | ZIP download |
+
+---
+
+## 🧪 Notes
+
+- **Portable:** Designed for localhost-first; deploy anywhere with Python 3.11+
+- **Cost-aware:** Each `gpt-image-2` high render is tracked; batch scripts avoid orphaned workers
+- **No external DB:** Uses local JSON for users, vault, and project state
+- **Cloudflare-ready:** Tunnels for external access without router config
+
+---
+
+<div align="center">
+
+Built with 🖤 for the continuity-first creative workflow.
+
+<br/>
+<a href="https://github.com/sharmiladevi888/continuity-studio-automation"> ⭐ Star on GitHub </a>
+
+</div>
