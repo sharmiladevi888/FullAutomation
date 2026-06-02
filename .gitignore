@@ -1,0 +1,25 @@
+# Secrets — NEVER commit the real key. Use .env.example as the template.
+.env
+
+# Generated project assets + state (large, user-specific, not source).
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Throwaway verification scratch files
+_verify*.py
+_verify*.txt
+_verify*.png
+_run.log
