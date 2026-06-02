@@ -26,6 +26,15 @@ CLAUDE_API_KEY = _get("CLAUDE_API_KEY", _get("ANTHROPIC_API_KEY", ""))
 CLAUDE_BASE_URL = _get("CLAUDE_BASE_URL", "https://api.derouter.network/proxy")
 CLAUDE_MODEL = _get("CLAUDE_MODEL", "claude-sonnet-4-6")
 
+# --- ElevenLabs (voice-over text-to-speech) --------------------------------
+# Turns the script's voice-over text into real spoken audio. Get a key at
+# https://elevenlabs.io (Profile -> API key). Can also be pasted in Settings.
+ELEVENLABS_API_KEY = _get("ELEVENLABS_API_KEY", "")
+ELEVENLABS_BASE_URL = _get("ELEVENLABS_BASE_URL", "https://api.elevenlabs.io/v1")
+# Default voice id (public "Rachel"). The Edit tab lists your account's voices.
+ELEVENLABS_VOICE_ID = _get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
+ELEVENLABS_MODEL = _get("ELEVENLABS_MODEL", "eleven_multilingual_v2")
+
 # --- default render settings -----------------------------------------------
 DEFAULT_SIZE = _get("DEFAULT_SIZE", "1536x1024")
 DEFAULT_QUALITY = _get("DEFAULT_QUALITY", "high")

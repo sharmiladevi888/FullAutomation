@@ -129,10 +129,16 @@ class ClaudeClient:
         }
         if system:
             kwargs["system"] = system
-        _log(f"messages.create model={self.model} max_tokens={max_tokens} "
+        _log(f"messages.stream model={self.model} max_tokens={max_tokens} "
              f"blocks={len(content_blocks)} base={self.base_url}")
+        # STREAM the response. Large outputs (a long paced script, vision edit
+        # plans) can take minutes to generate; a non-streaming call sits idle
+        # and the derouter proxy / Cloudflare edge drops the connection (~100s)
+        # before the JSON is complete, which surfaced as "script generation
+        # failed". Streaming keeps bytes flowing so the request never idles out.
         try:
-            resp = self._sdk.messages.create(**kwargs)
+            with self._sdk.messages.stream(**kwargs) as stream:
+                resp = stream.get_final_message()
         except (APIConnectionError, APITimeoutError) as e:
             raise RuntimeError(
                 f"could not reach Claude API at {self.base_url} — {self._format_err(e)}"
@@ -149,7 +155,13 @@ class ClaudeClient:
         for block in resp.content:
             if getattr(block, "type", None) == "text":
                 out.append(block.text)
-        return "\n".join(out).strip()
+        text = "\n".join(out).strip()
+        # If the model ran out of room, the JSON is truncated → parsing fails
+        # downstream with a confusing error. Surface the real cause instead.
+        if getattr(resp, "stop_reason", None) == "max_tokens":
+            _log(f"WARNING stop_reason=max_tokens (output hit the {max_tokens} "
+                 f"cap; response likely truncated)")
+        return text
 
     @staticmethod
     def _image_block(image_bytes: bytes, media_type: str = "image/png"):

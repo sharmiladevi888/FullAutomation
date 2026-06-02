@@ -33,7 +33,8 @@ _DEFAULT_STATE = {
     "sequence": [],        # [{id, index, prompt, full_prompt, image_url, ...}]
     "script": None,        # {title, logline, scenes:[{n, heading, action, prompt}]}
     "suggested_prompts": [], # raw prompts produced by Claude (vision-from-video)
-    "audio": None,         # {id, url, name, duration}
+    "audio": None,         # {id, url, name, duration}  (current edit audio track)
+    "voiceover": None,     # {id, url, voice_id, voice_name, mode, scenes, created}
     "edits": [],           # [{id, url, audio_id, transition, plan, created}]
 }
 

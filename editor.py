@@ -59,9 +59,10 @@ def assemble_video(
     audio_path: Optional[str],
     output_path: str,
     transition: str = "cut",   # cut | fade | crossfade
-    width: int = 1536,
-    height: int = 1024,
+    width: int = 1920,
+    height: int = 1080,
     fps: int = 30,
+    fit: str = "fill",         # fill = crop to fill (no bars) | pad = letterbox
 ) -> str:
     """Stitch ``shots`` into a single MP4 with optional audio overlay.
 
@@ -82,10 +83,19 @@ def assemble_video(
     for i, sh in enumerate(shots):
         clip = os.path.join(tmp_dir, f"clip_{i:04d}.mp4")
         dur = max(0.1, float(sh.get("duration") or 0))
-        vf = (
-            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
-        )
+        if fit == "pad":
+            # letterbox: fit whole frame, black bars where aspect differs.
+            vf = (
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
+            )
+        else:
+            # fill: scale up to cover, then center-crop to the exact size — no
+            # black bars (best for a clean 16:9 / 9:16 slideshow).
+            vf = (
+                f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+                f"crop={width}:{height},setsar=1"
+            )
         if transition == "fade":
             fade_d = min(0.25, dur / 4)
             vf += f",fade=t=in:st=0:d={fade_d},fade=t=out:st={max(0,dur-fade_d):.3f}:d={fade_d}"

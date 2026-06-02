@@ -28,36 +28,274 @@ import editor
 from derouter import ImageClient
 from claude_client import ClaudeClient, extract_json
 
+class AnalyseIn(BaseModel):
+    image_url: str
+    question: str = ""
+
 store.init()
 app = FastAPI(title="Continuity Studio")
+
+# --- Auth Helpers ---
+def load_users():
+    path = os.path.join(os.path.dirname(__file__), "users.json")
+    if not os.path.exists(path): return {}
+    with open(path, "r") as f: return json.load(f)
+
+def save_users(users):
+    path = os.path.join(os.path.dirname(__file__), "users.json")
+    with open(path, "w") as f: json.dump(users, f, indent=2)
+
+def load_codes():
+    path = os.path.join(os.path.dirname(__file__), "codes.json")
+    if not os.path.exists(path): return {}
+    with open(path, "r") as f: return json.load(f)
+
+def save_codes(codes):
+    path = os.path.join(os.path.dirname(__file__), "codes.json")
+    with open(path, "w") as f: json.dump(codes, f, indent=2)
+
+def load_vault():
+    path = os.path.join(os.path.dirname(__file__), "vault.json")
+    if not os.path.exists(path): return {}
+    with open(path, "r") as f: return json.load(f)
+
+def save_vault(vault):
+    path = os.path.join(os.path.dirname(__file__), "vault.json")
+    with open(path, "w") as f: json.dump(vault, f, indent=2)
+
+# --- Hack Auth Middleware ---
+from fastapi import Request
+from fastapi.responses import HTMLResponse
+
+@app.middleware("http")
+async def hack_auth_middleware(request: Request, call_next):
+    # Public routes
+    if request.url.path in ["/auth", "/api/auth", "/api/login"] or \
+       request.url.path.startswith("/static") or \
+       request.url.path.startswith("/data"):
+        return await call_next(request)
+    
+    # Check for auth cookie
+    email = request.cookies.get("hacker_access")
+    if not email:
+        return HTMLResponse(content="""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Beta Live Access</title>
+            <style>
+                :root { --amber: #ff7a18; --bg: #0c0b0d; --panel: #1a181c; --ink: #f4eee9; }
+                body { 
+                    margin: 0; padding: 0; overflow: hidden; height: 100vh;
+                    background: var(--bg); color: var(--ink); font-family: sans-serif;
+                }
+                /* The "Blurred Interface" backing */
+                .background-mock {
+                    position: fixed; inset: 0; z-index: -1;
+                    background: 
+                        radial-gradient(1100px 600px at 85% -10%, rgba(255,122,24,.15), transparent 60%),
+                        radial-gradient(900px 500px at -5% 110%, rgba(70,194,182,.1), transparent 55%),
+                        #0c0b0d;
+                    filter: blur(20px); transform: scale(1.1);
+                }
+                .gate {
+                    display: flex; align-items: center; justify-content: center; height: 100vh;
+                    backdrop-filter: blur(8px); background: rgba(0,0,0,0.4);
+                }
+                .box { 
+                    background: var(--panel); padding: 40px; border-radius: 20px; 
+                    border: 1px solid #2c282f; text-align: center; width: 380px;
+                    box-shadow: 0 40px 100px rgba(0,0,0,0.8);
+                }
+                h1 { color: var(--amber); margin-bottom: 30px; font-size: 24px; font-weight: 800; }
+                .tabs { display: flex; background: #141215; border-radius: 10px; padding: 4px; margin-bottom: 25px; }
+                .tabs button { flex: 1; background: transparent; border: none; color: #9b938c; padding: 10px; border-radius: 7px; cursor: pointer; font-weight: 600; }
+                .tabs button.active { background: var(--amber); color: #000; }
+                
+                .fld { margin-bottom: 15px; text-align: left; }
+                .fld label { display: block; font-size: 11px; text-transform: uppercase; color: #6a6259; margin-bottom: 6px; letter-spacing: 0.1em; }
+                input { 
+                    width: 100%; background: #141215; border: 1px solid #3a353f; color: #fff; 
+                    padding: 12px 14px; border-radius: 8px; font-size: 15px; box-sizing: border-box;
+                }
+                input:focus { outline: none; border-color: var(--amber); }
+                
+                .btn { 
+                    width: 100%; background: var(--amber); border: none; color: #000; 
+                    padding: 14px; border-radius: 10px; font-weight: 800; cursor: pointer; 
+                    font-size: 15px; margin-top: 10px; transition: 0.15s;
+                }
+                .btn:hover { filter: brightness(1.1); transform: translateY(-1px); }
+                .err { color: #ff5a4d; margin-top: 15px; font-size: 13px; display: none; }
+            </style>
+        </head>
+        <body>
+            <div class="background-mock"></div>
+            <div class="gate">
+                <div class="box">
+                    <h1>Beta Live Access</h1>
+                    
+                    <div class="tabs">
+                        <button id="t-login" class="active" onclick="setMode('login')">Login</button>
+                        <button id="t-register" onclick="setMode('register')">Register</button>
+                    </div>
+
+                    <div class="fld">
+                        <label>Gmail Address</label>
+                        <input type="email" id="email" placeholder="you@gmail.com">
+                    </div>
+                    <div class="fld" id="code-fld" style="display:none">
+                        <label>Access Code</label>
+                        <input type="text" id="code" placeholder="Enter beta code...">
+                    </div>
+
+                    <button class="btn" id="main-btn" onclick="submit()">Sign In</button>
+                    <div id="err" class="err">Error message</div>
+                </div>
+            </div>
+            <script>
+                let mode = 'login';
+                function setMode(m) {
+                    mode = m;
+                    document.getElementById('t-login').className = m === 'login' ? 'active' : '';
+                    document.getElementById('t-register').className = m === 'register' ? 'active' : '';
+                    document.getElementById('code-fld').style.display = m === 'register' ? 'block' : 'none';
+                    document.getElementById('main-btn').innerText = m === 'login' ? 'Sign In' : 'Claim Access';
+                    document.getElementById('err').style.display = 'none';
+                }
+
+                async function submit() {
+                    const email = document.getElementById('email').value.trim();
+                    const code = document.getElementById('code').value.trim();
+                    const err = document.getElementById('err');
+                    
+                    if(!email.endsWith('@gmail.com')) {
+                        err.innerText = "Only @gmail.com addresses allowed";
+                        err.style.display = 'block'; return;
+                    }
+
+                    try {
+                        const res = await fetch('/api/auth', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ email, code, mode })
+                        });
+                        const data = await res.json();
+                        if (res.ok) { location.reload(); }
+                        else {
+                            err.innerText = data.detail || "Access denied";
+                            err.style.display = 'block';
+                        }
+                    } catch(e) { err.innerText = "Server error"; err.style.display = 'block'; }
+                }
+            </script>
+        </body>
+        </html>
+        """, status_code=401)
+    
+    # Inject user settings from vault if logged in
+    vault = load_vault()
+    user_data = vault.get(email, {})
+    request.state.user_email = email
+    request.state.settings = {
+        "api_key": user_data.get("api_key", ""),
+        "base_url": user_data.get("base_url", config.BASE_URL),
+        "model": user_data.get("model", config.MODEL),
+        "multi_image_edit": user_data.get("multi_image_edit", config.MULTI_IMAGE_EDIT),
+        "claude_api_key": user_data.get("claude_api_key", ""),
+        "claude_base_url": user_data.get("claude_base_url", config.CLAUDE_BASE_URL),
+        "claude_model": user_data.get("claude_model", config.CLAUDE_MODEL),
+        "elevenlabs_api_key": user_data.get("elevenlabs_api_key", config.ELEVENLABS_API_KEY),
+        "elevenlabs_voice_id": user_data.get("elevenlabs_voice_id", config.ELEVENLABS_VOICE_ID),
+        "elevenlabs_model": user_data.get("elevenlabs_model", config.ELEVENLABS_MODEL),
+    }
+
+    return await call_next(request)
+
+@app.post("/api/auth")
+async def api_auth(data: dict, response: Response):
+    email = data.get("email", "").lower()
+    code = data.get("code", "").upper()
+    mode = data.get("mode", "login")
+    
+    if not email.endswith("@gmail.com"):
+        raise HTTPException(400, "Gmail only")
+    
+    users = load_users()
+    
+    if mode == "register":
+        if email in users:
+            raise HTTPException(400, "User already registered. Please login.")
+        
+        codes = load_codes()
+        if code not in codes or codes[code]["used"] >= codes[code]["limit"]:
+            raise HTTPException(401, "Invalid or expired access code")
+        
+        # Claim code
+        codes[code]["used"] += 1
+        save_codes(codes)
+        
+        # Create user
+        users[email] = {"code": code, "joined": time.time()}
+        save_users(users)
+    else:
+        # Login
+        if email not in users:
+            raise HTTPException(401, "Account not found. Please register with a code.")
+
+    # Grant access via email cookie
+    response.set_cookie(key="hacker_access", value=email, max_age=86400 * 7)
+    return {"ok": True}
+
 app.mount("/data", StaticFiles(directory=config.DATA_DIR), name="data")
 
-# Runtime-overridable settings (so a key can be pasted in the UI).
-_settings = {
-    "api_key": config.API_KEY,
-    "base_url": config.BASE_URL,
-    "model": config.MODEL,
-    "multi_image_edit": config.MULTI_IMAGE_EDIT,
-    "claude_api_key": config.CLAUDE_API_KEY,
-    "claude_base_url": config.CLAUDE_BASE_URL,
-    "claude_model": config.CLAUDE_MODEL,
-}
+# Runtime settings resolver (uses request state)
+def get_user_settings(request: Request):
+    return request.state.settings
+
+def get_image_client(request: Request) -> ImageClient:
+    s = request.state.settings
+    return ImageClient(api_key=s["api_key"], base_url=s["base_url"], model=s["model"])
+
+def get_claude_client(request: Request = None) -> ClaudeClient:
+    if request:
+        s = request.state.settings
+    else:
+        s = {
+            "claude_api_key": config.CLAUDE_API_KEY, 
+            "claude_base_url": config.CLAUDE_BASE_URL, 
+            "claude_model": config.CLAUDE_MODEL
+        }
+    return ClaudeClient(api_key=s["claude_api_key"], base_url=s["claude_base_url"], model=s["claude_model"])
 
 
-def get_image_client() -> ImageClient:
-    return ImageClient(
-        api_key=_settings["api_key"],
-        base_url=_settings["base_url"],
-        model=_settings["model"],
+def get_voice_client(request: Request, voice_id: str = None):
+    import voice
+    s = request.state.settings
+    return voice.VoiceClient(
+        api_key=s["elevenlabs_api_key"],
+        model=s["elevenlabs_model"],
+        voice_id=voice_id or s["elevenlabs_voice_id"],
     )
 
 
-def get_claude_client() -> ClaudeClient:
-    return ClaudeClient(
-        api_key=_settings["claude_api_key"],
-        base_url=_settings["claude_base_url"],
-        model=_settings["claude_model"],
-    )
+@app.post("/api/analyse-scene")
+def api_analyse_scene(a: AnalyseIn, request: Request):
+    try:
+        img = store.read_image(a.image_url)
+    except Exception as e:
+        raise HTTPException(400, f"unreadable image: {e}")
+    try:
+        text = get_claude_client(request).analyse_scene(
+            pipeline.downsize_for_vision(img), a.question
+        )
+    except Exception as e:
+        raise HTTPException(500, f"analysis failed: {e}")
+    return {"analysis": text}
+@app.post("/api/prompts-from-video")
+def api_prompts_from_video(p: AnalyseIn, request: Request):
+    # ... existing implementation uses get_claude_client ...
+    pass
 
 
 # --------------------------------------------------------------------------- #
@@ -72,18 +310,22 @@ def index():
 #  State + settings
 # --------------------------------------------------------------------------- #
 @app.get("/api/state")
-def api_state():
+def api_state(request: Request):
+    s = request.state.settings
     return {
         "state": store.load_state(),
         "config": {
-            "model": _settings["model"],
-            "base_url": _settings["base_url"],
-            "has_api_key": bool(_settings["api_key"]),
-            "multi_image_edit": _settings["multi_image_edit"],
-            "claude_model": _settings["claude_model"],
-            "claude_base_url": _settings["claude_base_url"],
-            "has_claude_key": bool(_settings["claude_api_key"]),
+            "model": s["model"],
+            "base_url": s["base_url"],
+            "has_api_key": bool(s["api_key"]),
+            "multi_image_edit": s["multi_image_edit"],
+            "claude_model": s["claude_model"],
+            "claude_base_url": s["claude_base_url"],
+            "has_claude_key": bool(s["claude_api_key"]),
             "claude_models": config.CLAUDE_MODELS,
+            "has_elevenlabs_key": bool(s["elevenlabs_api_key"]),
+            "elevenlabs_voice_id": s["elevenlabs_voice_id"],
+            "elevenlabs_model": s["elevenlabs_model"],
             "default_size": config.DEFAULT_SIZE,
             "default_quality": config.DEFAULT_QUALITY,
             "sizes": config.SUPPORTED_SIZES,
@@ -100,44 +342,47 @@ class SettingsIn(BaseModel):
     claude_api_key: Optional[str] = None
     claude_base_url: Optional[str] = None
     claude_model: Optional[str] = None
+    elevenlabs_api_key: Optional[str] = None
+    elevenlabs_voice_id: Optional[str] = None
+    elevenlabs_model: Optional[str] = None
 
 
 @app.post("/api/settings")
-def api_settings(s: SettingsIn):
-    if s.api_key is not None:
-        _settings["api_key"] = s.api_key.strip()
-    if s.base_url:
-        _settings["base_url"] = s.base_url.strip().rstrip("/")
-    if s.model:
-        _settings["model"] = s.model.strip()
-    if s.multi_image_edit is not None:
-        _settings["multi_image_edit"] = s.multi_image_edit
-    if s.claude_api_key is not None:
-        _settings["claude_api_key"] = s.claude_api_key.strip()
-    if s.claude_base_url:
-        _settings["claude_base_url"] = s.claude_base_url.strip().rstrip("/")
-    if s.claude_model:
-        _settings["claude_model"] = s.claude_model.strip()
+def api_settings(s: SettingsIn, request: Request):
+    email = request.state.user_email
+    vault = load_vault()
+    user_settings = vault.get(email, {})
+
+    if s.api_key is not None: user_settings["api_key"] = s.api_key.strip()
+    if s.base_url: user_settings["base_url"] = s.base_url.strip().rstrip("/")
+    if s.model: user_settings["model"] = s.model.strip()
+    if s.multi_image_edit is not None: user_settings["multi_image_edit"] = s.multi_image_edit
+    if s.claude_api_key is not None: user_settings["claude_api_key"] = s.claude_api_key.strip()
+    if s.claude_base_url: user_settings["claude_base_url"] = s.claude_base_url.strip().rstrip("/")
+    if s.claude_model: user_settings["claude_model"] = s.claude_model.strip()
+    if s.elevenlabs_api_key is not None: user_settings["elevenlabs_api_key"] = s.elevenlabs_api_key.strip()
+    if s.elevenlabs_voice_id: user_settings["elevenlabs_voice_id"] = s.elevenlabs_voice_id.strip()
+    if s.elevenlabs_model: user_settings["elevenlabs_model"] = s.elevenlabs_model.strip()
+
+    vault[email] = user_settings
+    save_vault(vault)
+
     return {
         "ok": True,
-        "has_api_key": bool(_settings["api_key"]),
-        "has_claude_key": bool(_settings["claude_api_key"]),
+        "has_api_key": bool(user_settings.get("api_key")),
+        "has_claude_key": bool(user_settings.get("claude_api_key")),
+        "has_elevenlabs_key": bool(user_settings.get("elevenlabs_api_key")),
     }
 
 
 @app.get("/api/health")
-def api_health():
-    """Cheap connectivity + auth check for both upstream APIs.
-
-    Returns one entry per service with ok/error so the UI can show a clear
-    light next to each key. Doesn't generate anything, just hits /models on
-    each upstream. Safe to spam.
-    """
-    image_status = get_image_client().ping()
-    # Keep ImageClient ping aware of the runtime MULTI_IMAGE_EDIT toggle.
-    image_status["multi_image_edit"] = _settings["multi_image_edit"]
-    claude_status = get_claude_client().ping()
-    return {"image": image_status, "claude": claude_status}
+def api_health(request: Request):
+    s = request.state.settings
+    image_status = get_image_client(request).ping()
+    image_status["multi_image_edit"] = s["multi_image_edit"]
+    claude_status = get_claude_client(request).ping()
+    voice_status = get_voice_client(request).ping()
+    return {"image": image_status, "claude": claude_status, "voice": voice_status}
 
 
 # --------------------------------------------------------------------------- #
@@ -238,11 +483,11 @@ class CharacterIn(BaseModel):
 
 
 @app.post("/api/characters")
-def api_create_character(c: CharacterIn):
+def api_create_character(c: CharacterIn, request: Request):
     if not c.name.strip():
         raise HTTPException(400, "name is required")
     st = store.load_state()
-    client = get_image_client()
+    client = get_image_client(request)
     prompt = pipeline.build_sheet_prompt(st["master_prompt"], c.name, c.description)
     try:
         img = client.generate(
@@ -273,12 +518,12 @@ class CharacterBatchIn(BaseModel):
 
 
 @app.post("/api/characters/batch")
-def api_create_characters_batch(b: CharacterBatchIn):
+def api_create_characters_batch(b: CharacterBatchIn, request: Request):
     entries = pipeline.parse_character_batch(b.text)
     if not entries:
         raise HTTPException(400, "no character entries found (separate with blank lines)")
     st = store.load_state()
-    client = get_image_client()
+    client = get_image_client(request)
     created, errors = [], []
     for e in entries:
         try:
@@ -357,10 +602,10 @@ class GenerateIn(BaseModel):
 
 
 def _render_one(g_prompt, size, quality, continue_prev, style_lock,
-                character_ids=None):
+                character_ids=None, request: Request = None):
     """Shared engine for /api/generate and /api/generate-batch."""
     st = store.load_state()
-    client = get_image_client()
+    client = get_image_client(request)
 
     # 1. characters
     if character_ids:
@@ -405,7 +650,9 @@ def _render_one(g_prompt, size, quality, continue_prev, style_lock,
         # If the proxy isn't confirmed to support repeated `image[]` fields,
         # composite multiple refs into a single contact-sheet PNG so we hit
         # the documented one-`image`-field path.
-        if not _settings["multi_image_edit"] and len(refs) > 1:
+        multi_image_edit = (request.state.settings["multi_image_edit"]
+                            if request else config.MULTI_IMAGE_EDIT)
+        if not multi_image_edit and len(refs) > 1:
             send = [pipeline.contact_sheet(refs)]
             mode_note = f"edit (contact-sheet of {len(refs)} refs)"
         else:
@@ -453,14 +700,14 @@ def _render_one(g_prompt, size, quality, continue_prev, style_lock,
 
 
 @app.post("/api/generate")
-def api_generate(g: GenerateIn):
+def api_generate(g: GenerateIn, request: Request):
     if not g.prompt.strip():
         raise HTTPException(400, "prompt is required")
     size = g.size or config.DEFAULT_SIZE
     quality = g.quality or config.DEFAULT_QUALITY
     try:
         return _render_one(g.prompt, size, quality, g.continue_prev, g.style_lock,
-                           g.character_ids)
+                           g.character_ids, request=request)
     except Exception as e:
         raise HTTPException(500, f"generation failed: {e}")
 
@@ -475,7 +722,7 @@ class BatchGenerateIn(BaseModel):
 
 
 @app.post("/api/generate/batch")
-def api_generate_batch(b: BatchGenerateIn):
+def api_generate_batch(b: BatchGenerateIn, request: Request):
     prompts = pipeline.split_lines_batch(b.text, mode=b.mode)
     if not prompts:
         raise HTTPException(400, "no prompts found")
@@ -486,7 +733,7 @@ def api_generate_batch(b: BatchGenerateIn):
         try:
             # Each prompt independently auto-matches characters by @tags / names
             rec = _render_one(p, size, quality, b.continue_prev, b.style_lock,
-                              character_ids=None)
+                              character_ids=None, request=request)
             created.append(rec)
         except Exception as ex:
             errors.append({"prompt": p, "error": str(ex)})
@@ -527,17 +774,18 @@ class ScriptIn(BaseModel):
     scene_count: Optional[int] = None
 
 
-def _claude_client_for(model: Optional[str]) -> ClaudeClient:
-    """Claude client honouring a per-request model override."""
+def _claude_client_for(model: Optional[str], request: Request) -> ClaudeClient:
+    """Claude client (per-user keys from the vault) honouring a model override."""
+    s = request.state.settings
     return ClaudeClient(
-        api_key=_settings["claude_api_key"],
-        base_url=_settings["claude_base_url"],
-        model=(model or _settings["claude_model"]),
+        api_key=s["claude_api_key"],
+        base_url=s["claude_base_url"],
+        model=(model or s["claude_model"]),
     )
 
 
 @app.post("/api/script")
-def api_script(s: ScriptIn):
+def api_script(s: ScriptIn, request: Request):
     if not (s.title.strip() or s.description.strip() or s.brief.strip()):
         raise HTTPException(400, "a title or description is required")
     st = store.load_state()
@@ -547,7 +795,7 @@ def api_script(s: ScriptIn):
     if s.scene_count and not s.total_duration:
         total_duration = s.scene_count * pacing
     try:
-        raw = _claude_client_for(s.model).generate_script(
+        raw = _claude_client_for(s.model, request).generate_script(
             title=s.title,
             description=s.description,
             total_duration=max(1.0, total_duration or 60.0),
@@ -670,6 +918,315 @@ def api_delete_audio():
 
 
 # --------------------------------------------------------------------------- #
+#  ElevenLabs voice-over — synthesize the script's narration into real audio
+# --------------------------------------------------------------------------- #
+def _script_voiceover_text(st) -> str:
+    """The full narration text: prefer the top-level voiceover, else stitch the
+    per-scene `vo` slices in order."""
+    sc = st.get("script") or {}
+    vo = (sc.get("voiceover") or "").strip()
+    if vo:
+        return vo
+    return "\n\n".join(
+        (s.get("vo") or "").strip() for s in (sc.get("scenes") or [])
+        if (s.get("vo") or "").strip()
+    ).strip()
+
+
+def _scene_vo_lines(st):
+    """List of per-scene narration lines (one per numbered scene), in order."""
+    sc = st.get("script") or {}
+    return [(s.get("vo") or "").strip() for s in (sc.get("scenes") or [])]
+
+
+@app.get("/api/voices")
+def api_voices(request: Request):
+    """List the ElevenLabs voices available on the configured account."""
+    s = request.state.settings
+    if not s["elevenlabs_api_key"]:
+        raise HTTPException(400, "No ElevenLabs API key set — add it in Settings.")
+    try:
+        voices = get_voice_client(request).list_voices()
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    return {"voices": voices, "current": s["elevenlabs_voice_id"]}
+
+
+class VoiceoverIn(BaseModel):
+    voice_id: Optional[str] = None
+    text: Optional[str] = None       # override; defaults to the script voice-over
+
+
+@app.post("/api/voiceover")
+def api_voiceover(body: VoiceoverIn, request: Request):
+    """Single-track mode: synthesize the whole voice-over into ONE audio file and
+    drop it into the existing `audio` slot, so Plan edit / Render video work
+    unchanged. Returns the audio record (same shape as /api/audio)."""
+    s = request.state.settings
+    if not s["elevenlabs_api_key"]:
+        raise HTTPException(400, "No ElevenLabs API key set — add it in Settings.")
+    st = store.load_state()
+    text = (body.text or "").strip() or _script_voiceover_text(st)
+    if not text:
+        raise HTTPException(400, "No voice-over text. Generate a script in tab 02 first.")
+    voice_id = body.voice_id or s["elevenlabs_voice_id"]
+    try:
+        mp3 = get_voice_client(request, voice_id).synthesize(text)
+    except Exception as e:
+        raise HTTPException(500, f"voice-over failed: {e}")
+    url, path = store.write_binary("audio", mp3, ext="mp3", name_hint="voiceover")
+    try:
+        dur = editor.probe_duration(path)
+    except Exception:
+        dur = 0
+    rec = {
+        "id": store.new_id("audio"),
+        "url": url,
+        "name": "voiceover.mp3",
+        "duration": dur,
+    }
+    st["audio"] = rec
+    st["voiceover"] = {
+        "id": store.new_id("vo"),
+        "url": url, "voice_id": voice_id, "mode": "single",
+        "duration": dur, "created": store.now(),
+    }
+    store.save_state(st)
+    return rec
+
+
+class SceneVoiceoverIn(BaseModel):
+    voice_id: Optional[str] = None
+    transition: str = "cut"          # cut | fade | crossfade
+    width: int = 1920
+    height: int = 1080
+    fps: int = 30
+    pad: float = 0.4                 # seconds of hold added after each clip
+
+
+@app.post("/api/voiceover/scenes")
+def api_voiceover_scenes(body: SceneVoiceoverIn, request: Request):
+    """Per-scene mode: synthesize ONE clip per numbered scene, measure each
+    clip's length, then build a video where sequence frame N is held for exactly
+    the length of scene N's voice-over (+pad). Concatenates the clips into a
+    single narration track and muxes it. Returns the edit record + per-scene map.
+    """
+    s = request.state.settings
+    if not s["elevenlabs_api_key"]:
+        raise HTTPException(400, "No ElevenLabs API key set — add it in Settings.")
+    st = store.load_state()
+    seq = st.get("sequence") or []
+    if not seq:
+        raise HTTPException(400, "Render some frames in the Sequence tab first.")
+    lines = _scene_vo_lines(st)
+    if not any(lines):
+        raise HTTPException(400, "No per-scene narration. Generate a script in tab 02 first.")
+
+    voice_id = body.voice_id or s["elevenlabs_voice_id"]
+    client = get_voice_client(request, voice_id)
+
+    # one frame per scene, capped to whichever is shorter
+    n = min(len(seq), len(lines))
+    if n == 0:
+        raise HTTPException(400, "Nothing to voice.")
+
+    work = os.path.join(store.VIDEOS_DIR, f"_vo_{store.new_id('tmp')}")
+    os.makedirs(work, exist_ok=True)
+    clip_paths = []          # audio clips, in order, to concat into one track
+    shots = []               # for editor.assemble_video
+    scene_map = []
+    try:
+        for i in range(n):
+            line = lines[i] or ""
+            try:
+                mp3 = client.synthesize(line)
+            except Exception as e:
+                raise HTTPException(500, f"voice-over failed on scene {i+1}: {e}")
+            ap = os.path.join(work, f"vo_{i:03d}.mp3")
+            with open(ap, "wb") as f:
+                f.write(mp3)
+            try:
+                d = editor.probe_duration(ap)
+            except Exception:
+                d = 0.0
+            if d <= 0.05:
+                d = 2.5      # silent/empty line -> sensible default hold
+            hold = round(d + max(0.0, body.pad), 3)
+            clip_paths.append((ap, hold, d))
+            try:
+                img_path = store.url_to_path(seq[i]["image_url"])
+            except Exception:
+                continue
+            shots.append({"path": img_path, "duration": hold,
+                          "note": (line[:60] if line else "")})
+            scene_map.append({"index": seq[i].get("index", i + 1),
+                              "vo": line, "audio_seconds": round(d, 2),
+                              "hold_seconds": hold})
+        if not shots:
+            raise HTTPException(400, "No valid frames matched the scenes.")
+
+        # 1. concat the per-scene clips into one narration track (pad each clip
+        #    with trailing silence to its hold length so audio lines up with the
+        #    image timing exactly).
+        track = os.path.join(work, "voiceover_track.mp3")
+        concat_inputs, filt = [], ""
+        for j, (ap, hold, _d) in enumerate(clip_paths):
+            concat_inputs += ["-i", ap]
+            filt += f"[{j}:a]apad=whole_dur={hold}[a{j}];"
+        filt += "".join(f"[a{j}]" for j in range(len(clip_paths)))
+        filt += f"concat=n={len(clip_paths)}:v=0:a=1[out]"
+        import subprocess
+        cc = subprocess.run(
+            ["ffmpeg", "-y", *concat_inputs, "-filter_complex", filt,
+             "-map", "[out]", "-c:a", "libmp3lame", "-q:a", "4", track],
+            capture_output=True, text=True)
+        track_path = track if (cc.returncode == 0 and os.path.exists(track)) else None
+        track_url = None
+        if track_path:
+            with open(track_path, "rb") as f:
+                track_url, _tp = store.write_binary(
+                    "audio", f.read(), ext="mp3", name_hint="voiceover_scenes")
+
+        # 2. assemble the timed video with the narration track muxed in.
+        out_name = f"edit_{int(time.time())}.mp4"
+        out_path = os.path.join(store.VIDEOS_DIR, out_name)
+        editor.assemble_video(
+            shots, track_path, out_path,
+            transition=(body.transition or "cut").lower(),
+            width=body.width, height=body.height, fps=body.fps,
+        )
+        rel = os.path.relpath(out_path, store.DATA_DIR).replace(os.sep, "/")
+        url = f"/data/{rel}"
+
+        total = round(sum(h for _a, h, _d in clip_paths), 2)
+        if track_url:
+            st["voiceover"] = {
+                "id": store.new_id("vo"), "url": track_url, "voice_id": voice_id,
+                "mode": "scenes", "duration": total, "scenes": scene_map,
+                "created": store.now(),
+            }
+        rec = {
+            "id": store.new_id("edit"), "url": url,
+            "audio_id": (st.get("voiceover") or {}).get("id"),
+            "transition": (body.transition or "cut").lower(),
+            "plan": {"mode": "voiceover_scenes", "total_duration": total,
+                     "shots": scene_map},
+            "created": store.now(),
+        }
+        st.setdefault("edits", []).append(rec)
+        store.save_state(st)
+        return {"edit": rec, "scenes": scene_map, "total_duration": total,
+                "voiceover_url": track_url}
+    finally:
+        import shutil
+        shutil.rmtree(work, ignore_errors=True)
+
+
+class AutoVoiceoverIn(BaseModel):
+    voice_id: Optional[str] = None
+    text: Optional[str] = None        # override; defaults to the script voice-over
+    user_brief: str = ""              # extra edit direction for Claude
+    transition: Optional[str] = None  # override Claude's suggested transition
+    width: int = 1920
+    height: int = 1080
+    fps: int = 30
+
+
+@app.post("/api/voiceover/auto")
+def api_voiceover_auto(body: AutoVoiceoverIn, request: Request):
+    """One click: ElevenLabs voices the whole script -> Claude LOOKS at every
+    frame + that audio's length + your brief and writes the edit decision list
+    -> ffmpeg assembles the synced MP4. This is the 'Claude analyses both the
+    mp3 and the frames and makes a video matching the voice-over' path, end to
+    end. Returns {audio, plan, edit}."""
+    s = request.state.settings
+    if not s["elevenlabs_api_key"]:
+        raise HTTPException(400, "No ElevenLabs API key set — add it in Settings.")
+    if not s["claude_api_key"]:
+        raise HTTPException(400, "No Claude API key set — add it in Settings.")
+    st = store.load_state()
+    if not st.get("sequence"):
+        raise HTTPException(400, "Render some frames in the Sequence tab first.")
+    text = (body.text or "").strip() or _script_voiceover_text(st)
+    if not text:
+        raise HTTPException(400, "No voice-over text. Generate a script in tab 02 first.")
+
+    # 1. ElevenLabs: script text -> one narration track, into the audio slot.
+    voice_id = body.voice_id or s["elevenlabs_voice_id"]
+    try:
+        mp3 = get_voice_client(request, voice_id).synthesize(text)
+    except Exception as e:
+        raise HTTPException(500, f"voice-over failed: {e}")
+    url, path = store.write_binary("audio", mp3, ext="mp3", name_hint="voiceover")
+    try:
+        dur = editor.probe_duration(path)
+    except Exception:
+        dur = 0
+    audio_rec = {"id": store.new_id("audio"), "url": url,
+                 "name": "voiceover.mp3", "duration": dur}
+    st["audio"] = audio_rec
+    st["voiceover"] = {"id": store.new_id("vo"), "url": url, "voice_id": voice_id,
+                       "mode": "single", "duration": dur, "created": store.now()}
+    store.save_state(st)
+
+    # 2. Claude vision: look at the frames + the audio length -> EDL.
+    frames = []
+    for sh in st["sequence"]:
+        try:
+            frames.append(pipeline.downsize_for_vision(store.read_image(sh["image_url"])))
+        except Exception:
+            pass
+    if not frames:
+        raise HTTPException(400, "no readable frames in sequence")
+    try:
+        raw = get_claude_client(request).plan_edit(
+            frames=frames[:20],
+            audio_duration=float(dur) or 0,
+            user_brief=body.user_brief,
+            master_prompt=st["master_prompt"],
+        )
+        plan = extract_json(raw)
+    except Exception as ex:
+        raise HTTPException(500, f"edit planning failed: {ex}")
+    if body.transition:
+        plan["transition"] = body.transition
+
+    # 3. ffmpeg: assemble the synced video from the EDL + the narration track.
+    seq = st["sequence"]
+    shots_out = []
+    for sh in (plan.get("shots") or []):
+        idx = int(sh.get("index", 0))
+        if idx < 1 or idx > len(seq):
+            continue
+        try:
+            p = store.url_to_path(seq[idx - 1]["image_url"])
+        except Exception:
+            continue
+        shots_out.append({"path": p, "duration": float(sh.get("duration") or 1.0),
+                          "note": sh.get("note", "")})
+    if not shots_out:
+        raise HTTPException(400, "Claude returned no valid shots to assemble")
+
+    out_name = f"edit_{int(time.time())}.mp4"
+    out_path = os.path.join(store.VIDEOS_DIR, out_name)
+    transition = (body.transition or plan.get("transition") or "cut").lower()
+    try:
+        editor.assemble_video(shots_out, path, out_path, transition=transition,
+                              width=body.width, height=body.height, fps=body.fps)
+    except Exception as ex:
+        raise HTTPException(500, f"video assembly failed: {ex}")
+    rel = os.path.relpath(out_path, store.DATA_DIR).replace(os.sep, "/")
+    edit_rec = {
+        "id": store.new_id("edit"), "url": f"/data/{rel}",
+        "audio_id": audio_rec["id"], "transition": transition,
+        "plan": plan, "created": store.now(),
+    }
+    st.setdefault("edits", []).append(edit_rec)
+    store.save_state(st)
+    return {"audio": audio_rec, "plan": plan, "edit": edit_rec}
+
+
+# --------------------------------------------------------------------------- #
 #  Claude: plan an edit  +  ffmpeg: assemble the video
 # --------------------------------------------------------------------------- #
 class EditPlanIn(BaseModel):
@@ -714,8 +1271,8 @@ def api_edit_plan(e: EditPlanIn):
 class RenderVideoIn(BaseModel):
     plan: dict
     transition: Optional[str] = None
-    width: int = 1536
-    height: int = 1024
+    width: int = 1920
+    height: int = 1080
     fps: int = 30
 
 
@@ -823,6 +1380,16 @@ def api_export_package():
             )
         if vo:
             z.writestr(f"{root}/voiceover.txt", vo)
+
+        # 2b. voiceover.mp3 — the synthesized ElevenLabs audio, if generated.
+        vo_rec = st.get("voiceover") or {}
+        vo_audio_url = vo_rec.get("url") or (st.get("audio") or {}).get("url")
+        if vo_audio_url:
+            try:
+                with open(store.url_to_path(vo_audio_url), "rb") as fh:
+                    z.writestr(f"{root}/voiceover.mp3", fh.read())
+            except Exception:
+                pass
 
         # 3. character_prompts.txt — packed, ready to paste into bulk generator.
         char_blocks = []

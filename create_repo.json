@@ -1,0 +1,6 @@
+{
+  "name": "continuity-studio-automation",
+  "description": "Continuity Studio - AI-powered video/image generation pipeline with Claude + DeRouter integration",
+  "private": false,
+  "auto_init": false
+}

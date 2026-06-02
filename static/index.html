@@ -213,6 +213,12 @@
   .editvid video{width:100%; display:block; max-height:560px; background:#000}
 
   .twocol{display:grid; grid-template-columns:1fr 1fr; gap:18px}
+  .vo-panel{border:1px solid rgba(70,194,182,.35); border-radius:13px; padding:16px 18px; margin-bottom:20px; background:linear-gradient(180deg,rgba(70,194,182,.06),transparent)}
+  .frames-strip{display:flex; gap:8px; overflow-x:auto; padding:10px; background:var(--bg2); border:1px solid var(--line); border-radius:11px}
+  .frames-strip .fr{position:relative; flex:0 0 auto; width:132px; border:1px solid var(--line2); border-radius:8px; overflow:hidden; background:#000}
+  .frames-strip .fr img{width:100%; height:78px; object-fit:cover; display:block}
+  .frames-strip .fr .fnum{position:absolute; top:4px; left:4px; font-family:var(--mono); font-size:10px; font-weight:700; color:#000; background:var(--amber); border-radius:4px; padding:1px 6px}
+  .frames-strip .empty{color:var(--faint); font-size:13px; padding:18px}
   @media(max-width:820px){ .twocol{grid-template-columns:1fr} .shot{grid-template-columns:1fr} }
 </style>
 </head>
@@ -454,7 +460,7 @@ Close-up of @Mira fixing a circuit board, sparks reflecting on her goggles
       <p class="hint">≈ <span id="sceneCountHint" style="color:var(--amber-soft)">30</span> scenes / images at this pacing. The narration is written to read aloud in about the target duration.</p>
 
       <div id="voWrap" style="display:none; margin-top:22px">
-        <label class="label">Voice-over script <button class="chip" style="margin-left:8px" onclick="copyVO()">⧉ copy</button></label>
+        <label class="label">Voice-over script <button class="chip" style="margin-left:8px" onclick="copyVO()">⧉ copy</button><button class="chip" style="margin-left:6px" onclick="voiceFromScript()">✨ voice + Claude edit → video</button></label>
         <textarea id="voText" rows="7" readonly style="font-family:var(--body); font-size:14px"></textarea>
       </div>
 
@@ -487,14 +493,39 @@ Close-up of @Mira fixing a circuit board, sparks reflecting on her goggles
     <!-- ============ 05 EDIT ============ -->
     <section class="view sheet" id="view-edit">
       <h2 class="section">Edit — match audio &amp; image sequence</h2>
-      <p class="sub">Upload an audio track. Claude looks at your rendered sequence + the audio length + your edit notes, and produces an edit decision list — which frame, in what order, for how long. ffmpeg assembles the final MP4.</p>
+      <p class="sub">Claude looks at your rendered sequence + the audio length + your edit notes, and produces an edit decision list — which frame, in what order, for how long. ffmpeg assembles the final MP4 in your chosen aspect ratio.</p>
+
+      <div id="editFramesWrap" style="margin:4px 0 22px">
+        <label class="label">Frames to be used — auto-loaded from the Sequence tab, in order <span id="editFramesCount" style="color:var(--amber)"></span></label>
+        <div class="frames-strip" id="editFramesStrip"></div>
+      </div>
+
+      <div class="vo-panel">
+        <h4 style="font-family:var(--disp); margin:0 0 4px; color:var(--teal)">🎙 Voice-over (ElevenLabs)</h4>
+        <p class="hint" style="margin-top:0">Turn the script's narration (tab 02) into real spoken audio. Pick a voice, then choose how to use it.</p>
+        <div class="row" style="align-items:end">
+          <div class="grow" style="max-width:340px">
+            <label class="label">Voice</label>
+            <select id="voiceSelect"><option value="">— load your voices —</option></select>
+          </div>
+          <div style="align-self:end"><button class="btn outline sm" id="loadVoicesBtn" onclick="loadVoices()">↻ Load voices</button></div>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <div style="align-self:end"><button class="btn" id="voAutoBtn" onclick="genVoiceoverAuto()">✨ Voice + Claude edit → finished video (1-click)</button></div>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <div style="align-self:end"><button class="btn outline sm" id="voSingleBtn" onclick="genVoiceoverSingle()">🎧 Voice whole script → audio track</button></div>
+          <div style="align-self:end"><button class="btn violet sm" id="voScenesBtn" onclick="genVoiceoverScenes()">🎬 Per-scene → auto-timed video</button></div>
+        </div>
+        <p class="hint" id="voHint"><strong style="color:var(--teal)">1-click</strong> voices the script, then Claude looks at your frames + that audio and cuts a matching video — all in one go. Or: <em>Whole script</em> just drops a track into the Audio slot (then Plan + Render yourself); <em>Per-scene</em> voices each scene and holds each frame for its own line (no Claude).</p>
+      </div>
 
       <div class="twocol">
         <div>
           <h4 style="font-family:var(--disp); margin:0 0 10px; color:var(--amber-soft)">Audio</h4>
           <div class="row">
             <div class="grow">
-              <label class="label">Upload audio (mp3 / wav / m4a)</label>
+              <label class="label">Upload audio (mp3 / wav / m4a) — or use the voice-over above</label>
               <input type="file" id="audioFile" accept="audio/*" style="padding:9px"/>
             </div>
             <div style="align-self:end"><button class="btn outline" id="audioBtn" onclick="uploadAudio()">Upload</button></div>
@@ -523,6 +554,15 @@ Close-up of @Mira fixing a circuit board, sparks reflecting on her goggles
                 <option value="cut">cut</option>
                 <option value="fade">fade in/out</option>
                 <option value="crossfade">crossfade</option>
+              </select>
+            </div>
+            <div class="opt">
+              <label class="label">Video format</label>
+              <select id="editFormat">
+                <option value="1920x1080" selected>16:9 — 1920×1080 (YouTube)</option>
+                <option value="1080x1920">9:16 — 1080×1920 (Shorts/Reels)</option>
+                <option value="1080x1080">1:1 — 1080×1080 (square)</option>
+                <option value="1536x1024">3:2 — 1536×1024 (native frame)</option>
               </select>
             </div>
             <div style="align-self:end; display:flex; gap:8px; flex-wrap:wrap">
@@ -571,6 +611,9 @@ Close-up of @Mira fixing a circuit board, sparks reflecting on her goggles
       <div class="fld"><label class="label">Claude API key</label><input type="password" id="setClKey" placeholder="sk-ant-..." /></div>
       <div class="fld"><label class="label">Base URL</label><input type="text" id="setClBase" /></div>
       <div class="fld"><label class="label">Model</label><select id="setClModel"></select></div>
+
+      <h4>ElevenLabs (voice-over)</h4>
+      <div class="fld"><label class="label">ElevenLabs API key</label><input type="password" id="setElKey" placeholder="ElevenLabs key…" /></div>
 
       <div id="healthBox" style="margin-top:16px; padding:12px 14px; border:1px solid var(--line); border-radius:8px; background:var(--bg2); font-family:var(--mono); font-size:12.5px; line-height:1.55; color:var(--muted); white-space:pre-wrap; display:none"></div>
 
@@ -652,6 +695,7 @@ async function load(){
   renderSuggested();
   renderAudio();
   renderEditsList();
+  renderEditFrames();
 }
 function setApi(ok){
   $("#apiDot").classList.toggle("ok", ok);
@@ -673,6 +717,11 @@ document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
   t.classList.add("active");
   $("#view-"+t.dataset.view).classList.add("active");
   window.scrollTo({top:0, behavior:"smooth"});
+  // refresh the frames strip + lazily load voices when the Edit tab opens
+  if(t.dataset.view==="edit"){
+    renderEditFrames();
+    if(CFG && CFG.has_elevenlabs_key && !VOICES.length){ loadVoices().catch(()=>{}); }
+  }
 });
 
 /* ---------- universe: master ---------- */
@@ -1036,6 +1085,25 @@ function pushSuggestedToBatch(){
 }
 
 /* ---------- AUDIO + EDIT ---------- */
+// chosen output dimensions (defaults to 16:9 1920x1080)
+function _fmt(){
+  const v = ($("#editFormat") && $("#editFormat").value) || "1920x1080";
+  const [w,h] = v.split("x").map(n=>parseInt(n,10)||0);
+  return { width: w||1920, height: h||1080 };
+}
+// show the frames that will go into the video, numbered + in order
+function renderEditFrames(){
+  const strip = $("#editFramesStrip"); if(!strip) return;
+  const seq = (STATE && STATE.sequence) || [];
+  $("#editFramesCount").textContent = seq.length ? `(${seq.length})` : "";
+  if(!seq.length){ strip.innerHTML = '<div class="empty">No frames yet — render some in the Sequence tab (04).</div>'; return; }
+  strip.innerHTML = "";
+  seq.forEach(s=>{
+    const d=document.createElement("div"); d.className="fr";
+    d.innerHTML=`<div class="fnum">${pad(s.index||0)}</div><img src="${s.image_url}" alt="frame ${s.index}"/>`;
+    strip.appendChild(d);
+  });
+}
 async function uploadAudio(){
   const f=$("#audioFile").files[0];
   if(!f){ toast("Pick an audio file","err"); return; }
@@ -1093,7 +1161,7 @@ async function renderEdit(){
   const b=$("#renderEditBtn"); busy(b,true,"Assembling video…");
   try{
     const r=await api("/api/render-video",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({plan:lastPlan, transition:$("#editTrans").value || null})});
+      body:JSON.stringify({plan:lastPlan, transition:$("#editTrans").value || null, ..._fmt()})});
     STATE.edits = STATE.edits || [];
     STATE.edits.push(r);
     renderEditsList();
@@ -1135,10 +1203,81 @@ async function analyseScene(){
   }catch(e){ $("#anOut").textContent="Failed: "+e.message; toast(e.message,"err"); } finally{ busy(b,false); }
 }
 
+/* ---------- VOICE-OVER (ElevenLabs) ---------- */
+let VOICES=[];
+async function loadVoices(){
+  if(!CFG.has_elevenlabs_key){ toast("Add your ElevenLabs key in Settings","err"); openSettings(); return; }
+  const b=$("#loadVoicesBtn"); busy(b,true,"Loading");
+  try{
+    const d=await api("/api/voices");
+    VOICES=d.voices||[];
+    const sel=$("#voiceSelect"); sel.innerHTML="";
+    if(!VOICES.length){ sel.innerHTML='<option value="">no voices found</option>'; }
+    VOICES.forEach(v=>{ const o=document.createElement("option"); o.value=v.id; o.textContent=v.name+(v.category?` · ${v.category}`:""); if(v.id===d.current)o.selected=true; sel.appendChild(o); });
+    toast(`Loaded ${VOICES.length} voices`,"ok");
+  }catch(e){ toast(e.message,"err"); } finally{ busy(b,false); }
+}
+function _voiceId(){ const v=$("#voiceSelect").value; return v||undefined; }
+function _hasVOText(){
+  const s=STATE&&STATE.script; if(!s) return false;
+  return !!((s.voiceover||"").trim() || (s.scenes||[]).some(x=>(x.vo||"").trim()));
+}
+async function genVoiceoverSingle(){
+  if(!CFG.has_elevenlabs_key){ toast("Add your ElevenLabs key in Settings","err"); openSettings(); return; }
+  if(!_hasVOText()){ toast("Generate a script in tab 02 first","err"); return; }
+  const b=$("#voSingleBtn"); busy(b,true,"Voicing…");
+  try{
+    const rec=await api("/api/voiceover",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({voice_id:_voiceId()})});
+    STATE.audio=rec; renderAudio();
+    toast(`Voice-over ready (${(rec.duration||0).toFixed(1)}s) — now Plan + Render`,"ok");
+    $("#audioCard").scrollIntoView({behavior:"smooth",block:"center"});
+  }catch(e){ toast(e.message,"err"); } finally{ busy(b,false); }
+}
+async function genVoiceoverScenes(){
+  if(!CFG.has_elevenlabs_key){ toast("Add your ElevenLabs key in Settings","err"); openSettings(); return; }
+  if(!STATE.sequence.length){ toast("Render frames in the Sequence tab first","err"); return; }
+  if(!_hasVOText()){ toast("Generate a script in tab 02 first","err"); return; }
+  const b=$("#voScenesBtn"); busy(b,true,"Voicing scenes & building…");
+  try{
+    const body={ voice_id:_voiceId(), transition:$("#editTrans").value||"cut", ..._fmt() };
+    const d=await api("/api/voiceover/scenes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    STATE.edits=STATE.edits||[]; STATE.edits.push(d.edit); renderEditsList();
+    // show the per-scene timing in the plan box
+    const lines=[`per-scene voice-over · total ${Number(d.total_duration||0).toFixed(2)}s`,""];
+    (d.scenes||[]).forEach(sc=>lines.push(`  seq ${pad(sc.index)}  ${Number(sc.audio_seconds||0).toFixed(2)}s voice → hold ${Number(sc.hold_seconds||0).toFixed(2)}s   ${sc.vo||""}`));
+    $("#planOut").textContent=lines.join("\n");
+    toast("Per-scene video built ✓","ok");
+    $("#editVidWrap").scrollIntoView({behavior:"smooth",block:"center"});
+  }catch(e){ toast(e.message,"err"); } finally{ busy(b,false); }
+}
+async function genVoiceoverAuto(){
+  if(!CFG.has_elevenlabs_key){ toast("Add your ElevenLabs key in Settings","err"); openSettings(); return; }
+  if(!CFG.has_claude_key){ toast("Add your Claude key in Settings","err"); openSettings(); return; }
+  if(!STATE.sequence.length){ toast("Render frames in the Sequence tab first","err"); return; }
+  if(!_hasVOText()){ toast("Generate a script in tab 02 first","err"); return; }
+  const b=$("#voAutoBtn"); busy(b,true,"Voicing → Claude editing → rendering…");
+  $("#planOut").textContent="① ElevenLabs voicing the script…\n② Claude reading every frame + the audio…\n③ ffmpeg assembling the cut…";
+  try{
+    const body={ voice_id:_voiceId(), user_brief:$("#editBrief").value, transition:$("#editTrans").value||null, ..._fmt() };
+    const d=await api("/api/voiceover/auto",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    STATE.audio=d.audio; renderAudio();
+    lastPlan=d.plan; renderPlan(d.plan); $("#renderEditBtn").disabled=false;
+    STATE.edits=STATE.edits||[]; STATE.edits.push(d.edit); renderEditsList();
+    toast("Done — Claude-matched video ready ✓","ok");
+    $("#editVidWrap").scrollIntoView({behavior:"smooth",block:"center"});
+  }catch(e){ toast(e.message,"err"); $("#planOut").textContent="Failed: "+e.message; } finally{ busy(b,false); }
+}
+function voiceFromScript(){
+  // jump to Edit tab and trigger the 1-click Claude-matched flow
+  document.querySelector('.tab[data-view="edit"]').click();
+  setTimeout(genVoiceoverAuto, 150);
+}
+
 /* ---------- settings ---------- */
 function openSettings(){
   $("#setKey").value=""; $("#setBase").value=CFG.base_url; $("#setModel").value=CFG.model;
   $("#setClKey").value=""; $("#setClBase").value=CFG.claude_base_url; $("#setClModel").value=CFG.claude_model;
+  $("#setElKey").value="";
   if(CFG.multi_image_edit) $("#tgMulti").classList.add("on"); else $("#tgMulti").classList.remove("on");
   const box = $("#healthBox"); box.style.display = "none"; box.textContent = "";
   $("#settingsModal").classList.add("show");
@@ -1151,10 +1290,12 @@ async function saveSettings(){
   };
   const k=$("#setKey").value.trim(); if(k) body.api_key=k;
   const ck=$("#setClKey").value.trim(); if(ck) body.claude_api_key=ck;
+  const ek=$("#setElKey").value.trim(); if(ek) body.elevenlabs_api_key=ek;
   try{
     const d=await api("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
     CFG.base_url=body.base_url; CFG.model=body.model; CFG.multi_image_edit=body.multi_image_edit; CFG.has_api_key=d.has_api_key;
     CFG.claude_base_url=body.claude_base_url; CFG.claude_model=body.claude_model; CFG.has_claude_key=d.has_claude_key;
+    CFG.has_elevenlabs_key=d.has_elevenlabs_key;
     $("#modelPill").textContent=CFG.model;
     setApi(d.has_api_key); setClaude(d.has_claude_key, CFG.claude_model);
     toast("Settings saved — running connection test…","ok");
@@ -1197,6 +1338,9 @@ async function testConnections(){
     } else {
       lines.push("✘ claude API: "+(cl.error||"unknown"));
     }
+    lines.push("");
+    const vo = h.voice || {};
+    lines.push((vo.ok?"✔":"✘")+" ElevenLabs: "+(vo.detail||(vo.ok?"ok":"unknown")));
     box.textContent = lines.join("\n");
     if(im.ok && cl.ok) toast("Both APIs reachable","ok");
     else toast("Connection test reported problems — see panel","err");

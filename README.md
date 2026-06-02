@@ -52,9 +52,16 @@ one downloadable folder.
      prompts that recreate the look.
 
 4. **Tab 05 — Edit (Audio + Video)** (new)
-   - Upload audio (mp3/wav/m4a/…), Claude looks at every rendered frame +
-     the audio length + your edit notes, returns an EDL (which frame, what
-     order, for how long, what transition).
+   - **🎙 Voice-over (ElevenLabs)** — turn the script's narration into real
+     spoken audio. Pick a voice from your ElevenLabs account, then either:
+     - **Whole script → audio track** — synthesizes one narration track and
+       drops it into the Audio slot; then Plan + Render as usual.
+     - **Per-scene → auto-timed video** — voices each numbered scene
+       separately, measures each clip, and builds a video where sequence frame
+       *N* is held for exactly the length of scene *N*'s line (no manual EDL).
+   - Or **upload audio** (mp3/wav/m4a/…) yourself. Claude looks at every
+     rendered frame + the audio length + your edit notes, returns an EDL (which
+     frame, what order, for how long, what transition).
    - **Render video** — ffmpeg assembles the cut from your frames and muxes
      the audio. Cut / fade / crossfade transitions supported.
 
@@ -131,6 +138,9 @@ Open <http://localhost:8000>.
 | `GET /api/export/package` | download whole project as a ZIP folder |
 | `POST /api/prompts-from-video` | Claude vision: reference frames → N image prompts |
 | `POST /api/analyse-scene` | Claude vision: describe one frame |
+| `GET /api/voices` | list the ElevenLabs voices on your account |
+| `POST /api/voiceover` | ElevenLabs: synthesize the whole script VO → one audio track (into the edit audio slot) |
+| `POST /api/voiceover/scenes` | ElevenLabs: one clip per scene → auto-timed MP4 (each frame held for its line) |
 | `POST /api/audio` | upload audio (probes duration with ffprobe) |
 | `POST /api/edit-plan` | Claude: frames + audio length + brief → EDL |
 | `POST /api/render-video` | ffmpeg: assemble final MP4 from EDL + audio |
@@ -142,6 +152,7 @@ Open <http://localhost:8000>.
 | `app.py` | FastAPI routes |
 | `derouter.py` | gpt-image-2 client (OpenAI-compatible) |
 | `claude_client.py` | Claude client via Anthropic SDK + derouter proxy |
+| `voice.py` | ElevenLabs text-to-speech client (list voices, synthesize) |
 | `pipeline.py` | name matching, prompt assembly, batch parsing, contact sheet |
 | `editor.py` | ffmpeg scene detection + video assembly |
 | `video.py` | ffmpeg frame extraction |
