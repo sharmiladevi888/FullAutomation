@@ -63,23 +63,22 @@ def save_vault(vault):
     path = os.path.join(os.path.dirname(__file__), "vault.json")
     with open(path, "w") as f: json.dump(vault, f, indent=2)
 
-# --- Hack Auth Middleware ---
+# --- Public Mode Middleware (no login/code gate) ---
 from fastapi import Request
 from fastapi.responses import HTMLResponse
 
 @app.middleware("http")
 async def hack_auth_middleware(request: Request, call_next):
-    # Public: allow all and inject default settings
-    email = request.cookies.get("hacker_access", "")
+    # Always inject settings from config/env for public usage
     vault = load_vault()
-    user_data = vault.get(email, {})
-    request.state.user_email = email
+    user_data = vault.get("", {})
+    request.state.user_email = ""
     request.state.settings = {
-        "api_key": user_data.get("api_key", ""),
+        "api_key": user_data.get("api_key", "") or os.environ.get("DEROUTER_API_KEY", ""),
         "base_url": user_data.get("base_url", config.BASE_URL),
         "model": user_data.get("model", config.MODEL),
         "multi_image_edit": user_data.get("multi_image_edit", config.MULTI_IMAGE_EDIT),
-        "claude_api_key": user_data.get("claude_api_key", ""),
+        "claude_api_key": user_data.get("claude_api_key", "") or os.environ.get("ANTHROPIC_API_KEY", ""),
         "claude_base_url": user_data.get("claude_base_url", config.CLAUDE_BASE_URL),
         "claude_model": user_data.get("claude_model", config.CLAUDE_MODEL),
         "elevenlabs_api_key": user_data.get("elevenlabs_api_key", getattr(config, "ELEVENLABS_API_KEY", "")),
@@ -87,33 +86,6 @@ async def hack_auth_middleware(request: Request, call_next):
         "elevenlabs_model": user_data.get("elevenlabs_model", getattr(config, "ELEVENLABS_MODEL", "")),
     }
     return await call_next(request)
-    
-    # Check for auth cookie
-    email = request.cookies.get("hacker_access")
-    # Public: inject default settings and allow all
-    email = request.cookies.get("hacker_access", "")
-    vault = load_vault()
-    user_data = vault.get(email, {})
-    request.state.user_email = email
-    request.state.settings = {
-        "api_key": user_data.get("api_key", ""),
-        "base_url": user_data.get("base_url", config.BASE_URL),
-        "model": user_data.get("model", config.MODEL),
-        "multi_image_edit": user_data.get("multi_image_edit", config.MULTI_IMAGE_EDIT),
-        "claude_api_key": user_data.get("claude_api_key", ""),
-        "claude_base_url": user_data.get("claude_base_url", config.CLAUDE_BASE_URL),
-        "claude_model": user_data.get("claude_model", config.CLAUDE_MODEL),
-        "elevenlabs_api_key": user_data.get("elevenlabs_api_key", config.ELEVENLABS_API_KEY),
-        "elevenlabs_voice_id": user_data.get("elevenlabs_voice_id", config.ELEVENLABS_VOICE_ID),
-        "elevenlabs_model": user_data.get("elevenlabs_model", config.ELEVENLABS_MODEL),
-    }
-    return await call_next(request)
-
-app.mount("/data", StaticFiles(directory=config.DATA_DIR), name="data")
-
-# Runtime settings resolver (uses request state)
-def get_user_settings(request: Request):
-    return request.state.settings
 
 def get_image_client(request: Request) -> ImageClient:
     s = request.state.settings
@@ -863,7 +835,7 @@ class SceneVoiceoverIn(BaseModel):
     width: int = 1920
     height: int = 1080
     fps: int = 30
-    pad: float = 0.12                # small breath of hold added after each clip
+    pad: float = 0.4                 # seconds of hold added after each clip
 
 
 @app.post("/api/voiceover/scenes")
@@ -912,10 +884,7 @@ def api_voiceover_scenes(body: SceneVoiceoverIn, request: Request):
             except Exception:
                 d = 0.0
             if d <= 0.05:
-                # silent/empty line -> brief hold only (a 2.5s freeze on a
-                # wordless scene is what made the cut drag); keep it short so
-                # the pacing stays tight.
-                d = 0.8
+                d = 2.5      # silent/empty line -> sensible default hold
             hold = round(d + max(0.0, body.pad), 3)
             clip_paths.append((ap, hold, d))
             try:

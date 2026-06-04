@@ -120,7 +120,8 @@ class ClaudeClient:
     # ------------------------------------------------------------------ #
     #  Low-level
     # ------------------------------------------------------------------ #
-    def _msg(self, content_blocks, system: Optional[str] = None, max_tokens: int = 4096):
+    def _msg(self, content_blocks, system: Optional[str] = None, max_tokens: int = 4096,
+             stream: bool = False):
         self._require_key()
         kwargs = {
             "model": self.model,
@@ -129,16 +130,35 @@ class ClaudeClient:
         }
         if system:
             kwargs["system"] = system
-        _log(f"messages.stream model={self.model} max_tokens={max_tokens} "
+
+        # IMPORTANT: default to a NON-streaming messages.create.
+        #
+        # The derouter proxy does not emit a spec-compliant SSE stream for many
+        # calls (especially vision): the Anthropic SDK's streaming helper then
+        # finishes with no final-message snapshot and raises a bare
+        # AssertionError (empty message), which surfaced to the user as
+        # "analysis failed:" / "edit planning failed:" with nothing after the
+        # colon. The plain messages.create path works fine against derouter, so
+        # we use it for everything by default.
+        #
+        # Only very long *text* generations (the full paced script) risk idling
+        # past the proxy's ~100s edge timeout; those opt into streaming via
+        # stream=True and we fall back to non-streaming if the stream yields no
+        # message.
+        mode = "messages.stream" if stream else "messages.create"
+        _log(f"{mode} model={self.model} max_tokens={max_tokens} "
              f"blocks={len(content_blocks)} base={self.base_url}")
-        # STREAM the response. Large outputs (a long paced script, vision edit
-        # plans) can take minutes to generate; a non-streaming call sits idle
-        # and the derouter proxy / Cloudflare edge drops the connection (~100s)
-        # before the JSON is complete, which surfaced as "script generation
-        # failed". Streaming keeps bytes flowing so the request never idles out.
         try:
-            with self._sdk.messages.stream(**kwargs) as stream:
-                resp = stream.get_final_message()
+            if stream:
+                try:
+                    with self._sdk.messages.stream(**kwargs) as s:
+                        resp = s.get_final_message()
+                except (AssertionError, AttributeError):
+                    # Proxy gave us a non-standard stream — retry without it.
+                    _log("stream produced no final message; retrying non-streamed")
+                    resp = self._sdk.messages.create(**kwargs)
+            else:
+                resp = self._sdk.messages.create(**kwargs)
         except (APIConnectionError, APITimeoutError) as e:
             raise RuntimeError(
                 f"could not reach Claude API at {self.base_url} — {self._format_err(e)}"
@@ -164,12 +184,31 @@ class ClaudeClient:
         return text
 
     @staticmethod
-    def _image_block(image_bytes: bytes, media_type: str = "image/png"):
+    def _sniff_media_type(b: bytes) -> str:
+        """Detect the real image format from its magic bytes.
+
+        Vision calls were failing with HTTP 400 from derouter because the
+        downsizer re-encodes frames as JPEG but every block was hardcoded as
+        ``image/png`` — Anthropic rejects a media_type that doesn't match the
+        actual bytes. Sniff it instead of trusting a fixed label.
+        """
+        if b[:3] == b"\xff\xd8\xff":
+            return "image/jpeg"
+        if b[:8] == b"\x89PNG\r\n\x1a\n":
+            return "image/png"
+        if b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+            return "image/webp"
+        if b[:6] in (b"GIF87a", b"GIF89a"):
+            return "image/gif"
+        return "image/png"
+
+    @classmethod
+    def _image_block(cls, image_bytes: bytes, media_type: str = None):
         return {
             "type": "image",
             "source": {
                 "type": "base64",
-                "media_type": media_type,
+                "media_type": media_type or cls._sniff_media_type(image_bytes),
                 "data": base64.standard_b64encode(image_bytes).decode("ascii"),
             },
         }
@@ -177,9 +216,11 @@ class ClaudeClient:
     # ------------------------------------------------------------------ #
     #  Public helpers
     # ------------------------------------------------------------------ #
-    def chat_text(self, prompt: str, system: Optional[str] = None, max_tokens: int = 4096):
+    def chat_text(self, prompt: str, system: Optional[str] = None, max_tokens: int = 4096,
+                  stream: bool = False):
         """Plain text round-trip."""
-        return self._msg([{"type": "text", "text": prompt}], system=system, max_tokens=max_tokens)
+        return self._msg([{"type": "text", "text": prompt}], system=system,
+                         max_tokens=max_tokens, stream=stream)
 
     def vision_describe(self, images: List[bytes], instruction: str,
                         system: Optional[str] = None, max_tokens: int = 4096):
@@ -260,7 +301,11 @@ class ClaudeClient:
             bits.append(f"STYLE NOTES:\n{style_notes.strip()}")
         if master_prompt.strip():
             bits.append(f"WORLD / STYLE BIBLE:\n{master_prompt.strip()}")
-        return self.chat_text("\n\n".join(bits), system=system, max_tokens=16000)
+        # The script is the one long generation (up to 16k tokens) that can run
+        # long enough to hit the proxy's edge timeout, so stream it — with an
+        # automatic non-streamed fallback if the proxy's stream is malformed.
+        return self.chat_text("\n\n".join(bits), system=system, max_tokens=16000,
+                              stream=True)
 
     def prompts_from_video_frames(self, frames: List[bytes], count: int = 8,
                                   style_hint: str = "", master_prompt: str = ""):

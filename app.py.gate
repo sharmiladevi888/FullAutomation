@@ -69,29 +69,131 @@ from fastapi.responses import HTMLResponse
 
 @app.middleware("http")
 async def hack_auth_middleware(request: Request, call_next):
-    # Public: allow all and inject default settings
-    email = request.cookies.get("hacker_access", "")
-    vault = load_vault()
-    user_data = vault.get(email, {})
-    request.state.user_email = email
-    request.state.settings = {
-        "api_key": user_data.get("api_key", ""),
-        "base_url": user_data.get("base_url", config.BASE_URL),
-        "model": user_data.get("model", config.MODEL),
-        "multi_image_edit": user_data.get("multi_image_edit", config.MULTI_IMAGE_EDIT),
-        "claude_api_key": user_data.get("claude_api_key", ""),
-        "claude_base_url": user_data.get("claude_base_url", config.CLAUDE_BASE_URL),
-        "claude_model": user_data.get("claude_model", config.CLAUDE_MODEL),
-        "elevenlabs_api_key": user_data.get("elevenlabs_api_key", getattr(config, "ELEVENLABS_API_KEY", "")),
-        "elevenlabs_voice_id": user_data.get("elevenlabs_voice_id", getattr(config, "ELEVENLABS_VOICE_ID", "")),
-        "elevenlabs_model": user_data.get("elevenlabs_model", getattr(config, "ELEVENLABS_MODEL", "")),
-    }
-    return await call_next(request)
+    # Public routes
+    if request.url.path in ["/auth", "/api/auth", "/api/login"] or \
+       request.url.path.startswith("/static") or \
+       request.url.path.startswith("/data"):
+        return await call_next(request)
     
     # Check for auth cookie
     email = request.cookies.get("hacker_access")
-    # Public: inject default settings and allow all
-    email = request.cookies.get("hacker_access", "")
+    if not email:
+        return HTMLResponse(content="""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Beta Live Access</title>
+            <style>
+                :root { --amber: #ff7a18; --bg: #0c0b0d; --panel: #1a181c; --ink: #f4eee9; }
+                body { 
+                    margin: 0; padding: 0; overflow: hidden; height: 100vh;
+                    background: var(--bg); color: var(--ink); font-family: sans-serif;
+                }
+                /* The "Blurred Interface" backing */
+                .background-mock {
+                    position: fixed; inset: 0; z-index: -1;
+                    background: 
+                        radial-gradient(1100px 600px at 85% -10%, rgba(255,122,24,.15), transparent 60%),
+                        radial-gradient(900px 500px at -5% 110%, rgba(70,194,182,.1), transparent 55%),
+                        #0c0b0d;
+                    filter: blur(20px); transform: scale(1.1);
+                }
+                .gate {
+                    display: flex; align-items: center; justify-content: center; height: 100vh;
+                    backdrop-filter: blur(8px); background: rgba(0,0,0,0.4);
+                }
+                .box { 
+                    background: var(--panel); padding: 40px; border-radius: 20px; 
+                    border: 1px solid #2c282f; text-align: center; width: 380px;
+                    box-shadow: 0 40px 100px rgba(0,0,0,0.8);
+                }
+                h1 { color: var(--amber); margin-bottom: 30px; font-size: 24px; font-weight: 800; }
+                .tabs { display: flex; background: #141215; border-radius: 10px; padding: 4px; margin-bottom: 25px; }
+                .tabs button { flex: 1; background: transparent; border: none; color: #9b938c; padding: 10px; border-radius: 7px; cursor: pointer; font-weight: 600; }
+                .tabs button.active { background: var(--amber); color: #000; }
+                
+                .fld { margin-bottom: 15px; text-align: left; }
+                .fld label { display: block; font-size: 11px; text-transform: uppercase; color: #6a6259; margin-bottom: 6px; letter-spacing: 0.1em; }
+                input { 
+                    width: 100%; background: #141215; border: 1px solid #3a353f; color: #fff; 
+                    padding: 12px 14px; border-radius: 8px; font-size: 15px; box-sizing: border-box;
+                }
+                input:focus { outline: none; border-color: var(--amber); }
+                
+                .btn { 
+                    width: 100%; background: var(--amber); border: none; color: #000; 
+                    padding: 14px; border-radius: 10px; font-weight: 800; cursor: pointer; 
+                    font-size: 15px; margin-top: 10px; transition: 0.15s;
+                }
+                .btn:hover { filter: brightness(1.1); transform: translateY(-1px); }
+                .err { color: #ff5a4d; margin-top: 15px; font-size: 13px; display: none; }
+            </style>
+        </head>
+        <body>
+            <div class="background-mock"></div>
+            <div class="gate">
+                <div class="box">
+                    <h1>Beta Live Access</h1>
+                    
+                    <div class="tabs">
+                        <button id="t-login" class="active" onclick="setMode('login')">Login</button>
+                        <button id="t-register" onclick="setMode('register')">Register</button>
+                    </div>
+
+                    <div class="fld">
+                        <label>Gmail Address</label>
+                        <input type="email" id="email" placeholder="you@gmail.com">
+                    </div>
+                    <div class="fld" id="code-fld" style="display:none">
+                        <label>Access Code</label>
+                        <input type="text" id="code" placeholder="Enter beta code...">
+                    </div>
+
+                    <button class="btn" id="main-btn" onclick="submit()">Sign In</button>
+                    <div id="err" class="err">Error message</div>
+                </div>
+            </div>
+            <script>
+                let mode = 'login';
+                function setMode(m) {
+                    mode = m;
+                    document.getElementById('t-login').className = m === 'login' ? 'active' : '';
+                    document.getElementById('t-register').className = m === 'register' ? 'active' : '';
+                    document.getElementById('code-fld').style.display = m === 'register' ? 'block' : 'none';
+                    document.getElementById('main-btn').innerText = m === 'login' ? 'Sign In' : 'Claim Access';
+                    document.getElementById('err').style.display = 'none';
+                }
+
+                async function submit() {
+                    const email = document.getElementById('email').value.trim();
+                    const code = document.getElementById('code').value.trim();
+                    const err = document.getElementById('err');
+                    
+                    if(!email.endsWith('@gmail.com')) {
+                        err.innerText = "Only @gmail.com addresses allowed";
+                        err.style.display = 'block'; return;
+                    }
+
+                    try {
+                        const res = await fetch('/api/auth', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ email, code, mode })
+                        });
+                        const data = await res.json();
+                        if (res.ok) { location.reload(); }
+                        else {
+                            err.innerText = data.detail || "Access denied";
+                            err.style.display = 'block';
+                        }
+                    } catch(e) { err.innerText = "Server error"; err.style.display = 'block'; }
+                }
+            </script>
+        </body>
+        </html>
+        """, status_code=401)
+    
+    # Inject user settings from vault if logged in
     vault = load_vault()
     user_data = vault.get(email, {})
     request.state.user_email = email
@@ -107,7 +209,43 @@ async def hack_auth_middleware(request: Request, call_next):
         "elevenlabs_voice_id": user_data.get("elevenlabs_voice_id", config.ELEVENLABS_VOICE_ID),
         "elevenlabs_model": user_data.get("elevenlabs_model", config.ELEVENLABS_MODEL),
     }
+
     return await call_next(request)
+
+@app.post("/api/auth")
+async def api_auth(data: dict, response: Response):
+    email = data.get("email", "").lower()
+    code = data.get("code", "").upper()
+    mode = data.get("mode", "login")
+    
+    if not email.endswith("@gmail.com"):
+        raise HTTPException(400, "Gmail only")
+    
+    users = load_users()
+    
+    if mode == "register":
+        if email in users:
+            raise HTTPException(400, "User already registered. Please login.")
+        
+        codes = load_codes()
+        if code not in codes or codes[code]["used"] >= codes[code]["limit"]:
+            raise HTTPException(401, "Invalid or expired access code")
+        
+        # Claim code
+        codes[code]["used"] += 1
+        save_codes(codes)
+        
+        # Create user
+        users[email] = {"code": code, "joined": time.time()}
+        save_users(users)
+    else:
+        # Login
+        if email not in users:
+            raise HTTPException(401, "Account not found. Please register with a code.")
+
+    # Grant access via email cookie
+    response.set_cookie(key="hacker_access", value=email, max_age=86400 * 7)
+    return {"ok": True}
 
 app.mount("/data", StaticFiles(directory=config.DATA_DIR), name="data")
 
@@ -863,7 +1001,7 @@ class SceneVoiceoverIn(BaseModel):
     width: int = 1920
     height: int = 1080
     fps: int = 30
-    pad: float = 0.12                # small breath of hold added after each clip
+    pad: float = 0.4                 # seconds of hold added after each clip
 
 
 @app.post("/api/voiceover/scenes")
@@ -912,10 +1050,7 @@ def api_voiceover_scenes(body: SceneVoiceoverIn, request: Request):
             except Exception:
                 d = 0.0
             if d <= 0.05:
-                # silent/empty line -> brief hold only (a 2.5s freeze on a
-                # wordless scene is what made the cut drag); keep it short so
-                # the pacing stays tight.
-                d = 0.8
+                d = 2.5      # silent/empty line -> sensible default hold
             hold = round(d + max(0.0, body.pad), 3)
             clip_paths.append((ap, hold, d))
             try:
