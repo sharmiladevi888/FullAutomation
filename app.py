@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import zipfile
 from typing import List, Optional
@@ -920,6 +921,182 @@ def api_generate_batch(b: BatchGenerateIn, request: Request):
         except Exception as ex:
             errors.append({"prompt": p, "error": str(ex)})
     return {"created": created, "errors": errors}
+
+
+# --------------------------------------------------------------------------- #
+#  Image generation QUEUE — controlled, retry-safe bulk generation.
+#  Splits prompts into jobs, runs them through image_queue (concurrency=1 by
+#  default) with backoff + a global rate-limit cooldown. The frontend submits a
+#  batch then polls /status; completed frames are saved as they finish so a
+#  later failure never loses earlier work, and any failed job can be retried.
+# --------------------------------------------------------------------------- #
+import image_queue
+
+# Serialises the quick read-modify-write of a project's sequence so a worker and
+# the user editing at the same time can't clobber each other's state.
+_state_write_lock = threading.Lock()
+
+
+def _render_one_for_queue(g_prompt, params, settings, project_id):
+    """Render ONE frame for a queued job. Mirrors _render_one's reference
+    assembly but operates on an explicit project + settings snapshot and lets
+    the queue own retries (so the client call uses retry=False)."""
+    size = params.get("size") or config.DEFAULT_SIZE
+    quality = params.get("quality") or config.DEFAULT_QUALITY
+    continue_prev = params.get("continue_prev", True)
+    style_lock = params.get("style_lock", True)
+    multi_image_edit = settings.get("multi_image_edit", config.MULTI_IMAGE_EDIT)
+    client = ImageClient(api_key=settings.get("api_key"),
+                         base_url=settings.get("base_url"),
+                         model=settings.get("model"))
+
+    st = store.load_state_for(project_id)
+    matched = pipeline.match_characters(g_prompt, st["characters"])
+    prev = st["sequence"][-1] if (continue_prev and st["sequence"]) else None
+    style_frames = st["style_frames"] if style_lock else []
+
+    refs, ref_meta = [], []
+    for c in matched:
+        try:
+            refs.append(store.read_image(c["sheet_url"]))
+            ref_meta.append({"type": "character", "name": c["name"]})
+        except Exception:
+            pass
+    if prev:
+        try:
+            refs.append(store.read_image(prev["image_url"]))
+            ref_meta.append({"type": "previous", "id": prev["id"]})
+        except Exception:
+            pass
+    for sf in style_frames[:3]:
+        try:
+            refs.append(store.read_image(sf["url"]))
+            ref_meta.append({"type": "style"})
+        except Exception:
+            pass
+
+    full_prompt = pipeline.build_full_prompt(
+        st["master_prompt"], g_prompt, matched,
+        has_previous=bool(prev), style_locked=bool(style_frames))
+
+    if refs:
+        if not multi_image_edit and len(refs) > 1:
+            send = [pipeline.contact_sheet(refs)]
+        else:
+            send = refs
+        try:
+            img = client.edit(full_prompt, send, size=size, quality=quality,
+                              retry=False)
+        except Exception:
+            if len(send) > 1:
+                img = client.edit(full_prompt, [pipeline.contact_sheet(refs)],
+                                  size=size, quality=quality, retry=False)
+            else:
+                raise
+        mode = "edit"
+    else:
+        img = client.generate(full_prompt, size=size, quality=quality,
+                             retry=False)
+        mode = "generate"
+
+    # Quick, locked read-modify-write so concurrent writers don't lose frames.
+    with _state_write_lock:
+        st = store.load_state_for(project_id)
+        rec = {
+            "id": store.new_id("shot"),
+            "index": len(st["sequence"]) + 1,
+            "prompt": g_prompt.strip(),
+            "full_prompt": full_prompt,
+            "image_url": store.write_image("images", img),
+            "mode": mode, "size": size, "quality": quality,
+            "characters": [c["name"] for c in matched],
+            "refs": ref_meta,
+            "continued_from": prev["id"] if prev else None,
+            "created": store.now(),
+        }
+        st["sequence"].append(rec)
+        store.save_state_for(project_id, st)
+    _cost = {"low": 0.02, "medium": 0.04, "high": 0.08, "auto": 0.06}
+    store.log_usage("image", 1, _cost.get(quality, 0.06), project_id=project_id)
+    return rec
+
+
+image_queue.QUEUE.set_render_fn(_render_one_for_queue)
+
+
+@app.on_event("startup")
+def _start_image_queue():
+    image_queue.QUEUE.start()
+
+
+def _img_settings_snapshot(request: Request) -> dict:
+    s = request.state.settings
+    return {
+        "api_key": s["api_key"], "base_url": s["base_url"],
+        "model": s["model"], "multi_image_edit": s["multi_image_edit"],
+    }
+
+
+class QueueSubmitIn(BaseModel):
+    text: str
+    mode: str = "line"
+    size: Optional[str] = None
+    quality: Optional[str] = None
+    continue_prev: bool = True
+    style_lock: bool = True
+
+
+@app.post("/api/images/queue")
+def api_images_queue_submit(b: QueueSubmitIn, request: Request):
+    """Enqueue a bulk batch. Returns the batch id + initial job list to poll."""
+    if not request.state.settings["api_key"]:
+        raise HTTPException(400, "Connect your image API key in Settings first.")
+    prompts = pipeline.split_lines_batch(b.text, mode=b.mode)
+    if not prompts:
+        raise HTTPException(400, "no prompts found")
+    params = {"size": b.size or config.DEFAULT_SIZE,
+              "quality": b.quality or config.DEFAULT_QUALITY,
+              "continue_prev": b.continue_prev, "style_lock": b.style_lock}
+    batch = image_queue.QUEUE.submit(prompts, params,
+                                     _img_settings_snapshot(request),
+                                     store.current_project_id())
+    return batch.to_dict()
+
+
+@app.get("/api/images/queue/{bid}")
+def api_images_queue_status(bid: str):
+    b = image_queue.QUEUE.get_batch(bid)
+    if not b:
+        raise HTTPException(404, "no such batch")
+    return b.to_dict()
+
+
+@app.post("/api/images/queue/{bid}/cancel")
+def api_images_queue_cancel(bid: str):
+    if not image_queue.QUEUE.cancel(bid):
+        raise HTTPException(404, "no such batch")
+    return image_queue.QUEUE.get_batch(bid).to_dict()
+
+
+@app.post("/api/images/queue/{bid}/retry-failed")
+def api_images_queue_retry_failed(bid: str, request: Request):
+    n = image_queue.QUEUE.retry_failed(bid, _img_settings_snapshot(request))
+    b = image_queue.QUEUE.get_batch(bid)
+    if not b:
+        raise HTTPException(404, "no such batch")
+    return {"requeued": n, "batch": b.to_dict()}
+
+
+@app.post("/api/images/job/{job_id}/retry")
+def api_images_job_retry(job_id: str, request: Request):
+    if not image_queue.QUEUE.retry_job(job_id, _img_settings_snapshot(request)):
+        raise HTTPException(400, "job not found or not retryable")
+    return {"ok": True}
+
+
+@app.get("/api/images/throttle")
+def api_images_throttle():
+    return image_queue.throttle_status()
 
 
 @app.delete("/api/sequence/{sid}")
@@ -2138,6 +2315,145 @@ def api_voices(request: Request):
     except Exception as e:
         raise HTTPException(500, str(e))
     return {"voices": voices, "current": s["elevenlabs_voice_id"]}
+
+
+# --------------------------------------------------------------------------- #
+#  "Natural flow" assembly — keep the voice-over continuous, time frames to it.
+#
+#  The older synced path voices each scene SEPARATELY, which chops sentences and
+#  makes the narration sound slow / unnatural, and can leave one frame on screen
+#  far too long. This path instead:
+#    1. synthesizes the WHOLE script as ONE continuous track (natural prosody —
+#       the audio is never time-stretched or pitch-shifted),
+#    2. measures it, then distributes the frames across that timeline weighted by
+#       how much narration each frame's scene carries (so each image is on screen
+#       roughly while its line is spoken),
+#    3. splits any frame that would sit too long into micro-cuts.
+#  The result: audio flows, frames match it, nothing freezes.
+# --------------------------------------------------------------------------- #
+def _word_count(s: str) -> int:
+    return len([w for w in re.split(r"\s+", (s or "").strip()) if w])
+
+
+def _build_flow_video(st, request, *, voice_id, text, transition="cut",
+                      width=1920, height=1080, fps=30, max_hold=6.0,
+                      motion=False, use_music=False, name_hint="flow"):
+    """Shared engine for the natural-flow video. Returns
+    (edit_rec, video_url, total_seconds, scene_map). Mutates + saves `st`."""
+    seq = st.get("sequence") or []
+    if not seq:
+        raise HTTPException(400, "Render some frames in the Sequence tab first.")
+    text = (text or "").strip()
+    if not text:
+        raise HTTPException(400, "No voice-over text. Generate a script first.")
+
+    # 1. ONE continuous narration track — natural, never stretched.
+    try:
+        mp3 = get_voice_client(request, voice_id).synthesize(text)
+    except Exception as e:
+        raise HTTPException(500, f"voice-over failed: {e}")
+    url, path = store.write_binary("audio", mp3, ext="mp3", name_hint=name_hint)
+    try:
+        dur = float(editor.probe_duration(path))
+    except Exception:
+        dur = 0.0
+    if dur <= 0.1:
+        dur = max(1.0, len(seq) * 2.0)
+
+    # 2. Weight each frame by its scene's narration length so images change in
+    #    step with the speech. Frames beyond the last scene line share evenly.
+    lines = _scene_vo_lines(st)
+    n = len(seq)
+    weights = []
+    for i in range(n):
+        line = lines[i] if i < len(lines) else ""
+        weights.append(float(max(1, _word_count(line))))
+    total_w = sum(weights) or float(n)
+    holds = [max(0.6, dur * w / total_w) for w in weights]
+    # Re-normalise so the holds sum to the real audio length (keeps A/V locked).
+    scale = dur / (sum(holds) or 1.0)
+    holds = [round(h * scale, 3) for h in holds]
+
+    shots, scene_map = [], []
+    for i in range(n):
+        try:
+            img_path = store.url_to_path(seq[i]["image_url"])
+        except Exception:
+            continue
+        line = lines[i] if i < len(lines) else ""
+        shots.append({"path": img_path, "duration": holds[i],
+                      "note": (line[:60] if line else "")})
+        scene_map.append({"index": seq[i].get("index", i + 1), "vo": line,
+                          "hold_seconds": holds[i]})
+    if not shots:
+        raise HTTPException(400, "no readable frames in sequence")
+
+    # 3. Micro-cut any frame that would sit too long.
+    shots = editor.split_long_holds(shots, max_hold=max(1.5, float(max_hold)))
+
+    music_path, music_vol = _music_for(st, use_music)
+    out_name = f"edit_{int(time.time())}.mp4"
+    out_path = os.path.join(store.VIDEOS_DIR, out_name)
+    try:
+        editor.assemble_video(shots, path, out_path,
+                              transition=(transition or "cut").lower(),
+                              width=width, height=height, fps=fps, motion=motion,
+                              music_path=music_path, music_volume=music_vol)
+    except Exception as ex:
+        raise HTTPException(500, f"video assembly failed: {ex}")
+    rel = os.path.relpath(out_path, store.DATA_DIR).replace(os.sep, "/")
+    video_url = f"/data/{rel}"
+
+    total = round(dur, 2)
+    st["audio"] = {"id": store.new_id("audio"), "url": url,
+                   "name": f"{name_hint}.mp3", "duration": total}
+    st["voiceover"] = {"id": store.new_id("vo"), "url": url, "voice_id": voice_id,
+                       "mode": "flow", "duration": total, "scenes": scene_map,
+                       "created": store.now()}
+    plan = {"mode": "voiceover_flow", "total_duration": total,
+            "transition": (transition or "cut").lower(),
+            "micro_cut_max_hold": max_hold, "shots": scene_map,
+            "rendered_clips": len(shots)}
+    edit_rec = {"id": store.new_id("edit"), "url": video_url,
+                "audio_id": st["audio"]["id"],
+                "transition": (transition or "cut").lower(),
+                "plan": plan, "created": store.now()}
+    st.setdefault("edits", []).append(edit_rec)
+    store.save_state(st)
+    store.log_usage("voice", 1, round(total * 0.0002, 4))
+    store.log_usage("video", 1, 0.0)
+    return edit_rec, video_url, total, scene_map
+
+
+class FlowVoiceoverIn(BaseModel):
+    voice_id: Optional[str] = None
+    text: str = ""
+    transition: Optional[str] = None
+    width: int = 1920
+    height: int = 1080
+    fps: int = 30
+    max_hold: float = 6.0          # split frames longer than this into micro-cuts
+    motion: bool = False
+    music: bool = False
+
+
+@app.post("/api/voiceover/auto-flow")
+def api_voiceover_auto_flow(body: FlowVoiceoverIn, request: Request):
+    """Natural-flow narrated video: one continuous voice-over, frames timed to
+    it, long holds broken into micro-cuts. See _build_flow_video."""
+    s = request.state.settings
+    if not s["elevenlabs_api_key"]:
+        raise HTTPException(400, "No ElevenLabs API key set — add it in Settings.")
+    st = store.load_state()
+    text = (body.text or "").strip() or _script_voiceover_text(st)
+    voice_id = body.voice_id or s["elevenlabs_voice_id"]
+    edit_rec, video_url, total, scene_map = _build_flow_video(
+        st, request, voice_id=voice_id, text=text,
+        transition=body.transition or "cut", width=body.width,
+        height=body.height, fps=body.fps, max_hold=body.max_hold,
+        motion=body.motion, use_music=body.music, name_hint="voiceover_flow")
+    return {"edit": edit_rec, "video_url": video_url, "total_duration": total,
+            "scenes": scene_map, "plan": edit_rec["plan"]}
 
 
 class VoiceoverIn(BaseModel):
@@ -3685,6 +4001,79 @@ class AutopilotIn(BaseModel):
     quality: Optional[str] = None
     size: Optional[str] = None
     model: Optional[str] = None        # Claude model override
+    voice_id: Optional[str] = None     # ElevenLabs voice for the narration
+    target_seconds: Optional[float] = None  # desired video length target
+    run_id: Optional[str] = None       # client token so a run can be stopped
+    step_timeout: float = 60.0         # auto-proceed if a heavy step stalls past this
+    max_hold: float = 6.0              # split frames longer than this into micro-cuts
+
+
+# --- Autopilot run control: stop flag + per-step deadline ------------------- #
+_AUTOPILOT_STOP = set()
+_AUTOPILOT_LOCK = threading.Lock()
+
+
+class _Stopped(Exception):
+    pass
+
+
+def _autopilot_stopped(run_id):
+    if not run_id:
+        return False
+    with _AUTOPILOT_LOCK:
+        return run_id in _AUTOPILOT_STOP
+
+
+def _check_stop(run_id):
+    if _autopilot_stopped(run_id):
+        with _AUTOPILOT_LOCK:
+            _AUTOPILOT_STOP.discard(run_id)
+        raise _Stopped()
+
+
+@app.exception_handler(_Stopped)
+async def _stopped_handler(request: Request, exc: _Stopped):
+    # An autopilot run was stopped between steps. Whatever finished is already
+    # saved to project state, so the client just reloads /api/state.
+    return JSONResponse(status_code=200, content={
+        "ok": False, "stopped": True,
+        "detail": "Autopilot stopped — finished steps were kept."})
+
+
+def _run_with_deadline(fn, seconds):
+    """Run ``fn`` in a daemon thread and stop WAITING after ``seconds`` so a
+    stalled heavy step doesn't hang the whole run. Returns (finished, value).
+    A step that times out keeps finishing in the background — its results just
+    appear a little later — which is safe here because every step only appends
+    to project state. Exceptions raised by ``fn`` are re-raised."""
+    box = {}
+
+    def worker():
+        try:
+            box["v"] = fn()
+        except Exception as e:          # noqa: BLE001
+            box["e"] = e
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    t.join(max(1.0, float(seconds)))
+    if t.is_alive():
+        return (False, None)
+    if "e" in box:
+        raise box["e"]
+    return (True, box.get("v"))
+
+
+class AutopilotStopIn(BaseModel):
+    run_id: str
+
+
+@app.post("/api/autopilot/stop")
+def api_autopilot_stop(body: AutopilotStopIn):
+    """Request that an in-flight autopilot run stop at the next step boundary."""
+    with _AUTOPILOT_LOCK:
+        _AUTOPILOT_STOP.add(body.run_id)
+    return {"ok": True, "run_id": body.run_id}
 
 
 @app.post("/api/autopilot")
@@ -3699,12 +4088,18 @@ def api_autopilot(body: AutopilotIn, request: Request):
     if not s["elevenlabs_api_key"]:
         raise HTTPException(400, "No ElevenLabs API key — add it in Settings.")
 
+    run_id = body.run_id or store.new_id("run")
+    with _AUTOPILOT_LOCK:                      # clear any stale stop flag
+        _AUTOPILOT_STOP.discard(run_id)
+    step_to = max(15.0, float(body.step_timeout or 60.0))
+
     import youtube
     if not youtube.is_youtube_url(body.url):
         raise HTTPException(400, "That doesn't look like a YouTube link.")
 
     quality = body.quality or config.DEFAULT_QUALITY
     size = body.size or config.DEFAULT_SIZE
+    voice_id = body.voice_id or s["elevenlabs_voice_id"]
     steps = []
 
     # ---- STEP 1: Analyse the YouTube reference ----
@@ -3755,6 +4150,7 @@ def api_autopilot(body: AutopilotIn, request: Request):
     store.log_usage("script", 1, 0.01)
 
     # ---- STEP 2: Pick a suggestion and generate a script ----
+    _check_stop(run_id)
     pick = suggestions[min(body.suggestion_index, len(suggestions) - 1)]
     title = pick.get("title", "")
     desc = "\n\n".join(filter(None, [
@@ -3764,6 +4160,9 @@ def api_autopilot(body: AutopilotIn, request: Request):
     ]))
     pacing = pick.get("pacing_seconds", 1.0)
     total_dur = pick.get("total_duration", 30.0)
+    # A user-supplied target length wins — drives how much script Claude writes.
+    if body.target_seconds and body.target_seconds > 0:
+        total_dur = float(body.target_seconds)
     num_chars = pick.get("num_characters", 2)
     style_notes = (pick.get("image_prompt_style") or "")[:80]
 
@@ -3788,15 +4187,18 @@ def api_autopilot(body: AutopilotIn, request: Request):
     store.log_usage("script", 1, 0.01)
 
     # ---- STEP 3: Generate character sheets ----
+    _check_stop(run_id)
     chars = script.get("characters") or []
     img_client = get_image_client(request)
     char_created = []
     for c in chars:
+        _check_stop(run_id)
         name = (c.get("name") or "").strip()
         sheet_prompt = (c.get("sheet_prompt") or c.get("description") or "").strip()
         if not name:
             continue
-        try:
+
+        def _make_sheet(name=name, sheet_prompt=sheet_prompt):
             prompt = pipeline.build_sheet_prompt(st["master_prompt"], name, sheet_prompt)
             img = img_client.generate(prompt, size=size, quality=quality)
             rec = {
@@ -3805,22 +4207,32 @@ def api_autopilot(body: AutopilotIn, request: Request):
                 "sheet_url": store.write_image("characters", img),
                 "prompt": prompt, "source": "generated",
             }
-            st = store.load_state()
-            st["characters"].append(rec)
-            store.save_state(st)
-            char_created.append(name)
+            cur = store.load_state()
+            cur["characters"].append(rec)
+            store.save_state(cur)
             store.log_usage("image", 1, 0.08)
+            return name
+        try:
+            # Auto-proceed if a single sheet stalls past the step timeout; it
+            # finishes in the background and just shows up a moment later.
+            finished, val = _run_with_deadline(_make_sheet, step_to)
+            if finished and val:
+                char_created.append(val)
         except Exception:
             pass
     steps.append({"step": "characters", "created": len(char_created)})
 
     # ---- STEP 4: Batch render sequence frames ----
+    _check_stop(run_id)
     scenes = script.get("scenes") or []
     frames_ok, frames_fail = 0, 0
     for sc in scenes:
+        _check_stop(run_id)
         p = (sc.get("prompt") or "").strip()
         if not p:
             continue
+        # Each frame self-heals via the image_queue throttle (backoff + cooldown
+        # on rate limits) so the run no longer dies on a single 429.
         try:
             rec = _render_one(p, size, quality, True, True,
                               character_ids=None, request=request)
@@ -3829,107 +4241,36 @@ def api_autopilot(body: AutopilotIn, request: Request):
             frames_fail += 1
     steps.append({"step": "frames", "rendered": frames_ok, "failed": frames_fail})
 
-    # ---- STEP 5: Voice-over + video assembly ----
+    # ---- STEP 5: Voice-over + video assembly (natural flow) ----
+    #  ONE continuous narration track + frames timed to it + micro-cuts on long
+    #  holds — the audio is never chopped per-scene, so it sounds natural.
+    _check_stop(run_id)
     st = store.load_state()
     seq = st.get("sequence") or []
-    lines = _scene_vo_lines(st)
-    n = min(len(seq), len(lines))
     video_url = None
     total_seconds = 0
-
-    if n > 0 and any(lines):
-        voice_id = s["elevenlabs_voice_id"]
-        client = get_voice_client(request, voice_id)
-        work = os.path.join(store.VIDEOS_DIR, f"_ap_{store.new_id('tmp')}")
-        os.makedirs(work, exist_ok=True)
+    vo_text = _script_voiceover_text(st)
+    if seq and vo_text:
         try:
-            clip_paths = []
-            shots = []
-            scene_map = []
-            for i in range(n):
-                line = lines[i] or ""
-                try:
-                    img_path = store.url_to_path(seq[i]["image_url"])
-                except Exception:
-                    continue
-                try:
-                    mp3 = client.synthesize(line)
-                except Exception:
-                    continue
-                ap = os.path.join(work, f"vo_{i:03d}.mp3")
-                with open(ap, "wb") as f:
-                    f.write(mp3)
-                try:
-                    d = editor.probe_duration(ap)
-                except Exception:
-                    d = 0.0
-                if d <= 0.05:
-                    d = 0.8
-                hold = round(d + 0.12, 3)
-                clip_paths.append((ap, hold, d))
-                shots.append({"path": img_path, "duration": hold,
-                              "note": (line[:60] if line else "")})
-                scene_map.append({"index": seq[i].get("index", i + 1),
-                                  "vo": line, "audio_seconds": round(d, 2),
-                                  "hold_seconds": hold})
-
-            if shots and clip_paths:
-                track = os.path.join(work, "vo_track.mp3")
-                concat_inputs, filt = [], ""
-                for j, (ap, hold, _d) in enumerate(clip_paths):
-                    concat_inputs += ["-i", ap]
-                    filt += f"[{j}:a]apad=whole_dur={hold}[a{j}];"
-                filt += "".join(f"[a{j}]" for j in range(len(clip_paths)))
-                filt += f"concat=n={len(clip_paths)}:v=0:a=1[out]"
-                cc = subprocess.run(
-                    ["ffmpeg", "-y", *concat_inputs, "-filter_complex", filt,
-                     "-map", "[out]", "-c:a", "libmp3lame", "-q:a", "4", track],
-                    capture_output=True, text=True)
-                track_path = track if (cc.returncode == 0 and os.path.exists(track)) else None
-                track_url = None
-                if track_path:
-                    with open(track_path, "rb") as f:
-                        track_url, _tp = store.write_binary(
-                            "audio", f.read(), ext="mp3", name_hint="autopilot_vo")
-
-                out_name = f"edit_{int(time.time())}.mp4"
-                out_path = os.path.join(store.VIDEOS_DIR, out_name)
-                editor.assemble_video(
-                    shots, track_path, out_path,
-                    transition=body.transition,
-                    width=body.width, height=body.height, fps=body.fps,
-                    motion=body.motion,
-                )
-                rel = os.path.relpath(out_path, store.DATA_DIR).replace(os.sep, "/")
-                video_url = f"/data/{rel}"
-                total_seconds = round(sum(h for _a, h, _d in clip_paths), 2)
-
-                st = store.load_state()
-                if track_url:
-                    st["voiceover"] = {
-                        "id": store.new_id("vo"), "url": track_url,
-                        "voice_id": voice_id, "mode": "scenes",
-                        "duration": total_seconds, "scenes": scene_map,
-                        "created": store.now(),
-                    }
-                edit_rec = {
-                    "id": store.new_id("edit"), "url": video_url,
-                    "transition": body.transition,
-                    "plan": {"mode": "autopilot", "total_duration": total_seconds,
-                             "shots": scene_map},
-                    "created": store.now(),
-                }
-                st.setdefault("edits", []).append(edit_rec)
-                store.save_state(st)
-                store.log_usage("voice", n, round(total_seconds * 0.0002, 4))
-                store.log_usage("video", 1, 0.0)
-        finally:
-            shutil.rmtree(work, ignore_errors=True)
+            finished, val = _run_with_deadline(
+                lambda: _build_flow_video(
+                    st, request, voice_id=voice_id, text=vo_text,
+                    transition=body.transition, width=body.width,
+                    height=body.height, fps=body.fps, max_hold=body.max_hold,
+                    motion=body.motion, name_hint="autopilot_vo"),
+                step_to * 4)            # assembly can be slow; give it room
+            if finished and val:
+                _edit_rec, video_url, total_seconds, _sm = val
+        except HTTPException:
+            pass
+        except Exception as ex:
+            print(f"[autopilot] video step skipped: {ex}", flush=True)
 
     steps.append({"step": "video", "url": video_url,
-                  "duration": total_seconds, "scenes_voiced": n})
+                  "duration": total_seconds, "scenes_voiced": len(seq)})
 
     # ---- STEP 6: Thumbnail ----
+    _check_stop(run_id)
     thumb_url = None
     try:
         thumb_title = title or (script.get("title") or "")
@@ -3979,8 +4320,11 @@ def api_autopilot(body: AutopilotIn, request: Request):
 
     steps.append({"step": "thumbnail", "url": thumb_url})
 
+    with _AUTOPILOT_LOCK:
+        _AUTOPILOT_STOP.discard(run_id)
     return {
         "ok": True,
+        "run_id": run_id,
         "steps": steps,
         "suggestion": pick,
         "video_url": video_url,

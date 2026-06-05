@@ -165,6 +165,34 @@ def save_state(state):
     return state
 
 
+# Explicit-project variants — used by background workers (e.g. the image queue)
+# so results always land in the project that was active when the batch was
+# submitted, even if the user switches projects mid-run.
+def load_state_for(pid):
+    if not pid:
+        return load_state()
+    p = _project_path(pid)
+    if not os.path.exists(p):
+        return _default_state()
+    with open(p, "r", encoding="utf-8") as f:
+        st = json.load(f)
+    for k, v in _DEFAULT_STATE.items():
+        st.setdefault(k, json.loads(json.dumps(v)))
+    return st
+
+
+def save_state_for(pid, state):
+    if not pid:
+        return save_state(state)
+    _save_project(pid, state)
+    idx = _read_index()
+    for p in idx.get("projects", []):
+        if p["id"] == pid:
+            p["updated"] = now()
+    _write_index(idx)
+    return state
+
+
 # --------------------------------------------------------------------------- #
 #  Project management
 # --------------------------------------------------------------------------- #

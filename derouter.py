@@ -18,6 +18,7 @@ import requests
 from openai import OpenAI, APIError, APIConnectionError, APITimeoutError, AuthenticationError
 
 import config
+import image_queue
 
 
 def _log(msg):
@@ -100,8 +101,21 @@ class ImageClient:
     # ------------------------------------------------------------------ #
     #  Public
     # ------------------------------------------------------------------ #
-    def generate(self, prompt, size=None, quality=None):
-        """Text -> image. Returns PNG bytes."""
+    def generate(self, prompt, size=None, quality=None, retry=True, index=0):
+        """Text -> image. Returns PNG bytes.
+
+        With ``retry=True`` (default) the call is routed through the shared
+        image_queue throttle: bounded concurrency, request spacing, exponential
+        backoff on server errors and a global cooldown on rate-limit/429 errors.
+        Pass ``retry=False`` when an outer queue is already managing retries.
+        """
+        if not retry:
+            return self._generate_once(prompt, size, quality)
+        return image_queue.run_with_retry(
+            lambda: self._generate_once(prompt, size, quality),
+            index=index, model=self.model, label="generate")
+
+    def _generate_once(self, prompt, size=None, quality=None):
         self._require_key()
         size = size or config.DEFAULT_SIZE
         quality = quality or config.DEFAULT_QUALITY
@@ -138,7 +152,20 @@ class ImageClient:
             )
         return base64.b64decode(r.data[0].b64_json)
 
-    def edit(self, prompt, images, size=None, quality=None, mask=None):
+    def edit(self, prompt, images, size=None, quality=None, mask=None,
+             retry=True, index=0):
+        """Reference image(s) + prompt -> image. See ``generate`` for the retry
+        semantics; ``retry=True`` (default) routes through the image_queue
+        throttle (backoff + cooldown + concurrency)."""
+        if not retry:
+            return self._edit_once(prompt, images, size=size, quality=quality,
+                                   mask=mask)
+        return image_queue.run_with_retry(
+            lambda: self._edit_once(prompt, images, size=size, quality=quality,
+                                    mask=mask),
+            index=index, model=self.model, label="edit")
+
+    def _edit_once(self, prompt, images, size=None, quality=None, mask=None):
         """Reference image(s) + prompt -> image. ``images`` is list[bytes].
 
         ``mask`` (optional PNG bytes) enables inpainting: transparent areas of
