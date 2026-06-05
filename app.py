@@ -861,22 +861,28 @@ def _render_one(g_prompt, size, quality, continue_prev, style_lock,
         img = client.generate(full_prompt, size=size, quality=quality)
         mode = "generate"
 
-    rec = {
-        "id": store.new_id("shot"),
-        "index": len(st["sequence"]) + 1,
-        "prompt": g_prompt.strip(),
-        "full_prompt": full_prompt,
-        "image_url": store.write_image("images", img),
-        "mode": mode,
-        "size": size,
-        "quality": quality,
-        "characters": [c["name"] for c in matched],
-        "refs": ref_meta,
-        "continued_from": prev["id"] if prev else None,
-        "created": store.now(),
-    }
-    st["sequence"].append(rec)
-    store.save_state(st)
+    # Append under a lock against a FRESH read so concurrent renderers (e.g. a
+    # background character-sheet thread or the image queue) can't clobber each
+    # other's sequence or collide on the frame index.
+    image_url = store.write_image("images", img)
+    with _state_write_lock:
+        fresh = store.load_state()
+        rec = {
+            "id": store.new_id("shot"),
+            "index": len(fresh["sequence"]) + 1,
+            "prompt": g_prompt.strip(),
+            "full_prompt": full_prompt,
+            "image_url": image_url,
+            "mode": mode,
+            "size": size,
+            "quality": quality,
+            "characters": [c["name"] for c in matched],
+            "refs": ref_meta,
+            "continued_from": prev["id"] if prev else None,
+            "created": store.now(),
+        }
+        fresh["sequence"].append(rec)
+        store.save_state(fresh)
     _cost = {"low": 0.02, "medium": 0.04, "high": 0.08, "auto": 0.06}
     store.log_usage("image", 1, _cost.get(quality, 0.06))
     return rec
@@ -4210,6 +4216,8 @@ class AutopilotIn(BaseModel):
     dynamic: bool = True               # reaction-rich, varied-background scenes
     fresh: bool = True                 # wipe the previous run's frames/video/etc.
                                        # before generating so they don't mix
+    orientation: Optional[str] = None  # "vertical" (9:16 Shorts), "square", or
+                                       # "landscape" (default) — sets frame + video size
 
 
 # --- Autopilot run control: stop flag + per-step deadline ------------------- #
@@ -4459,6 +4467,14 @@ def api_autopilot(body: AutopilotIn, request: Request):
 
     quality = body.quality or config.DEFAULT_QUALITY
     size = body.size or config.DEFAULT_SIZE
+    width, height = body.width, body.height
+    orient = (body.orientation or "").lower()
+    if orient in ("vertical", "portrait", "9:16", "shorts", "tiktok"):
+        size = body.size or "1024x1536"        # portrait frames
+        width, height = 1080, 1920             # 9:16 video
+    elif orient in ("square", "1:1"):
+        size = body.size or "1024x1024"
+        width, height = 1080, 1080
     voice_id = body.voice_id or s["elevenlabs_voice_id"]
     claude = _claude_client_for(body.model, request)
     steps = []
@@ -4550,9 +4566,10 @@ def api_autopilot(body: AutopilotIn, request: Request):
                 "sheet_url": store.write_image("characters", img),
                 "prompt": prompt, "source": "generated",
             }
-            cur = store.load_state()
-            cur["characters"].append(rec)
-            store.save_state(cur)
+            with _state_write_lock:
+                cur = store.load_state()
+                cur["characters"].append(rec)
+                store.save_state(cur)
             store.log_usage("image", 1, 0.08)
             return name
         try:
@@ -4598,17 +4615,16 @@ def api_autopilot(body: AutopilotIn, request: Request):
     total_seconds = 0
     vo_text = _script_voiceover_text(st)
     if seq and vo_text:
+        # Awaited fully (NOT under a deadline): it's the core deliverable, and a
+        # backgrounded build would later save a stale state and clobber the
+        # thumbnail/SEO saved after it. Its sub-calls (TTS/ffmpeg) are bounded.
         try:
-            finished, val = _run_with_deadline(
-                lambda: _build_flow_video(
-                    st, request, voice_id=voice_id, text=vo_text,
-                    transition=body.transition, width=body.width,
-                    height=body.height, fps=body.fps, max_hold=body.max_hold,
-                    motion=body.motion, name_hint="autopilot_vo",
-                    sound_design=body.sound_design),
-                step_to * 6)            # assembly + SFX gen can be slow; give it room
-            if finished and val:
-                _edit_rec, video_url, total_seconds, _sm = val
+            _edit_rec, video_url, total_seconds, _sm = _build_flow_video(
+                st, request, voice_id=voice_id, text=vo_text,
+                transition=body.transition, width=width,
+                height=height, fps=body.fps, max_hold=body.max_hold,
+                motion=body.motion, name_hint="autopilot_vo",
+                sound_design=body.sound_design)
         except HTTPException:
             pass
         except Exception as ex:
