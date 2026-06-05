@@ -15,6 +15,10 @@ import re
 import sys
 from typing import List, Optional
 
+import random
+import threading
+import time
+
 import anthropic
 from anthropic import (
     APIError,
@@ -22,9 +26,52 @@ from anthropic import (
     APITimeoutError,
     AuthenticationError,
 )
+try:
+    from anthropic import RateLimitError
+except Exception:                       # very old SDKs
+    class RateLimitError(Exception):
+        pass
 import requests
 
 import config
+
+# --- Claude rate-limit handling --------------------------------------------
+# The key enforces a CONCURRENT-request cap per model (e.g. "limit: 2 in-flight")
+# plus the usual tokens-per-minute limits. We (a) cap how many Claude requests
+# run at once process-wide so we don't trip the concurrent limit, and (b) retry
+# 429 / 5xx / connection errors with backoff, honouring the server's
+# `retry_after_sec` / Retry-After hint. Tunable via env.
+CLAUDE_MAX_CONCURRENCY = max(1, int(float(config._get("CLAUDE_MAX_CONCURRENCY", "1"))))
+CLAUDE_MAX_RETRIES = max(0, int(float(config._get("CLAUDE_MAX_RETRIES", "6"))))
+CLAUDE_BACKOFF_BASE_MS = max(100, int(float(config._get("CLAUDE_BACKOFF_BASE_MS", "1500"))))
+CLAUDE_BACKOFF_MAX_MS = max(1000, int(float(config._get("CLAUDE_BACKOFF_MAX_MS", "30000"))))
+
+_CLAUDE_SEM = threading.Semaphore(CLAUDE_MAX_CONCURRENCY)
+
+
+def _retry_after_seconds(e, default):
+    """Pull a retry hint from a RateLimitError: Retry-After header or the body's
+    retry_after_sec. Falls back to ``default``."""
+    resp = getattr(e, "response", None)
+    if resp is not None:
+        try:
+            ra = resp.headers.get("retry-after")
+            if ra:
+                return float(ra)
+        except Exception:
+            pass
+    try:
+        body = getattr(e, "body", None) or {}
+        err = body.get("error") if isinstance(body, dict) else {}
+        if isinstance(err, dict) and err.get("retry_after_sec"):
+            return float(err["retry_after_sec"])
+    except Exception:
+        pass
+    low = str(e).lower()
+    m = re.search(r"retry_after_sec[\"'\s:=]+(\d+(?:\.\d+)?)", low)
+    if m:
+        return float(m.group(1))
+    return default
 
 
 def _log(msg):
@@ -148,27 +195,68 @@ class ClaudeClient:
         mode = "messages.stream" if stream else "messages.create"
         _log(f"{mode} model={self.model} max_tokens={max_tokens} "
              f"blocks={len(content_blocks)} base={self.base_url}")
-        try:
-            if stream:
-                try:
-                    with self._sdk.messages.stream(**kwargs) as s:
-                        resp = s.get_final_message()
-                except (AssertionError, AttributeError):
-                    # Proxy gave us a non-standard stream — retry without it.
-                    _log("stream produced no final message; retrying non-streamed")
-                    resp = self._sdk.messages.create(**kwargs)
-            else:
-                resp = self._sdk.messages.create(**kwargs)
-        except (APIConnectionError, APITimeoutError) as e:
-            raise RuntimeError(
-                f"could not reach Claude API at {self.base_url} — {self._format_err(e)}"
-            )
-        except AuthenticationError as e:
-            raise RuntimeError(
-                f"Claude API rejected the key — {self._format_err(e)}"
-            )
-        except APIError as e:
-            raise RuntimeError(f"Claude API error — {self._format_err(e)}")
+
+        def _backoff(attempt):
+            raw = CLAUDE_BACKOFF_BASE_MS * (2 ** (attempt - 1)) + \
+                random.uniform(0, CLAUDE_BACKOFF_BASE_MS)
+            return min(raw, CLAUDE_BACKOFF_MAX_MS) / 1000.0
+
+        # Cap concurrent Claude calls (avoids the "limit: 2 in-flight" 429) and
+        # retry 429 / 5xx / connection errors with backoff, honouring the
+        # server's retry-after hint. The semaphore is released between attempts
+        # so a backoff sleep never holds a slot.
+        attempt = 0
+        while True:
+            try:
+                with _CLAUDE_SEM:
+                    if stream:
+                        try:
+                            with self._sdk.messages.stream(**kwargs) as s:
+                                resp = s.get_final_message()
+                        except (AssertionError, AttributeError):
+                            # Proxy gave us a non-standard stream — retry without it.
+                            _log("stream produced no final message; retrying non-streamed")
+                            resp = self._sdk.messages.create(**kwargs)
+                    else:
+                        resp = self._sdk.messages.create(**kwargs)
+                break
+            except AuthenticationError as e:
+                raise RuntimeError(
+                    f"Claude API rejected the key — {self._format_err(e)}")
+            except RateLimitError as e:
+                attempt += 1
+                if attempt > CLAUDE_MAX_RETRIES:
+                    raise RuntimeError(
+                        f"Claude API rate limit — gave up after {attempt-1} "
+                        f"retries: {self._format_err(e)}")
+                wait = _retry_after_seconds(e, default=5.0) + random.uniform(0, 1.0)
+                _log(f"429 rate_limit (attempt {attempt}) — waiting {wait:.1f}s "
+                     f"then retrying")
+                time.sleep(wait)
+            except (APIConnectionError, APITimeoutError) as e:
+                attempt += 1
+                if attempt > CLAUDE_MAX_RETRIES:
+                    raise RuntimeError(
+                        f"could not reach Claude API at {self.base_url} — "
+                        f"{self._format_err(e)}")
+                wait = _backoff(attempt)
+                _log(f"connection/timeout (attempt {attempt}) — backing off "
+                     f"{wait:.1f}s")
+                time.sleep(wait)
+            except APIError as e:
+                status = getattr(e, "status_code", None)
+                if status and 500 <= int(status) < 600:
+                    attempt += 1
+                    if attempt > CLAUDE_MAX_RETRIES:
+                        raise RuntimeError(
+                            f"Claude API server error — gave up after "
+                            f"{attempt-1} retries: {self._format_err(e)}")
+                    wait = _backoff(attempt)
+                    _log(f"server {status} (attempt {attempt}) — backing off "
+                         f"{wait:.1f}s")
+                    time.sleep(wait)
+                else:
+                    raise RuntimeError(f"Claude API error — {self._format_err(e)}")
 
         # Collect text from all text blocks.
         out = []

@@ -139,6 +139,7 @@ class _Throttle:
         self._cooldown_until = 0.0     # wall-clock; queue paused until then
         self._next_slot = 0.0          # earliest time the next request may start
         self._cooldown_reason = ""
+        self._rl_streak = 0            # consecutive rate-limits since last success
         self.inflight = 0
         self.completed = 0
         self.failed = 0
@@ -146,11 +147,20 @@ class _Throttle:
     # -- cooldown (retry-storm prevention) --------------------------------- #
     def trigger_cooldown(self, reason="rate limit"):
         with self._lock:
-            until = time.time() + config.IMAGE_RATE_LIMIT_COOLDOWN_MS / 1000.0
-            # Extend, never shorten — coalesces a burst of 429s into ONE pause.
-            if until > self._cooldown_until:
+            # Adaptive: start short and escalate only if the limit stays
+            # saturated (no success between hits), capped at one full TPM window.
+            # A success resets the streak so normal batches stay fast.
+            self._rl_streak += 1
+            base = config.IMAGE_RATE_LIMIT_COOLDOWN_MS / 1000.0
+            wait = min(base * self._rl_streak, 60.0)
+            until = time.time() + wait
+            if until > self._cooldown_until:   # extend, never shorten
                 self._cooldown_until = until
                 self._cooldown_reason = reason
+
+    def note_success(self):
+        with self._lock:
+            self._rl_streak = 0
 
     def cooldown_remaining(self) -> float:
         return max(0.0, self._cooldown_until - time.time())
@@ -290,6 +300,7 @@ def run_with_retry(fn: Callable, *, index: int = 0, model: str = "",
             _sleep_interruptible(delay or 0, should_stop)
             continue
         else:
+            THROTTLE.note_success()        # reset the adaptive cooldown streak
             with THROTTLE._lock:
                 THROTTLE.completed += 1
             _log(label=label, index=index, model=model, attempt=attempt + 1,
