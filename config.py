@@ -58,6 +58,14 @@ SUPPORTED_SIZES = [
 ]
 SUPPORTED_QUALITIES = ["low", "medium", "high", "auto"]
 
+AUTH_REQUIRED = _get("AUTH_REQUIRED", "false").lower() in ("1", "true", "yes")
+SESSION_SECRET = _get("SESSION_SECRET", "continuity-studio-default-session-key")
+
+# --- Google OAuth (YouTube upload + Drive export) ---
+GOOGLE_CLIENT_ID = _get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = _get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REDIRECT_URI = _get("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/google/callback")
+
 CLAUDE_MODELS = [
     "claude-opus-4-8",
     "claude-opus-4-7",

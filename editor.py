@@ -54,24 +54,108 @@ def detect_scenes(video_path: str, threshold: float = 0.4) -> List[float]:
     return times
 
 
+# ffmpeg xfade transition names we expose (crossfade is an alias of "fade").
+_XFADE = {"fade", "dissolve", "slideleft", "slideright", "slideup", "slidedown",
+          "wipeleft", "wiperight", "circleopen", "circleclose", "radial",
+          "zoomin", "smoothleft", "smoothright", "fadeblack", "fadewhite"}
+
+
+def bookend_video(main_path, out_path, intro_img=None, outro_img=None,
+                  dur=2.2, width=1920, height=1080, fps=30):
+    """Concatenate optional silent intro/outro title cards around a finished
+    video. Re-encodes via the concat filter so differing params don't matter.
+    Returns out_path, or main_path if there's nothing to add."""
+    if not intro_img and not outro_img:
+        return main_path
+    workdir = os.path.dirname(out_path) or "."
+    tmp = os.path.join(workdir, "_bk_tmp")
+    os.makedirs(tmp, exist_ok=True)
+
+    def _card(img, name):
+        cp = os.path.join(tmp, name)
+        vf = (f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+              f"crop={width}:{height},setsar=1,"
+              f"fade=t=in:st=0:d=0.4,fade=t=out:st={max(0,dur-0.4):.3f}:d=0.4")
+        cmd = ["ffmpeg", "-y", "-loop", "1", "-t", f"{dur:.3f}", "-i", img,
+               "-f", "lavfi", "-t", f"{dur:.3f}",
+               "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+               "-vf", vf, "-r", str(fps),
+               "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
+               "-crf", "20", "-c:a", "aac", "-b:a", "192k", "-shortest", cp]
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        if p.returncode != 0:
+            raise RuntimeError(f"card failed: {p.stderr[-300:]}")
+        return cp
+
+    def _has_audio(path):
+        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a",
+                            "-show_entries", "stream=index", "-of", "csv=p=0", path],
+                           capture_output=True, text=True)
+        return bool(r.stdout.strip())
+
+    def _with_audio(path, name):
+        """Guarantee an audio stream so the concat filter has [i:a] for every part."""
+        if _has_audio(path):
+            return path
+        outp = os.path.join(tmp, name)
+        cmd = ["ffmpeg", "-y", "-i", path, "-f", "lavfi",
+               "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+               "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+               "-c:a", "aac", "-b:a", "192k", "-shortest", outp]
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        return outp if p.returncode == 0 else path
+
+    parts = []
+    if intro_img:
+        parts.append(_card(intro_img, "intro.mp4"))
+    parts.append(_with_audio(main_path, "main_a.mp4"))
+    if outro_img:
+        parts.append(_card(outro_img, "outro.mp4"))
+
+    inputs = []
+    for p in parts:
+        inputs += ["-i", p]
+    fc = ("".join(f"[{i}:v][{i}:a]" for i in range(len(parts))) +
+          f"concat=n={len(parts)}:v=1:a=1[v][a]")
+    cmd = ["ffmpeg", "-y", *inputs, "-filter_complex", fc,
+           "-map", "[v]", "-map", "[a]",
+           "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
+           "-crf", "20", "-c:a", "aac", "-b:a", "192k", out_path]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    import shutil
+    shutil.rmtree(tmp, ignore_errors=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"bookend concat failed: {p.stderr[-400:]}")
+    return out_path
+
+
 def assemble_video(
     shots: List[Dict],         # [{path:str, duration:float, note?:str}]
     audio_path: Optional[str],
     output_path: str,
-    transition: str = "cut",   # cut | fade | crossfade
+    transition: str = "cut",   # cut | fade | crossfade | any xfade name
     width: int = 1920,
     height: int = 1080,
     fps: int = 30,
     fit: str = "fill",         # fill = crop to fill (no bars) | pad = letterbox
+    motion: bool = False,      # Ken Burns slow zoom on each still
+    music_path: Optional[str] = None,
+    music_volume: float = 0.18,
 ) -> str:
-    """Stitch ``shots`` into a single MP4 with optional audio overlay.
+    """Stitch ``shots`` into a single MP4 with optional voice-over + music.
 
     ``cut``        -> concat demuxer
     ``fade``       -> per-shot fade-in/out (uniform 0.25s)
-    ``crossfade``  -> xfade chain between adjacent shots (0.4s)
+    ``crossfade`` / any xfade name -> xfade chain between adjacent shots (0.4s)
+    ``motion``     -> slow Ken Burns zoom on every still
+    ``music_path`` -> looped, ducked under the voice-over
     """
     if not shots:
         raise ValueError("no shots provided")
+    # Decide how clips are combined.
+    is_xfade = (transition == "crossfade") or (transition in _XFADE)
+    xfade_name = "fade" if transition == "crossfade" else (
+        transition if transition in _XFADE else "fade")
 
     workdir = os.path.dirname(output_path) or "."
     os.makedirs(workdir, exist_ok=True)
@@ -96,18 +180,31 @@ def assemble_video(
                 f"scale={width}:{height}:force_original_aspect_ratio=increase,"
                 f"crop={width}:{height},setsar=1"
             )
+        if motion:
+            frames = max(2, round(dur * fps))
+            vf += (f",zoompan=z='min(zoom+0.0010,1.18)':"
+                   f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+                   f"d={frames}:s={width}x{height}:fps={fps},setsar=1")
         if transition == "fade":
             fade_d = min(0.25, dur / 4)
             vf += f",fade=t=in:st=0:d={fade_d},fade=t=out:st={max(0,dur-fade_d):.3f}:d={fade_d}"
-        cmd = [
-            "ffmpeg", "-y",
-            "-loop", "1", "-t", f"{dur:.3f}",
-            "-i", sh["path"],
-            "-vf", vf,
-            "-r", str(fps),
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "20",
-            clip,
-        ]
+        if motion:
+            # Ken Burns: cap by OUTPUT frame count (not -t) so zoompan doesn't
+            # explode the duration when fed a looped still.
+            frames = max(2, round(dur * fps))
+            cmd = [
+                "ffmpeg", "-y", "-loop", "1", "-i", sh["path"],
+                "-vf", vf, "-frames:v", str(frames), "-r", str(fps),
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "20",
+                clip,
+            ]
+        else:
+            cmd = [
+                "ffmpeg", "-y", "-loop", "1", "-t", f"{dur:.3f}",
+                "-i", sh["path"], "-vf", vf, "-r", str(fps),
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "20",
+                clip,
+            ]
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0:
             raise RuntimeError(f"ffmpeg clip failed [{i}]: {proc.stderr[-500:]}")
@@ -115,7 +212,7 @@ def assemble_video(
 
     # 2. Combine clips.
     silent_video = os.path.join(tmp_dir, "video.mp4")
-    if transition == "crossfade" and len(clip_paths) > 1:
+    if is_xfade and len(clip_paths) > 1:
         # Chain xfades. We rebuild via a single filter graph using the inputs.
         inputs = []
         for cp, _ in clip_paths:
@@ -128,7 +225,7 @@ def assemble_video(
             offset = max(0, cum - xfade_d)
             new_label = f"v{i}"
             filtergraph += (
-                f"[{last_label}][{i}:v]xfade=transition=fade:duration={xfade_d}:"
+                f"[{last_label}][{i}:v]xfade=transition={xfade_name}:duration={xfade_d}:"
                 f"offset={offset:.3f}[{new_label}];"
             )
             last_label = new_label
@@ -154,11 +251,31 @@ def assemble_video(
         if proc.returncode != 0:
             raise RuntimeError(f"ffmpeg concat failed: {proc.stderr[-600:]}")
 
-    # 3. Mux audio if provided, else leave silent.
-    if audio_path and os.path.exists(audio_path):
+    # 3. Mux audio (voice-over) and/or looped, ducked background music.
+    has_vo = bool(audio_path and os.path.exists(audio_path))
+    has_music = bool(music_path and os.path.exists(music_path))
+    mv = max(0.0, min(1.0, float(music_volume)))
+    if has_vo and has_music:
+        cmd = ["ffmpeg", "-y",
+               "-i", silent_video, "-i", audio_path,
+               "-stream_loop", "-1", "-i", music_path,
+               "-filter_complex",
+               f"[1:a]volume=1[vo];[2:a]volume={mv}[mu];"
+               f"[vo][mu]amix=inputs=2:duration=longest:normalize=0[a]",
+               "-map", "0:v:0", "-map", "[a]",
+               "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+               "-shortest", output_path]
+    elif has_vo:
         cmd = ["ffmpeg", "-y",
                "-i", silent_video, "-i", audio_path,
                "-map", "0:v:0", "-map", "1:a:0",
+               "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+               "-shortest", output_path]
+    elif has_music:
+        cmd = ["ffmpeg", "-y",
+               "-i", silent_video, "-stream_loop", "-1", "-i", music_path,
+               "-filter_complex", f"[1:a]volume={mv}[a]",
+               "-map", "0:v:0", "-map", "[a]",
                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
                "-shortest", output_path]
     else:
@@ -180,4 +297,39 @@ def assemble_video(
     except Exception:
         pass
 
+    return output_path
+
+
+def mix_sfx(video_path: str, sfx_list: List[Dict], output_path: str = None) -> str:
+    """Overlay SFX clips at given timestamps onto an existing video.
+
+    sfx_list: [{path:str, at_seconds:float, volume:float(0-1)}]
+    """
+    if not sfx_list or not os.path.exists(video_path):
+        return video_path
+    if output_path is None:
+        base, ext = os.path.splitext(video_path)
+        output_path = f"{base}_sfx{ext}"
+
+    inputs = ["-i", video_path]
+    for sfx in sfx_list:
+        inputs += ["-i", sfx["path"]]
+
+    filt_parts = []
+    for i, sfx in enumerate(sfx_list):
+        delay_ms = int(max(0, sfx.get("at_seconds", 0)) * 1000)
+        vol = max(0, min(1.0, sfx.get("volume", 0.8)))
+        filt_parts.append(f"[{i+1}:a]adelay={delay_ms}|{delay_ms},volume={vol}[sfx{i}]")
+
+    main_audio = "[0:a]"
+    all_labels = [main_audio] + [f"[sfx{i}]" for i in range(len(sfx_list))]
+    filt = ";".join(filt_parts) + ";" + "".join(all_labels) + f"amix=inputs={len(all_labels)}:duration=longest:normalize=0[out]"
+
+    cmd = ["ffmpeg", "-y", *inputs, "-filter_complex", filt,
+           "-map", "0:v:0", "-map", "[out]",
+           "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+           output_path]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"sfx mix failed: {proc.stderr[-500:]}")
     return output_path

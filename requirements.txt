@@ -6,3 +6,6 @@ anthropic>=0.40
 requests>=2.31
 Pillow>=10.0
 python-dotenv>=1.0
+cryptography>=41.0
+yt-dlp>=2024.0
+youtube-transcript-api>=0.6
