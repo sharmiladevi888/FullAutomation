@@ -888,6 +888,15 @@
               <label class="label" style="margin:0 0 4px">Per-step timer (sec)</label>
               <input type="number" id="apStepTimeout" value="60" min="15" max="600" step="5" style="width:120px" title="Auto-proceed if a heavy step stalls past this"/>
             </div>
+            <div style="min-width:170px">
+              <label class="label" style="margin:0 0 4px">Format</label>
+              <select id="apOrient" style="width:100%">
+                <option value="vertical">📱 Vertical 9:16 (Shorts/TikTok)</option>
+                <option value="landscape">🖥 Landscape 16:9 (YouTube)</option>
+                <option value="square">⬛ Square 1:1</option>
+              </select>
+            </div>
+            <label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer;min-width:150px"><input type="checkbox" id="apSfx" checked/> 🔊 Sound design</label>
           </div>
           <div id="apTopics" style="margin-top:14px; display:none"></div>
           <div id="apProgress" style="margin-top:12px; display:none"></div>
@@ -3989,7 +3998,7 @@ async function stopAutopilot(){
   try{ await api("/api/autopilot/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({run_id:AP_RUN_ID})}); toast("Stopping after the current step…",""); }
   catch(e){ toast(e.message,"err"); }
 }
-const AP_STEP_NAMES=["Analysing YouTube video","Generating script with Claude","Creating character sheets","Rendering sequence frames","Building narrated video","Designing thumbnail"];
+const AP_STEP_NAMES=["Analysing YouTube video","Generating script with Claude","Creating character sheets","Rendering sequence frames","Building narrated video + sound","Designing thumbnail","Writing YouTube SEO"];
 function apMark(i,cls){const d=document.querySelector(`#aps${i} .ap-dot`);if(d){d.className="ap-dot "+cls;}}
 function apSetStep(i){
   // advance the visible "active" dot and (re)start the per-step countdown.
@@ -4057,6 +4066,8 @@ async function runAutopilot(idx=0, fromCache=false){
   const target_seconds=parseFloat(($("#apLength")||{}).value)||null;
   const voice_id=($("#apVoice")||{}).value||undefined;
   const step_timeout=parseFloat(($("#apStepTimeout")||{}).value)||60;
+  const orientation=($("#apOrient")||{}).value||"vertical";
+  const sound_design=!($("#apSfx")&&!$("#apSfx").checked);
   AP_STEP_LIMIT=step_timeout;
   AP_RUN_ID="run_"+Date.now()+"_"+Math.random().toString(36).slice(2,7);
   $("#apTopics").style.display="none";
@@ -4071,7 +4082,7 @@ async function runAutopilot(idx=0, fromCache=false){
   const b=$("#apBtn"); busy(b,true,"Running — this may take several minutes…");
   $("#apStopBtn").style.display="inline-flex"; $("#apRegenBtn").style.display="none";
   try{
-    const d=await api("/api/autopilot",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url,nudge,target_seconds,voice_id,run_id:AP_RUN_ID,step_timeout,suggestion_index:idx,from_cache:fromCache})});
+    const d=await api("/api/autopilot",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url,nudge,target_seconds,voice_id,run_id:AP_RUN_ID,step_timeout,suggestion_index:idx,from_cache:fromCache,orientation,sound_design})});
     clearInterval(poll);
     STATE=await api("/api/state").then(r=>r.state);
     renderBoard(); renderCharacters(); renderCast(); renderEditsList();
