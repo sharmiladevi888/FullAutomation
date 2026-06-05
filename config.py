@@ -66,12 +66,16 @@ def _int(name, default):
         return default
 
 
-IMAGE_MAX_CONCURRENCY = max(1, _int("IMAGE_MAX_CONCURRENCY", 1))
-IMAGE_REQUEST_DELAY_MS = max(0, _int("IMAGE_REQUEST_DELAY_MS", 1500))
-IMAGE_MAX_RETRIES = max(0, _int("IMAGE_MAX_RETRIES", 5))
-IMAGE_BACKOFF_BASE_MS = max(100, _int("IMAGE_BACKOFF_BASE_MS", 2000))
-IMAGE_BACKOFF_MAX_MS = max(1000, _int("IMAGE_BACKOFF_MAX_MS", 60000))
-IMAGE_RATE_LIMIT_COOLDOWN_MS = max(1000, _int("IMAGE_RATE_LIMIT_COOLDOWN_MS", 65000))
+IMAGE_MAX_CONCURRENCY = max(1, _int("IMAGE_MAX_CONCURRENCY", 2))
+IMAGE_REQUEST_DELAY_MS = max(0, _int("IMAGE_REQUEST_DELAY_MS", 50))
+IMAGE_MAX_RETRIES = max(0, _int("IMAGE_MAX_RETRIES", 6))
+IMAGE_BACKOFF_BASE_MS = max(100, _int("IMAGE_BACKOFF_BASE_MS", 1500))
+IMAGE_BACKOFF_MAX_MS = max(1000, _int("IMAGE_BACKOFF_MAX_MS", 30000))
+# Wait after a rate-limit (429) before the queue resumes. The TPM window is ~60s,
+# but a fixed 65s overshoots when the limit is hit mid-window. We use a shorter
+# pause and simply re-poll (silently) — this self-tunes to how fast tokens free
+# up and recovers far quicker. Raise it if you still see frequent retries.
+IMAGE_RATE_LIMIT_COOLDOWN_MS = max(1000, _int("IMAGE_RATE_LIMIT_COOLDOWN_MS", 18000))
 
 # ffmpeg: frames-per-second to sample when splitting an uploaded video.
 FRAME_FPS = float(_get("FRAME_FPS", "1"))
