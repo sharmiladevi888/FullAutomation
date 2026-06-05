@@ -237,7 +237,8 @@ class ClaudeClient:
     def generate_script(self, title: str = "", description: str = "",
                         total_duration: float = 60.0, pacing_seconds: float = 1.0,
                         num_characters: int = 0, style_notes: str = "",
-                        master_prompt: str = "", brief: str = ""):
+                        master_prompt: str = "", brief: str = "",
+                        dialogue: bool = False):
         """Title + description -> full VO script + paced scene list + packed
         per-character sheet prompts.
 
@@ -284,6 +285,15 @@ class ClaudeClient:
             "written so it can be sent straight to a character-sheet generator. Use "
             "the exact same names as in the scene prompts."
         )
+        if dialogue:
+            system += (
+                "\n\nDIALOGUE MODE:\n"
+                '- Write each scene "vo" with speaker tags: [SPEAKER NAME]: Their line here.\n'
+                "- Use [NARRATOR]: for narration lines.\n"
+                "- Use the character's exact name in brackets for dialogue lines.\n"
+                '- The full "voiceover" must also use these speaker tags.\n'
+                "- Example: \"[NARRATOR]: The city sleeps.\\n[MAYA]: I can't stay here.\""
+            )
         bits = []
         if title.strip():
             bits.append(f"TITLE:\n{title.strip()}")
@@ -331,6 +341,254 @@ class ClaudeClient:
         return self.vision_describe(frames, "\n\n".join(instr_bits), system=system,
                                     max_tokens=6000)
 
+    def suggest_from_reference(self, frames: List[bytes], transcript: str = "",
+                               source_title: str = "", source_channel: str = "",
+                               nudge: str = "", master_prompt: str = "",
+                               n_suggestions: int = 10):
+        """Analyse a reference YouTube video (sampled frames + transcript) and
+        return STRICT JSON with a style read + N ready-to-produce video ideas in
+        the same vein.
+
+        Shape:
+          { "style_summary": str, "speech_style": str, "topic": str,
+            "suggestions": [ {
+                "title": str, "logline": str,
+                "num_characters": int,
+                "characters": [ { "name": str, "sheet_prompt": str } ],
+                "voiceover_style": str,
+                "image_prompt_style": str,
+                "pacing_seconds": number, "total_duration": number,
+                "scene_count": int
+            } ] }
+        """
+        system = (
+            "You are a viral short-form video strategist and film director. You "
+            "are shown sampled frames from a reference video plus its transcript. "
+            "Analyse its VISUAL STYLE (palette, lighting, framing, editing rhythm), "
+            "its TOPIC, and its WAY OF SPEAKING (tone, pacing, vocabulary, hooks). "
+            "Then invent fresh video ideas in the SAME spirit — same energy, format "
+            "and audience — that a creator could produce as a sequence of generated "
+            "still images with a voice-over.\n"
+            "Return STRICT JSON ONLY (no prose, no markdown fences):\n"
+            "{\n"
+            '  "style_summary": str,   // 2-3 sentences on the visual look\n'
+            '  "speech_style": str,    // how the narration talks (tone/pacing/hooks)\n'
+            '  "topic": str,           // what the source is about\n'
+            '  "suggestions": [ {\n'
+            '     "title": str,\n'
+            '     "logline": str,                 // one punchy sentence\n'
+            '     "num_characters": int,          // 0-8 recurring characters\n'
+            '     "characters": [ {"name": str, "sheet_prompt": str} ],\n'
+            '     "voiceover_style": str,          // how this VO should sound\n'
+            '     "image_prompt_style": str,       // the look every frame shares\n'
+            '     "pacing_seconds": number,        // seconds each image is on screen\n'
+            '     "total_duration": number,        // seconds\n'
+            '     "scene_count": int               // = round(total_duration/pacing)\n'
+            "  } ]\n"
+            "}\n"
+            f"RULES:\n- Produce EXACTLY {n_suggestions} suggestions, varied but all "
+            "true to the reference's style and audience.\n"
+            "- characters[].sheet_prompt is ONE rich paragraph of that character's "
+            "canonical look, ready for a character-sheet generator. If num_characters "
+            "is 0, characters is an empty list.\n"
+            "- Keep pacing_seconds, total_duration and scene_count internally "
+            "consistent (scene_count ≈ total_duration / pacing_seconds)."
+        )
+        bits = []
+        if source_title:
+            bits.append(f"SOURCE TITLE: {source_title}")
+        if source_channel:
+            bits.append(f"SOURCE CHANNEL: {source_channel}")
+        if transcript.strip():
+            bits.append("TRANSCRIPT (topic + speaking style):\n" + transcript.strip())
+        else:
+            bits.append("No transcript available — infer topic/voice from the frames.")
+        if nudge.strip():
+            bits.append(f"CREATOR'S EXTRA DIRECTION: {nudge.strip()}")
+        if master_prompt.strip():
+            bits.append(f"EXISTING WORLD / STYLE BIBLE: {master_prompt.strip()}")
+        bits.append(f"Now analyse the look and write EXACTLY {n_suggestions} "
+                    "suggestions. JSON only.")
+        # Frames first (vision), then the instruction text.
+        return self.vision_describe(frames, "\n\n".join(bits), system=system,
+                                    max_tokens=8000)
+
+    def suggest_from_references(self, frames: List[bytes], sources: List[dict],
+                                nudge: str = "", master_prompt: str = "",
+                                n_suggestions: int = 10):
+        """Analyse MANY reference YouTube videos at once and return a deep,
+        4-axis read of what they have in common plus N ready-to-produce video
+        ideas in that combined vein.
+
+        ``frames`` is a FLAT list of sampled stills pooled from every video.
+        ``sources`` is per-video metadata: [{title, channel, transcript}, ...].
+
+        Returns the raw model text (STRICT JSON). Caller runs extract_json().
+        Shape:
+          { "art_style": str, "pacing": str, "speech_style": str,
+            "storytelling": str, "sources_summary": str,
+            "suggestions": [ {
+                "title": str, "logline": str, "num_characters": int,
+                "characters": [ {"name": str, "sheet_prompt": str} ],
+                "voiceover_style": str, "image_prompt_style": str,
+                "pacing_seconds": number, "total_duration": number,
+                "scene_count": int
+            } ] }
+        """
+        system = (
+            "You are a viral short-form video strategist and film director. You "
+            "are shown sampled frames pooled from SEVERAL reference videos plus "
+            "their transcripts. Study what they share and deconstruct it along "
+            "FOUR axes:\n"
+            "  1. ART STYLE  — palette, lighting, framing, texture, the visual look\n"
+            "  2. PACING     — shot length, editing rhythm, energy, how fast it moves\n"
+            "  3. WAY OF SPEAKING — narration tone, vocabulary, hooks, cadence\n"
+            "  4. STORYTELLING — structure, how a hook opens, how tension builds, payoff\n"
+            "Then invent fresh video ideas that fuse those four qualities — same "
+            "spirit, format and audience — producible as a sequence of generated "
+            "still images with a voice-over.\n"
+            "Return STRICT JSON ONLY (no prose, no markdown fences):\n"
+            "{\n"
+            '  "art_style": str,        // 2-3 sentences on the shared visual look\n'
+            '  "pacing": str,           // how fast/slow it cuts and why it works\n'
+            '  "speech_style": str,     // how the narration talks (tone/hooks/cadence)\n'
+            '  "storytelling": str,     // shared narrative structure & hook strategy\n'
+            '  "sources_summary": str,  // 1-2 sentences on what these videos are about\n'
+            '  "suggestions": [ {\n'
+            '     "title": str,\n'
+            '     "logline": str,                 // one punchy sentence\n'
+            '     "num_characters": int,          // 0-8 recurring characters\n'
+            '     "characters": [ {"name": str, "sheet_prompt": str} ],\n'
+            '     "voiceover_style": str,          // how this VO should sound\n'
+            '     "image_prompt_style": str,       // the look every frame shares\n'
+            '     "pacing_seconds": number,        // seconds each image is on screen\n'
+            '     "total_duration": number,        // seconds\n'
+            '     "scene_count": int               // = round(total_duration/pacing)\n'
+            "  } ]\n"
+            "}\n"
+            f"RULES:\n- Produce EXACTLY {n_suggestions} suggestions, varied but all "
+            "true to the references' combined style and audience.\n"
+            "- characters[].sheet_prompt is ONE rich paragraph of that character's "
+            "canonical look, ready for a character-sheet generator. If num_characters "
+            "is 0, characters is an empty list.\n"
+            "- Keep pacing_seconds, total_duration and scene_count internally "
+            "consistent (scene_count ≈ total_duration / pacing_seconds)."
+        )
+        bits = [f"You are analysing {len(sources)} reference video(s)."]
+        for i, src in enumerate(sources, 1):
+            head = f"--- SOURCE {i}"
+            if src.get("title"):
+                head += f": {src['title']}"
+            if src.get("channel"):
+                head += f"  (channel: {src['channel']})"
+            bits.append(head)
+            tr = (src.get("transcript") or "").strip()
+            bits.append("TRANSCRIPT:\n" + tr if tr else
+                        "No transcript — infer topic/voice from the frames.")
+        if nudge.strip():
+            bits.append(f"CREATOR'S EXTRA DIRECTION: {nudge.strip()}")
+        if master_prompt.strip():
+            bits.append(f"EXISTING WORLD / STYLE BIBLE: {master_prompt.strip()}")
+        bits.append(
+            "Now deconstruct the shared ART STYLE, PACING, WAY OF SPEAKING and "
+            f"STORYTELLING, then write EXACTLY {n_suggestions} suggestions. JSON only.")
+        # Frames first (vision), then the instruction text.
+        return self.vision_describe(frames, "\n\n".join(bits), system=system,
+                                    max_tokens=8000)
+
+    # ----- Wave 3: script editing helpers -----
+    def regen_scene(self, n, heading, action, vo, prompt, direction="", master_prompt=""):
+        system = ("Rewrite ONE scene of a visual voice-over script. Return STRICT "
+                  'JSON ONLY: {"heading":str,"action":str,"vo":str,"prompt":str}. '
+                  "Keep it consistent with the rest of the show; the image prompt "
+                  "stays a self-contained visual description.")
+        bits = [f"SCENE {n}", f"heading: {heading}", f"action: {action}",
+                f"vo: {vo}", f"image prompt: {prompt}"]
+        if direction.strip():
+            bits.append(f"DIRECTION: {direction.strip()}")
+        if master_prompt.strip():
+            bits.append(f"WORLD / STYLE: {master_prompt.strip()}")
+        bits.append("Rewrite this scene. JSON only.")
+        return self.chat_text("\n".join(bits), system=system, max_tokens=1500)
+
+    def translate_script(self, voiceover, scene_vos, lang):
+        system = ("Translate a voice-over script for narration. Return STRICT JSON "
+                  'ONLY: {"voiceover":str,"scenes":[{"n":int,"vo":str}]}. Translate '
+                  "naturally; keep proper names; do not add commentary.")
+        payload = {"voiceover": voiceover,
+                   "scenes": [{"n": i + 1, "vo": v} for i, v in enumerate(scene_vos)]}
+        return self.chat_text(
+            f"Target language: {lang}\n\nTranslate this script:\n" +
+            json.dumps(payload, ensure_ascii=False),
+            system=system, max_tokens=8000)
+
+    def rewrite_tone(self, voiceover, scenes, tone, direction="", master_prompt=""):
+        system = ("Rewrite a voice-over script in a new TONE, keeping the SAME scene "
+                  "count, numbering, headings positions and image prompts. Return "
+                  'STRICT JSON ONLY: {"voiceover":str,"scenes":[{"n":int,"heading":str,'
+                  '"action":str,"vo":str}]}.')
+        bits = [f"NEW TONE: {tone}"]
+        if direction.strip():
+            bits.append(f"EXTRA DIRECTION: {direction.strip()}")
+        if master_prompt.strip():
+            bits.append(f"WORLD / STYLE: {master_prompt.strip()}")
+        bits.append("Rewrite (keep scene numbers; do NOT change image prompts):\n" +
+                    json.dumps({"voiceover": voiceover, "scenes": scenes}, ensure_ascii=False))
+        return self.chat_text("\n\n".join(bits), system=system, max_tokens=8000)
+
+    def hooks(self, title, description, n=6):
+        system = ('Write punchy opening hooks for a short video. Return STRICT JSON '
+                  'ONLY: {"hooks":[str, ...]}. Each hook is ONE scroll-stopping sentence.')
+        return self.chat_text(
+            f"Title: {title}\nAbout: {description}\nWrite {n} distinct hooks. JSON only.",
+            system=system, max_tokens=1500)
+
+    def outline(self, title, description, beats=6):
+        system = ('Outline a short video as a beat sheet. Return STRICT JSON ONLY: '
+                  '{"beats":[{"title":str,"summary":str}]}.')
+        return self.chat_text(
+            f"Title: {title}\nAbout: {description}\nProduce {beats} beats that build "
+            "a satisfying arc. JSON only.", system=system, max_tokens=2000)
+
+    def character_consistency(self, sheet_img, frames, name):
+        system = ("You check visual character consistency. The FIRST image is the "
+                  "canonical reference sheet; the rest are story frames in order. Flag "
+                  "where the character drifts (face, hair, outfit, colours). Return "
+                  'STRICT JSON ONLY: {"summary":str,"issues":[{"frame":int,"note":str}]}. '
+                  "`frame` is the 1-based position among the story frames shown.")
+        return self.vision_describe(
+            [sheet_img] + list(frames),
+            f"Character: {name}. Compare every story frame to the canonical sheet and "
+            "report drift. JSON only.", system=system, max_tokens=2000)
+
+    # ----- Wave 5: YT growth helpers -----
+    def seo(self, title, description, n=5):
+        system = ('YouTube SEO assistant. Return STRICT JSON ONLY: '
+                  '{"titles":[str,...],"description":str,"tags":[str,...]}. '
+                  "Titles are click-worthy but honest; description is 2-3 short "
+                  "paragraphs that open with a hook and include a soft CTA; tags are "
+                  "lowercase keywords.")
+        return self.chat_text(
+            f"Topic: {title}\nDetails: {description}\nGive {n} title options, a "
+            "description, and ~15 tags. JSON only.", system=system, max_tokens=2000)
+
+    def gaps(self, channel_title, titles, n=10):
+        system = ("You find content gaps for a YouTube channel. Given its recent "
+                  "video titles, propose topics it has NOT covered but its audience "
+                  'would love. Return STRICT JSON ONLY: {"gaps":[{"title":str,"why":str}]}.')
+        body = "\n".join("- " + t for t in titles[:60] if t)
+        return self.chat_text(
+            f"Channel: {channel_title}\nRecent titles:\n{body}\n\nPropose {n} fresh "
+            "gap topics. JSON only.", system=system, max_tokens=2500)
+
+    def trend_angles(self, niche, sample_titles, n=10):
+        system = ("You distill winning content angles in a niche from example popular "
+                  'video titles. Return STRICT JSON ONLY: {"angles":[{"title":str,"why":str}]}.')
+        body = "\n".join("- " + t for t in sample_titles[:50] if t)
+        return self.chat_text(
+            f"Niche: {niche}\nPopular titles right now:\n{body}\n\nDistill {n} strong "
+            "angles to make videos about. JSON only.", system=system, max_tokens=2500)
+
     def analyse_scene(self, image: bytes, question: str = ""):
         instr = question.strip() or (
             "Describe this scene as a cinematographer would: subject, framing, "
@@ -341,44 +599,211 @@ class ClaudeClient:
                                     system="You are an expert cinematographer.",
                                     max_tokens=1200)
 
+    # Anthropic caps a single request at ~20 images. To let the editor "see"
+    # an arbitrarily long sequence (the user had 59 frames but only the first
+    # 20 were ever sent), we send the frames in batches of this size and merge
+    # the per-batch decisions into one edit decision list.
+    _FRAME_BATCH = 18
+
     def plan_edit(self, frames: List[bytes], audio_duration: float,
                   user_brief: str = "", master_prompt: str = ""):
-        """Look at every frame + know the audio length, produce an EDL.
+        """Look at EVERY frame (chunked) + know the audio length, produce an EDL.
 
-        Returns STRICT JSON of the form:
+        Returns a dict:
           { "total_duration": float,
             "transition": "cut"|"fade"|"crossfade",
-            "shots": [ { "index": int (1-based into frames list),
-                         "duration": float (seconds),
-                         "note": str } ],
+            "shots": [ { "index": int (1-based, GLOBAL into the full list),
+                         "duration": float (seconds), "note": str } ],
             "rationale": str }
         """
+        n = len(frames)
+        if n == 0:
+            raise RuntimeError("plan_edit needs at least one frame")
+
+        # Per-batch the model only knows its slice of the audio; give each batch
+        # a proportional share of the total so the merged durations are sane.
+        batches = [(i, frames[i:i + self._FRAME_BATCH])
+                   for i in range(0, n, self._FRAME_BATCH)]
+        all_shots = []
+        transition = None
+        rationales = []
+        for offset, batch in batches:
+            share = audio_duration * (len(batch) / n) if n else audio_duration
+            lo, hi = offset + 1, offset + len(batch)
+            data = self._plan_edit_batch(
+                batch, share, lo, hi, n, user_brief, master_prompt)
+            transition = transition or data.get("transition")
+            if data.get("rationale"):
+                rationales.append(str(data["rationale"]))
+            for sh in (data.get("shots") or []):
+                try:
+                    local = int(sh.get("index", 0))
+                except Exception:
+                    continue
+                # Model is told to use GLOBAL indices (lo..hi); accept those, but
+                # tolerate a model that slipped into 1..len(batch) local form.
+                if lo <= local <= hi:
+                    g = local
+                elif 1 <= local <= len(batch):
+                    g = offset + local
+                else:
+                    continue
+                all_shots.append({
+                    "index": g,
+                    "duration": max(0.2, float(sh.get("duration") or 1.0)),
+                    "note": sh.get("note", ""),
+                })
+
+        if not all_shots:
+            raise RuntimeError("Claude returned no usable shots across batches")
+
+        # Normalise durations so the whole cut equals the audio length exactly.
+        self._normalise_durations(all_shots, audio_duration)
+        return {
+            "total_duration": round(audio_duration, 2),
+            "transition": transition or "cut",
+            "shots": all_shots,
+            "rationale": " ".join(rationales)[:1500],
+            "frames_seen": n,
+            "batches": len(batches),
+        }
+
+    def _plan_edit_batch(self, frames, share_duration, lo, hi, total,
+                         user_brief, master_prompt):
         system = (
-            "You are a film editor. You receive a sequence of generated frames "
-            "(in order, 1-indexed) and a target audio duration. Decide how long "
-            "each frame should be on screen, in what order, and what transition "
-            "style to use, so the final cut feels intentional and fits the audio. "
-            "Return STRICT JSON ONLY (no markdown):\n"
-            '{ "total_duration": float, "transition": "cut"|"fade"|"crossfade", '
+            "You are a film editor assembling ONE continuous cut. You receive a "
+            "BATCH of generated frames from a longer sequence, plus the slice of "
+            "audio time this batch should fill. Decide how long each frame is on "
+            "screen, in what order, and the transition style. Return STRICT JSON "
+            "ONLY (no markdown):\n"
+            '{ "transition": "cut"|"fade"|"crossfade", '
             '"shots": [{"index": int, "duration": float, "note": str}], '
             '"rationale": str }\n'
-            "Rules: index is the 1-based position of the frame in the list as "
-            "given. You may repeat or omit frames. Sum of durations should equal "
-            "total_duration (= audio length). Keep individual shots between 0.4 "
-            "and 8 seconds unless the brief says otherwise."
+            "Rules: index is the GLOBAL 1-based frame number shown below — use "
+            "those numbers exactly. You may repeat or omit frames. The sum of "
+            "durations should be about the batch audio share. Keep shots between "
+            "0.4 and 8 seconds unless the brief says otherwise."
         )
         instr = [
-            f"Audio duration: {audio_duration:.2f} seconds.",
-            f"Frames provided: {min(len(frames), 20)} (in display order, labelled "
-            f"1..{min(len(frames), 20)}). Only these indices are valid.",
+            f"This batch contains frames {lo}..{hi} of {total} total "
+            f"(use ONLY indices {lo}..{hi}).",
+            f"Fill about {share_duration:.2f} seconds of audio with this batch.",
         ]
         if user_brief.strip():
             instr.append(f"USER EDIT DIRECTION:\n{user_brief.strip()}")
         if master_prompt.strip():
             instr.append(f"WORLD / STYLE BIBLE:\n{master_prompt.strip()}")
-        instr.append("Now design the edit. JSON only.")
-        return self.vision_describe(frames, "\n\n".join(instr), system=system,
-                                    max_tokens=4000)
+        instr.append("Now design this batch. JSON only.")
+        raw = self.vision_describe(frames, "\n\n".join(instr), system=system,
+                                   max_tokens=3000)
+        try:
+            return extract_json(raw)
+        except Exception:
+            return {"shots": []}
+
+    def plan_edit_within_budget(self, frames: List[bytes], scene_durations: List[float],
+                                user_brief: str = "", master_prompt: str = ""):
+        """Scene-locked edit: each frame's duration is FIXED to its measured
+        narration length. Claude may only REORDER or DROP scenes for better flow
+        — never change a duration. Chunk-aware (global 1-based indices).
+
+        Returns a dict:
+          { "transition": ..., "order": [int, ...]   # global indices, in play order
+            "notes": {index: str}, "rationale": str }
+        """
+        n = len(frames)
+        if n == 0:
+            raise RuntimeError("plan_edit_within_budget needs at least one frame")
+
+        batches = [(i, frames[i:i + self._FRAME_BATCH])
+                   for i in range(0, n, self._FRAME_BATCH)]
+        # When everything fits one batch, ask for a single global ordering.
+        keep_per_batch = []
+        transition = None
+        notes = {}
+        rationales = []
+        for offset, batch in batches:
+            lo, hi = offset + 1, offset + len(batch)
+            durs = {offset + j + 1: round(scene_durations[offset + j], 2)
+                    for j in range(len(batch))
+                    if offset + j < len(scene_durations)}
+            data = self._plan_synced_batch(batch, durs, lo, hi, n,
+                                            user_brief, master_prompt)
+            transition = transition or data.get("transition")
+            if data.get("rationale"):
+                rationales.append(str(data["rationale"]))
+            order = data.get("order")
+            if not isinstance(order, list):
+                order = sorted(durs.keys())   # fallback: keep this batch in order
+            clean = []
+            for x in order:
+                try:
+                    x = int(x)
+                except Exception:
+                    continue
+                if lo <= x <= hi and x not in clean:
+                    clean.append(x)
+            keep_per_batch.append(clean)
+            for k, v in (data.get("notes") or {}).items():
+                try:
+                    notes[int(k)] = str(v)
+                except Exception:
+                    pass
+
+        # Concatenate batch orderings in batch order (each batch already in the
+        # order Claude chose; cross-batch ordering stays sequential to keep the
+        # story coherent across chunks).
+        final_order = [x for batch_order in keep_per_batch for x in batch_order]
+        if not final_order:
+            final_order = list(range(1, n + 1))
+        return {
+            "transition": transition or "cut",
+            "order": final_order,
+            "notes": notes,
+            "rationale": " ".join(rationales)[:1500],
+            "frames_seen": n,
+            "batches": len(batches),
+        }
+
+    def _plan_synced_batch(self, frames, durs, lo, hi, total, user_brief, master_prompt):
+        dur_lines = ", ".join(f"#{k}={v}s" for k, v in durs.items())
+        system = (
+            "You are a film editor. Each frame has a FIXED on-screen duration "
+            "(equal to the narration spoken over it) — you must NOT change any "
+            "duration. Your only freedom is to choose the ORDER frames play and "
+            "to DROP frames that don't help. Return STRICT JSON ONLY:\n"
+            '{ "transition": "cut"|"fade"|"crossfade", '
+            '"order": [int, ...], '            # global indices, the play order
+            '"notes": {"<index>": str}, "rationale": str }\n'
+            "Rules: 'order' is GLOBAL 1-based frame numbers from the list below, "
+            "in the sequence they should play. Include each kept frame once; omit "
+            "frames you drop. Do not invent indices."
+        )
+        instr = [
+            f"This batch is frames {lo}..{hi} of {total} (use ONLY these indices).",
+            f"Fixed durations (do not change): {dur_lines}",
+        ]
+        if user_brief.strip():
+            instr.append(f"USER EDIT DIRECTION:\n{user_brief.strip()}")
+        if master_prompt.strip():
+            instr.append(f"WORLD / STYLE BIBLE:\n{master_prompt.strip()}")
+        instr.append("Choose the order (and any drops). JSON only.")
+        raw = self.vision_describe(frames, "\n\n".join(instr), system=system,
+                                   max_tokens=2000)
+        try:
+            return extract_json(raw)
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _normalise_durations(shots, target_total):
+        """Scale shot durations so they sum to target_total (clamped sensibly)."""
+        cur = sum(max(0.0, s["duration"]) for s in shots)
+        if cur <= 0 or target_total <= 0:
+            return
+        k = target_total / cur
+        for s in shots:
+            s["duration"] = round(max(0.2, s["duration"] * k), 3)
 
 
 def extract_json(text: str):

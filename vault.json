@@ -7,23 +7,34 @@
     "claude_model": "claude-sonnet-4-6"
   },
   "sickvamsick9@gmail.com": {
-    "api_key": "sk-ant-b257660c2ab4617364c06a91976cbd75e6ebd8a2d0069bca03ecd172f8518f49",
+    "api_key": "enc::gAAAAABqIuEA0hmX0bXyQvS_SpSKFs3db6a61Us6PLUh_vGfnsVvy0P7lMvWsozWnltdB08-g0FtIr8Rhqx7zP6lVEMFn6F8weRyq1i6RY2M5IPa55MehOxdArxbSYYo_u9Vy3lKP-tZ_9M62569rXD-M4ss7AOQR_Mu1zy_LRDTtUpzcsVQOTI=",
     "base_url": "https://api-direct.derouter.network/openai/v1",
     "model": "gpt-image-2",
     "multi_image_edit": false,
-    "claude_api_key": "sk-ant-b257660c2ab4617364c06a91976cbd75e6ebd8a2d0069bca03ecd172f8518f49",
+    "claude_api_key": "enc::gAAAAABqIuEAWeBejfN64J4moLdF2ORkx1zwkS9Wn9shGk-qGsBsxuPedFgBgZr-uhkhAQ4PbeLW22dL11qTrKzBqzbODx-LxtWBelIVoow_FhOGJNgn1U8s9HJOt3-ueT2TnJN3-AtK1LLI7Nr4OuNqlq-hb55OH2Kq-K4ArmhKOxyc4GjwlPE=",
     "claude_base_url": "https://api.derouter.network/proxy",
     "claude_model": "claude-opus-4-7",
-    "elevenlabs_api_key": "sk_25de0673a91ad183e9a247d53e6275f859c2caa8bb4fde49"
+    "elevenlabs_api_key": "enc::gAAAAABqIuEAmBVQXVAMI-h3-S7jfCH05Ec5kNOidtE4wcRQCyOws82G_QCEPsOQMeHKE6YOSEyiyPYd8LQynRSjrvkRjfYS8YgjD_iUC1hcZQ4N1d5_hkh9_Fyd8sEo_BFNCrRkkizcg3PhILWl0pAtS2YuB7fNYw=="
   },
   "sickvamsick@gmail.com": {
-    "api_key": "sk-ant-b257660c2ab4617364c06a91976cbd75e6ebd8a2d0069bca03ecd172f8518f49",
+    "api_key": "enc::gAAAAABqIuEA7rwDTgOUBtUUVfNn-jyLoC0lOnu_I7g5G3bV60Fd36MjOUuvVOZQsZAFlgUWijA9b-3c4cdQY8qkQynSB2BX51p-scpVSPK2M02TbtkLMLa84UxwXTiVUP3o2zeyTsIk3uidtO-60KBko507OYzeSdrl5FL--gXxgkxP0g-umlU=",
     "base_url": "https://api-direct.derouter.network/openai/v1",
     "model": "gpt-image-2",
     "multi_image_edit": false,
-    "claude_api_key": "sk-ant-b257660c2ab4617364c06a91976cbd75e6ebd8a2d0069bca03ecd172f8518f49",
+    "claude_api_key": "enc::gAAAAABqIuEAi_eyCaQsxqoc59NbomBrl0cgI-2jH0dZRx7kDOT23eccAZl1DfMCu22iTqFpiKHlAAGYsyjwkjZ7hsC3t0YGU104cT5bWYm8po7OR3ZMPlVeh6Cgr7P_aqq0dHDMfYhD5vXmBX0LewJPPTH3T__kXfnXeqg8hq1GYRtVSLzA6BI=",
     "claude_base_url": "https://api.derouter.network/proxy",
-    "claude_model": "claude-opus-4-6",
-    "elevenlabs_api_key": "sk_25de0673a91ad183e9a247d53e6275f859c2caa8bb4fde49"
+    "claude_model": "claude-opus-4-8",
+    "elevenlabs_api_key": "enc::gAAAAABqIuEA4S0TOEiLmuFZnZRFhnSTIOILRzaS47iUtBqyLYq8IqMlAr5mMqyy_7OmRa1cU8yT_tixem-KMslPuqZW7_qWasQh94s67BW5MBDcHnONVp3fo2V85kuz01CQmoLftD6Tqf0CVimEZh12cTno7SFvwQ=="
+  },
+  "": {
+    "api_key": "enc::gAAAAABqIuEAwM1MWlw8zL7WLDC_SXG8AoKxY_GeFZ6GwRWNvH5USp6HUWAJP4NttFz813GNbuneUWOAzPGnaIK8dKkKURGpUnwwQKkZ_rGB-6jRuMsFE6EH0X0VGQjR9aJQre5zYBGSMLa2nAOVOozIfTYuIA8U1GjUiuF-zmAaDiVxoHugCDw=",
+    "base_url": "https://api-direct.derouter.network/openai/v1",
+    "model": "gpt-image-2",
+    "multi_image_edit": false,
+    "claude_api_key": "enc::gAAAAABqIuEASJ05h5vDqAKZMMj9T4tdHgyks180_GOkcMc0So4PVZ8YXrYyOb_taW-OLCGjJRtX4giT1ykIf6fWRrLGOE2Kxvhg0qZTF6RHjheIwWgLLbuoUnJ9mAmQSVguLVRxuOvEgLPi7TQEAx1g4CE7QkNd1KDAdwAxDJOADHUvM-4b38k=",
+    "claude_base_url": "https://api.derouter.network/proxy",
+    "claude_model": "claude-sonnet-4-6",
+    "elevenlabs_api_key": "enc::gAAAAABqIuEAPEa0gmhpX5pk3IDk7BlXutSPiQTrspn7qcs9-RxbQNtTkKUQHHDFeNpyyOrD50UmitATj_J_FbNbxnNX3VBDl1wCO7GoORyQQ3ltWKpc7p5EkoxmaXkP7jijJ4UcDuvY6UhC0QQmID-4dJvWsw4sJg==",
+    "webhook_url": ""
   }
 }

@@ -138,8 +138,11 @@ class ImageClient:
             )
         return base64.b64decode(r.data[0].b64_json)
 
-    def edit(self, prompt, images, size=None, quality=None):
+    def edit(self, prompt, images, size=None, quality=None, mask=None):
         """Reference image(s) + prompt -> image. ``images`` is list[bytes].
+
+        ``mask`` (optional PNG bytes) enables inpainting: transparent areas of
+        the mask are the regions the model repaints (OpenAI images/edits spec).
 
         With config.MULTI_IMAGE_EDIT=False (default + only path documented by
         derouter), the caller is expected to have already composited multiple
@@ -166,6 +169,10 @@ class ImageClient:
             # The documented derouter path: ONE image field.
             files.append(("image", ("ref.png", images[0], "image/png")))
             mode = "image (single)"
+
+        if mask is not None:
+            files.append(("mask", ("mask.png", mask, "image/png")))
+            mode += " +mask"
 
         data = {"model": self.model, "prompt": prompt}
         if size and size != "auto":
