@@ -1386,7 +1386,8 @@ Close-up of @Mira fixing a circuit board, sparks reflecting on her goggles
           <div class="bc-tag" style="color:var(--teal)">🌊 Natural flow · recommended</div>
           <p class="hint" style="margin:8px 0 12px">Keeps the voice-over as <strong>one continuous, natural track</strong> (never chopped or slowed) and times the frames to it. Any frame that would sit too long is broken into <strong>micro-cuts</strong>.</p>
           <label class="label" style="margin:0 0 4px">Max time on one frame before micro-cuts (sec)</label>
-          <input type="number" id="flowMaxHold" value="6" min="2" max="20" step="1" style="width:120px; margin-bottom:10px"/>
+          <input type="number" id="flowMaxHold" value="6" min="2" max="20" step="1" style="width:120px; margin-bottom:8px"/>
+          <label style="display:flex;align-items:center;gap:8px;font-size:12px;margin-bottom:10px;cursor:pointer"><input type="checkbox" id="flowSfx" checked/> 🔊 ElevenLabs sound design (rumble + booms + loud mix)</label>
           <button class="btn glow btn-primary" id="voFlowBtn" onclick="genVoiceoverFlow()" style="width:100%; justify-content:center">🌊 Build natural-flow video</button>
         </div>
         <!-- B: Claude-directed -->
@@ -3411,7 +3412,8 @@ async function genVoiceoverFlow(){
   $("#planOut").textContent="① ElevenLabs voicing the full script as one natural track…\n② Timing each frame to the narration…\n③ Adding micro-cuts to any frame that sits too long…";
   try{
     const maxHold=parseFloat(($("#flowMaxHold")||{}).value)||6;
-    const body={ voice_id:_voiceId(), transition:$("#editTrans").value||"cut", max_hold:maxHold, ..._fmt(), motion:isOn("tgMotion"), music:isOn("tgUseMusic") };
+    const sfxOn=!!($("#flowSfx")&&$("#flowSfx").checked);
+    const body={ voice_id:_voiceId(), transition:$("#editTrans").value||"cut", max_hold:maxHold, sound_design:sfxOn, ..._fmt(), motion:isOn("tgMotion"), music:isOn("tgUseMusic") };
     const d=await api("/api/voiceover/auto-flow",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
     try{ STATE=await api("/api/state").then(r=>r.state); renderAudio&&renderAudio(); }catch(_){ STATE.edits=STATE.edits||[]; STATE.edits.push(d.edit); }
     renderEditsList();
