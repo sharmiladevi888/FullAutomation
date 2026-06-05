@@ -326,7 +326,7 @@ class ClaudeClient:
                         total_duration: float = 60.0, pacing_seconds: float = 1.0,
                         num_characters: int = 0, style_notes: str = "",
                         master_prompt: str = "", brief: str = "",
-                        dialogue: bool = False):
+                        dialogue: bool = False, dynamic: bool = False):
         """Title + description -> full VO script + paced scene list + packed
         per-character sheet prompts.
 
@@ -373,6 +373,25 @@ class ClaudeClient:
             "written so it can be sent straight to a character-sheet generator. Use "
             "the exact same names as in the scene prompts."
         )
+        if dynamic:
+            system += (
+                "\n\nDYNAMIC / HIGH-RETENTION MODE (avoid a static slideshow):\n"
+                "- Every scene image \"prompt\" MUST show the MAIN CHARACTER actively "
+                "REACTING to that exact beat — pick the fitting one: scared, confused, "
+                "coughing, choking, sweating, running, shielding their face, stumbling/"
+                "falling back from heat, bracing for impact, looking up at the sky, "
+                "pointing, jaw-dropped. Never just standing and watching.\n"
+                "- VARY THE BACKGROUND every scene and ESCALATE the danger over time "
+                "(calm/confused -> toxic sky -> extreme heat -> lava oceans -> meteor "
+                "storm -> no oxygen/black cracked ground -> payoff). Pull from: lava "
+                "ocean, smoky toxic sky, meteor storm, cracked black ground, volcano "
+                "silhouettes, burning horizon, ash clouds, glowing molten surface.\n"
+                "- Add a CAMERA/COMPOSITION cue to each prompt (extreme close-up on the "
+                "face, low dramatic angle, wide establishing, over-the-shoulder, dutch "
+                "tilt) so consecutive frames feel cut, not repeated.\n"
+                "- Keep the SAME simple art style the whole way through.\n"
+                "- The first scene must be a strong HOOK and the last a punchy PAYOFF.\n"
+            )
         if dialogue:
             system += (
                 "\n\nDIALOGUE MODE:\n"

@@ -59,6 +59,32 @@ class VoiceClient:
             })
         return out
 
+    def generate_sfx(self, text, duration_seconds=None, prompt_influence=0.4):
+        """Text -> sound effect via ElevenLabs Sound Generation. Returns MP3
+        bytes. ``text`` is a short description ("deep cinematic boom", "lava
+        crackle", "fast whoosh transition"). ``duration_seconds`` 0.5-22 (None =
+        let ElevenLabs choose). Raises on failure."""
+        self._require_key()
+        desc = (text or "").strip()
+        if not desc:
+            raise RuntimeError("generate_sfx needs a description")
+        body = {"text": desc,
+                "prompt_influence": max(0.0, min(1.0, float(prompt_influence)))}
+        if duration_seconds:
+            body["duration_seconds"] = max(0.5, min(22.0, float(duration_seconds)))
+        r = requests.post(
+            f"{self.base_url}/sound-generation",
+            headers={"xi-api-key": self.api_key,
+                     "Content-Type": "application/json",
+                     "Accept": "audio/mpeg"},
+            json=body, timeout=self.timeout,
+        )
+        if r.status_code >= 400:
+            raise RuntimeError(f"SFX gen failed [{r.status_code}]: {r.text[:400]}")
+        if not r.content:
+            raise RuntimeError("SFX gen returned empty audio")
+        return r.content
+
     def synthesize(self, text, voice_id=None, model=None,
                    stability=0.5, similarity_boost=0.75, style=0.0):
         """Text -> spoken audio. Returns MP3 bytes. Raises on failure."""

@@ -2335,11 +2335,119 @@ def _word_count(s: str) -> int:
     return len([w for w in re.split(r"\s+", (s or "").strip()) if w])
 
 
+# --------------------------------------------------------------------------- #
+#  ElevenLabs sound design — generate real SFX and mix them into the edit.
+# --------------------------------------------------------------------------- #
+_SFX_CACHE_DIR = os.path.join(config.DATA_DIR, "sfx_cache")
+
+# Map words in the narration to a sound-effect description + intensity. Whichever
+# matches first wins; "high" intensity scenes also get an impact boom.
+_SFX_KEYWORDS = [
+    (("lava", "molten", "magma"), "bubbling molten lava crackle and hiss", "high"),
+    (("meteor", "asteroid", "comet", "impact", "crash", "collide"),
+     "huge meteor impact explosion boom", "high"),
+    (("explos", "erupt", "volcano", "blast", "burst"),
+     "volcanic eruption explosion rumble", "high"),
+    (("poison", "toxic", "gas", "fume", "cough", "choke", "breathe", "air"),
+     "toxic gas hiss with a human cough", "normal"),
+    (("heat", "burn", "1200", "1,200", "degree", "boil", "scorch"),
+     "intense roaring fire whoosh", "high"),
+    (("die", "death", "dead", "gone", "vanish", "destroy"),
+     "dramatic deep cinematic impact hit", "high"),
+    (("wind", "storm", "ash", "smoke", "cloud"), "howling wind with ash storm", "normal"),
+    (("water", "ocean", "rain", "flood"), "rushing water surge", "normal"),
+]
+
+
+def _sfx_for_text(text):
+    low = (text or "").lower()
+    for keys, desc, intensity in _SFX_KEYWORDS:
+        if any(k in low for k in keys):
+            return desc, intensity
+    return None, "normal"
+
+
+def _generate_sfx_cached(request, text, duration=None):
+    """Generate (or reuse) an ElevenLabs sound effect for ``text``. Cached on
+    disk by text+duration so the same boom/whoosh isn't paid for twice.
+    Returns (url, path)."""
+    os.makedirs(_SFX_CACHE_DIR, exist_ok=True)
+    key = hashlib.md5(f"{text}|{duration}".encode("utf-8")).hexdigest()[:16]
+    path = os.path.join(_SFX_CACHE_DIR, f"{key}.mp3")
+    if not os.path.exists(path):
+        mp3 = get_voice_client(request).generate_sfx(text, duration_seconds=duration)
+        with open(path, "wb") as f:
+            f.write(mp3)
+    rel = os.path.relpath(path, store.DATA_DIR).replace(os.sep, "/")
+    return f"/data/{rel}", path
+
+
+def _normalize_loud(video_path, target_lufs=-14.0):
+    """Loudness-normalize + limit a finished video's audio for crisp, LOUD
+    Shorts/TikTok output. Voice is compressed so it stays above the bed. In place."""
+    tmp = video_path + ".loud.mp4"
+    af = (f"acompressor=threshold=-18dB:ratio=3:attack=5:release=120,"
+          f"loudnorm=I={target_lufs}:TP=-1.0:LRA=11,alimiter=limit=0.97")
+    proc = subprocess.run(
+        ["ffmpeg", "-y", "-i", video_path, "-af", af,
+         "-c:v", "copy", "-c:a", "aac", "-b:a", "256k", tmp],
+        capture_output=True, text=True)
+    if proc.returncode == 0 and os.path.exists(tmp):
+        os.replace(tmp, video_path)
+    else:
+        print(f"[sound] loudnorm skipped: {proc.stderr[-200:]}", flush=True)
+
+
+def _auto_sound_design(request, scene_map, total_seconds):
+    """Build a sound plan from the scene narration and generate it via
+    ElevenLabs. Returns (rumble_path_or_None, sfx_entries). The rumble is meant
+    for the looped 'music' bed; sfx_entries drop into st['sfx'] (point sounds).
+    Generates only a handful of UNIQUE clips (cached + reused) to control cost."""
+    sfx_entries = []
+    rumble_path = None
+    try:
+        _, rumble_path = _generate_sfx_cached(
+            request, "deep continuous low ominous cinematic rumble drone, seamless",
+            duration=22)
+    except Exception as e:
+        print(f"[sound] rumble skipped: {e}", flush=True)
+
+    # whoosh at the very start (into the hook/first frame)
+    def _add(desc, at, vol, dur=None):
+        try:
+            url, _p = _generate_sfx_cached(request, desc, duration=dur)
+            sfx_entries.append({"id": store.new_id("sfx"), "url": url,
+                                "name": desc[:40], "at_seconds": round(max(0, at), 2),
+                                "volume": vol})
+        except Exception as e:
+            print(f"[sound] sfx '{desc[:24]}' skipped: {e}", flush=True)
+
+    _add("fast cinematic whoosh transition", 0.0, 0.5, dur=1.0)
+    t = 0.0
+    last_boom = -5.0
+    for sc in scene_map:
+        hold = float(sc.get("hold_seconds") or 0)
+        desc, intensity = _sfx_for_text(sc.get("vo") or "")
+        if desc and (t - last_boom) >= 2.0:      # don't stack sounds too densely
+            _add(desc, t + 0.05, 0.55, dur=2.0)
+            last_boom = t
+        t += hold
+    # final comedic/dramatic hit on the payoff
+    _add("hard dramatic comedic impact hit", max(0.0, total_seconds - 1.4), 0.7, dur=1.5)
+    return rumble_path, sfx_entries
+
+
 def _build_flow_video(st, request, *, voice_id, text, transition="cut",
                       width=1920, height=1080, fps=30, max_hold=6.0,
-                      motion=False, use_music=False, name_hint="flow"):
+                      motion=False, use_music=False, name_hint="flow",
+                      sound_design=False):
     """Shared engine for the natural-flow video. Returns
-    (edit_rec, video_url, total_seconds, scene_map). Mutates + saves `st`."""
+    (edit_rec, video_url, total_seconds, scene_map). Mutates + saves `st`.
+
+    ``sound_design`` (needs an ElevenLabs key) generates real SFX via the
+    ElevenLabs Sound API — a low rumble bed under the whole video plus contextual
+    booms/whooshes/crackles on the matching narration beats — mixes them in, and
+    loudness-normalizes the result for crisp, loud Shorts audio."""
     seq = st.get("sequence") or []
     if not seq:
         raise HTTPException(400, "Render some frames in the Sequence tab first.")
@@ -2391,7 +2499,20 @@ def _build_flow_video(st, request, *, voice_id, text, transition="cut",
     # 3. Micro-cut any frame that would sit too long.
     shots = editor.split_long_holds(shots, max_hold=max(1.5, float(max_hold)))
 
+    # 3b. Sound design (ElevenLabs): a rumble bed for the music slot + a plan of
+    #     contextual point-SFX to mix in after assembly.
     music_path, music_vol = _music_for(st, use_music)
+    sfx_entries = []
+    do_sound = bool(sound_design and request and
+                    request.state.settings.get("elevenlabs_api_key"))
+    if do_sound:
+        try:
+            rumble_path, sfx_entries = _auto_sound_design(request, scene_map, dur)
+            if rumble_path and not music_path:   # use rumble as the ducked bed
+                music_path, music_vol = rumble_path, 0.16
+        except Exception as ex:
+            print(f"[sound] design skipped: {ex}", flush=True)
+
     out_name = f"edit_{int(time.time())}.mp4"
     out_path = os.path.join(store.VIDEOS_DIR, out_name)
     try:
@@ -2401,6 +2522,23 @@ def _build_flow_video(st, request, *, voice_id, text, transition="cut",
                               music_path=music_path, music_volume=music_vol)
     except Exception as ex:
         raise HTTPException(500, f"video assembly failed: {ex}")
+
+    # 3c. Mix the point-SFX onto the rendered video, then make it loud + crisp.
+    if do_sound:
+        if sfx_entries:
+            try:
+                editor.mix_sfx(out_path, [
+                    {"path": store.url_to_path(s["url"]),
+                     "at_seconds": s["at_seconds"], "volume": s["volume"]}
+                    for s in sfx_entries
+                    if os.path.exists(store.url_to_path(s["url"]))],
+                    out_path + ".sfx.mp4")
+                if os.path.exists(out_path + ".sfx.mp4"):
+                    os.replace(out_path + ".sfx.mp4", out_path)
+            except Exception as ex:
+                print(f"[sound] sfx mix skipped: {ex}", flush=True)
+        _normalize_loud(out_path)
+
     rel = os.path.relpath(out_path, store.DATA_DIR).replace(os.sep, "/")
     video_url = f"/data/{rel}"
 
@@ -2413,7 +2551,8 @@ def _build_flow_video(st, request, *, voice_id, text, transition="cut",
     plan = {"mode": "voiceover_flow", "total_duration": total,
             "transition": (transition or "cut").lower(),
             "micro_cut_max_hold": max_hold, "shots": scene_map,
-            "rendered_clips": len(shots)}
+            "rendered_clips": len(shots),
+            "sound_design": bool(do_sound), "sfx_count": len(sfx_entries)}
     edit_rec = {"id": store.new_id("edit"), "url": video_url,
                 "audio_id": st["audio"]["id"],
                 "transition": (transition or "cut").lower(),
@@ -2435,6 +2574,7 @@ class FlowVoiceoverIn(BaseModel):
     max_hold: float = 6.0          # split frames longer than this into micro-cuts
     motion: bool = False
     music: bool = False
+    sound_design: bool = False     # generate + mix ElevenLabs SFX, then loudnorm
 
 
 @app.post("/api/voiceover/auto-flow")
@@ -2451,7 +2591,8 @@ def api_voiceover_auto_flow(body: FlowVoiceoverIn, request: Request):
         st, request, voice_id=voice_id, text=text,
         transition=body.transition or "cut", width=body.width,
         height=body.height, fps=body.fps, max_hold=body.max_hold,
-        motion=body.motion, use_music=body.music, name_hint="voiceover_flow")
+        motion=body.motion, use_music=body.music, name_hint="voiceover_flow",
+        sound_design=body.sound_design)
     return {"edit": edit_rec, "video_url": video_url, "total_duration": total,
             "scenes": scene_map, "plan": edit_rec["plan"]}
 
@@ -3662,6 +3803,40 @@ async def api_sfx_upload(
     return rec
 
 
+class SfxGenIn(BaseModel):
+    text: str                          # e.g. "deep cinematic boom", "lava crackle"
+    duration_seconds: Optional[float] = None   # 0.5-22, or None for auto
+    at_seconds: float = 0.0
+    volume: float = 0.7
+
+
+@app.post("/api/sfx/generate")
+def api_sfx_generate(body: SfxGenIn, request: Request):
+    """Generate a sound effect from a text description via ElevenLabs and add it
+    to the project's SFX (mixed into the next render at ``at_seconds``)."""
+    if not request.state.settings["elevenlabs_api_key"]:
+        raise HTTPException(400, "No ElevenLabs API key set — add it in Settings.")
+    if not (body.text or "").strip():
+        raise HTTPException(400, "describe the sound to generate")
+    try:
+        url, path = _generate_sfx_cached(request, body.text.strip(),
+                                         body.duration_seconds)
+    except Exception as e:
+        raise HTTPException(500, f"SFX generation failed: {e}")
+    try:
+        dur = editor.probe_duration(path)
+    except Exception:
+        dur = 0
+    st = store.load_state()
+    rec = {"id": store.new_id("sfx"), "url": url, "name": body.text.strip()[:50],
+           "duration": dur, "at_seconds": max(0.0, body.at_seconds),
+           "volume": max(0.0, min(1.0, body.volume))}
+    st.setdefault("sfx", []).append(rec)
+    store.save_state(st)
+    store.log_usage("voice", 1, 0.01)
+    return rec
+
+
 class SfxUpdateIn(BaseModel):
     at_seconds: Optional[float] = None
     volume: Optional[float] = None
@@ -4031,6 +4206,8 @@ class AutopilotIn(BaseModel):
     max_hold: float = 6.0              # split frames longer than this into micro-cuts
     from_cache: bool = False           # reuse the topics from a prior /suggest call
                                        # so the picked index maps to what the user saw
+    sound_design: bool = True          # generate + mix ElevenLabs SFX + loudnorm
+    dynamic: bool = True               # reaction-rich, varied-background scenes
 
 
 # --- Autopilot run control: stop flag + per-step deadline ------------------- #
@@ -4278,6 +4455,7 @@ def api_autopilot(body: AutopilotIn, request: Request):
             num_characters=max(0, num_chars),
             style_notes=style_notes,
             master_prompt=st["master_prompt"],
+            dynamic=body.dynamic,
         )
         script = extract_json(raw)
     except Exception as e:
@@ -4369,8 +4547,9 @@ def api_autopilot(body: AutopilotIn, request: Request):
                     st, request, voice_id=voice_id, text=vo_text,
                     transition=body.transition, width=body.width,
                     height=body.height, fps=body.fps, max_hold=body.max_hold,
-                    motion=body.motion, name_hint="autopilot_vo"),
-                step_to * 4)            # assembly can be slow; give it room
+                    motion=body.motion, name_hint="autopilot_vo",
+                    sound_design=body.sound_design),
+                step_to * 6)            # assembly + SFX gen can be slow; give it room
             if finished and val:
                 _edit_rec, video_url, total_seconds, _sm = val
         except HTTPException:
