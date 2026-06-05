@@ -47,6 +47,32 @@ DEFAULT_QUALITY = _get("DEFAULT_QUALITY", "high")
 # fields — otherwise edits with multiple references will fail.
 MULTI_IMAGE_EDIT = _get("MULTI_IMAGE_EDIT", "false").lower() == "true"
 
+# --- image generation queue / rate-limit handling --------------------------
+# The image endpoint (gpt-image via derouter / OpenAI) enforces a tokens-per-
+# minute rate limit. Firing a whole batch at once trips `rate_limit_exceeded`.
+# These settings drive image_queue.py: a controlled queue + exponential backoff
+# + a global cooldown so we never spam the API or retry in a storm.
+#
+#   IMAGE_MAX_CONCURRENCY        how many image requests may be in flight at once
+#   IMAGE_REQUEST_DELAY_MS       min gap between starting two image requests
+#   IMAGE_MAX_RETRIES            attempts per prompt before it is marked failed
+#   IMAGE_BACKOFF_BASE_MS        base for exponential backoff on server errors
+#   IMAGE_BACKOFF_MAX_MS         ceiling for a single backoff wait
+#   IMAGE_RATE_LIMIT_COOLDOWN_MS how long the WHOLE queue pauses after a 429
+def _int(name, default):
+    try:
+        return int(float(_get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+IMAGE_MAX_CONCURRENCY = max(1, _int("IMAGE_MAX_CONCURRENCY", 1))
+IMAGE_REQUEST_DELAY_MS = max(0, _int("IMAGE_REQUEST_DELAY_MS", 1500))
+IMAGE_MAX_RETRIES = max(0, _int("IMAGE_MAX_RETRIES", 5))
+IMAGE_BACKOFF_BASE_MS = max(100, _int("IMAGE_BACKOFF_BASE_MS", 2000))
+IMAGE_BACKOFF_MAX_MS = max(1000, _int("IMAGE_BACKOFF_MAX_MS", 60000))
+IMAGE_RATE_LIMIT_COOLDOWN_MS = max(1000, _int("IMAGE_RATE_LIMIT_COOLDOWN_MS", 65000))
+
 # ffmpeg: frames-per-second to sample when splitting an uploaded video.
 FRAME_FPS = float(_get("FRAME_FPS", "1"))
 

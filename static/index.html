@@ -870,6 +870,23 @@
               <input type="text" id="apNudge" placeholder="Creative nudge (optional)" style="width:100%"/>
             </div>
             <button class="btn glow btn-primary" id="apBtn" onclick="runAutopilot()" style="white-space:nowrap">🚀 Launch Autopilot</button>
+            <button class="btn danger" id="apStopBtn" onclick="stopAutopilot()" style="white-space:nowrap; display:none">■ Stop</button>
+            <button class="btn outline" id="apRegenBtn" onclick="runAutopilot()" style="white-space:nowrap; display:none">↻ Regenerate</button>
+          </div>
+          <div class="row" style="gap:10px; align-items:end; flex-wrap:wrap; margin-top:8px">
+            <div style="min-width:150px">
+              <label class="label" style="margin:0 0 4px">Video length (sec)</label>
+              <input type="number" id="apLength" value="30" min="5" max="600" step="5" style="width:120px" title="Target length — drives how much script Claude writes"/>
+            </div>
+            <div style="min-width:220px">
+              <label class="label" style="margin:0 0 4px">Voice</label>
+              <select id="apVoice" style="width:100%"><option value="">Default voice</option></select>
+            </div>
+            <button class="btn outline sm" id="apVoiceBtn" onclick="loadApVoices()" style="white-space:nowrap">↻ Load voices</button>
+            <div style="min-width:150px">
+              <label class="label" style="margin:0 0 4px">Per-step timer (sec)</label>
+              <input type="number" id="apStepTimeout" value="60" min="15" max="600" step="5" style="width:120px" title="Auto-proceed if a heavy step stalls past this"/>
+            </div>
           </div>
           <div id="apProgress" style="margin-top:12px; display:none"></div>
           <div id="apResult" style="margin-top:12px"></div>
@@ -1361,6 +1378,14 @@ Close-up of @Mira fixing a circuit board, sparks reflecting on her goggles
           <div class="bc-tag">⚡ Quick · perfect sync</div>
           <p class="hint" style="margin:8px 0 14px">Holds each frame for exactly its own narration line. One click, no decisions.</p>
           <button class="btn glow btn-primary" id="voScenesBtn" onclick="genVoiceoverScenes()">🎬 Generate narrated video</button>
+        </div>
+        <!-- A2: natural flow (recommended) -->
+        <div class="build-card">
+          <div class="bc-tag" style="color:var(--teal)">🌊 Natural flow · recommended</div>
+          <p class="hint" style="margin:8px 0 12px">Keeps the voice-over as <strong>one continuous, natural track</strong> (never chopped or slowed) and times the frames to it. Any frame that would sit too long is broken into <strong>micro-cuts</strong>.</p>
+          <label class="label" style="margin:0 0 4px">Max time on one frame before micro-cuts (sec)</label>
+          <input type="number" id="flowMaxHold" value="6" min="2" max="20" step="1" style="width:120px; margin-bottom:10px"/>
+          <button class="btn glow btn-primary" id="voFlowBtn" onclick="genVoiceoverFlow()" style="width:100%; justify-content:center">🌊 Build natural-flow video</button>
         </div>
         <!-- B: Claude-directed -->
         <div class="build-card claude-edit">
@@ -2285,41 +2310,75 @@ async function genShot(){
   }catch(e){ toast(e.message,"err"); } finally{ busy(b,false); $("#genNote").textContent=""; }
 }
 
+/* Batch generation now runs through the server-side image QUEUE: jobs run one
+   at a time (configurable), self-heal on rate-limits with a global cooldown, and
+   each completed frame is saved immediately so a later failure never loses work.
+   The UI polls /status and shows live per-job state + retry counts. */
+const _Q_LABEL={pending:"queued",running:"rendering…",retrying:"retrying",rate_limited:"⏳ cooling down",completed:"✓ done",failed:"failed",cancelled:"cancelled"};
+const _Q_COLOR={pending:"var(--muted)",running:"var(--amber)",retrying:"var(--amber)",rate_limited:"var(--violet)",completed:"var(--teal)",failed:"var(--red)",cancelled:"var(--muted)"};
+function _qRowHtml(j){
+  let state=_Q_LABEL[j.status]||j.status;
+  if(j.status==="completed"&&j.result&&j.result.index!=null) state="✓ frame "+pad(j.result.index);
+  if((j.status==="retrying"||j.status==="rate_limited")&&j.next_retry_in>0) state+=` · ${Math.ceil(j.next_retry_in)}s`;
+  if((j.retry_count||0)>0&&j.status!=="completed") state+=` (try ${j.retry_count+1})`;
+  const retryBtn=(j.status==="failed")?`<button class="x-btn" style="margin-left:8px" onclick="retryJob('${j.id}')">↻ retry</button>`:"";
+  const msg=(j.status==="failed"||j.status==="rate_limited")&&j.message?`<div style="font-size:11px;color:var(--muted);margin-left:22px">${escapeHtml(j.message).slice(0,120)}</div>`:"";
+  return `<div style="display:flex;align-items:center;gap:8px"><span class="q-dot" style="background:${_Q_COLOR[j.status]||"var(--muted)"}"></span><span class="q-txt" style="flex:1">${escapeHtml(j.prompt).slice(0,90)}</span><span class="q-state" style="color:${_Q_COLOR[j.status]||"var(--muted)"}">${state}</span>${retryBtn}</div>${msg}`;
+}
+function _renderBatch(d){
+  const c=d.counts||{};
+  const finished=(c.completed||0)+(c.failed||0)+(c.cancelled||0);
+  const qs=$("#qStat"); if(qs) qs.textContent=`${finished} / ${d.total}`;
+  const qf=$("#qFill"); if(qf) qf.style.width=(d.total?finished/d.total*100:0)+"%";
+  const cool=d.throttle&&d.throttle.cooling_down;
+  const banner=$("#qCooldown"); if(banner){ banner.style.display=cool?"block":"none";
+    if(cool) banner.textContent=`⏳ Image API rate limit reached — queue cooling down for ~${Math.ceil(d.throttle.cooldown_remaining)}s, then it continues automatically.`; }
+  const list=$("#qList"); if(list) list.innerHTML=(d.jobs||[]).map(_qRowHtml).join("");
+  // merge any newly-completed frames into the board
+  let added=false;
+  (d.jobs||[]).forEach(j=>{ if(j.status==="completed"&&j.result&&j.result.id&&!(STATE.sequence||[]).some(s=>s.id===j.result.id)){ STATE.sequence.push(j.result); added=true; } });
+  if(added){ renderBoard(); if(typeof renderEditFrames==="function") renderEditFrames(); }
+}
 async function genBatch(){
-  const prompts=splitBatch($("#batchPrompts").value, isOn("tgBatchBlank"));
-  if(!prompts.length){ toast("Add at least one prompt","err"); return; }
+  if(!($("#batchPrompts").value||"").trim()){ toast("Add at least one prompt","err"); return; }
   if(!CFG.has_api_key){ toast("Set your image API key first","err"); openSettings(); return; }
-  BATCH_CANCEL=false;
   const b=$("#batchGenBtn"); b.disabled=true; $("#cancelBatchBtn").style.display="inline-flex";
   const prog=$("#batchProgress"); prog.style.display="block";
-  prog.innerHTML=`<div class="q-head"><div class="q-bar"><div class="q-fill" id="qFill"></div></div><span class="q-stat" id="qStat">0 / ${prompts.length}</span></div><div class="q-list" id="qList"></div>`;
-  const list=$("#qList");
-  prompts.forEach((p,i)=>{ const r=document.createElement("div"); r.className="q-row"; r.id="q"+i;
-    r.innerHTML=`<span class="q-dot"></span><span class="q-txt">${escapeHtml(p).slice(0,90)}</span><span class="q-state">queued</span>`; list.appendChild(r); });
-  let done=0, ok=0, fail=0;
-  for(let i=0;i<prompts.length;i++){
-    if(BATCH_CANCEL) break;
-    const row=$("#q"+i), st=row.querySelector(".q-state");
-    row.classList.add("active"); st.textContent="rendering…";
-    try{
-      BATCH_ABORT=new AbortController();
-      const body={ prompt:prompts[i], size:$("#optSize").value, quality:$("#optQuality").value,
-        continue_prev:isOn("tgContinue"), style_lock:isOn("tgStyle") };
-      const rec=await api("/api/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body), signal:BATCH_ABORT.signal});
-      STATE.sequence.push(rec); renderBoard(); renderEditFrames();
-      row.classList.remove("active"); row.classList.add("ok"); st.textContent="✓ frame "+pad(rec.index); ok++;
-    }catch(e){
-      row.classList.remove("active");
-      if(BATCH_CANCEL){ st.textContent="cancelled"; break; }
-      row.classList.add("fail"); st.textContent="failed"; fail++; console.warn("batch fail:",e);
+  prog.innerHTML=`<div id="qCooldown" style="display:none;margin-bottom:8px;padding:8px 10px;border-radius:8px;background:rgba(168,124,255,.12);color:var(--violet);font-size:12px"></div><div class="q-head"><div class="q-bar"><div class="q-fill" id="qFill"></div></div><span class="q-stat" id="qStat">0 / ?</span><button class="x-btn" id="qRetryAll" style="display:none;margin-left:8px" onclick="retryFailed()">↻ retry failed</button></div><div class="q-list" id="qList"></div>`;
+  try{
+    const body={ text:$("#batchPrompts").value, mode:isOn("tgBatchBlank")?"blank":"line",
+      size:$("#optSize").value, quality:$("#optQuality").value,
+      continue_prev:isOn("tgContinue"), style_lock:isOn("tgStyle") };
+    const first=await api("/api/images/queue",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    CUR_BATCH_ID=first.id; _renderBatch(first);
+    // poll until done
+    while(true){
+      await new Promise(r=>setTimeout(r,1200));
+      if(!CUR_BATCH_ID) break;
+      let d; try{ d=await api("/api/images/queue/"+CUR_BATCH_ID); }catch(_){ continue; }
+      _renderBatch(d);
+      if(d.done){
+        const c=d.counts||{}; const rt=$("#qRetryAll"); if(rt) rt.style.display=(c.failed>0)?"inline-flex":"none";
+        toast(`Rendered ${c.completed||0}${c.failed?`, ${c.failed} failed`:""}`, (c.completed)?"ok":"err");
+        break;
+      }
     }
-    done++; const qs=$("#qStat"); if(qs) qs.textContent=`${done} / ${prompts.length}`; const qf=$("#qFill"); if(qf) qf.style.width=(done/prompts.length*100)+"%";
-  }
-  b.disabled=false; $("#cancelBatchBtn").style.display="none"; BATCH_ABORT=null;
-  if(BATCH_CANCEL) toast(`Stopped — ${ok} rendered`,"");
-  else toast(`Rendered ${ok}${fail?`, ${fail} failed`:""}`, ok?"ok":"err");
+  }catch(e){ toast(e.message,"err"); }
+  finally{ b.disabled=false; $("#cancelBatchBtn").style.display="none"; }
   setTimeout(()=>$("#board").lastElementChild?.scrollIntoView({behavior:"smooth",block:"center"}),100);
 }
+async function retryJob(jid){
+  try{ await api("/api/images/job/"+jid+"/retry",{method:"POST"}); toast("Re-queued","ok"); if(!CUR_BATCH_ID) return; pollBatchOnce(); }
+  catch(e){ toast(e.message,"err"); }
+}
+async function retryFailed(){
+  if(!CUR_BATCH_ID) return;
+  try{ const d=await api("/api/images/queue/"+CUR_BATCH_ID+"/retry-failed",{method:"POST"}); toast(`Re-queued ${d.requeued}`,"ok"); $("#batchGenBtn").disabled=true; $("#cancelBatchBtn").style.display="inline-flex";
+    while(true){ await new Promise(r=>setTimeout(r,1200)); const s=await api("/api/images/queue/"+CUR_BATCH_ID); _renderBatch(s); if(s.done){ const c=s.counts||{}; const rt=$("#qRetryAll"); if(rt) rt.style.display=(c.failed>0)?"inline-flex":"none"; break; } }
+  }catch(e){ toast(e.message,"err"); }
+  finally{ $("#batchGenBtn").disabled=false; $("#cancelBatchBtn").style.display="none"; }
+}
+async function pollBatchOnce(){ if(!CUR_BATCH_ID) return; try{ _renderBatch(await api("/api/images/queue/"+CUR_BATCH_ID)); }catch(_){} }
 
 async function delShot(id){
   try{ await api("/api/sequence/"+id,{method:"DELETE"}); await load(); }
@@ -2536,8 +2595,12 @@ function updateCost(){
   const cb=$("#costBatch"); if(cb) cb.textContent = n?`${n} prompt${n>1?"s":""} · ≈ $${(n*r).toFixed(2)} total (rough)`:"";
 }
 /* render queue with progress + cancel */
-let BATCH_CANCEL=false, BATCH_ABORT=null;
-function cancelBatch(){ BATCH_CANCEL=true; if(BATCH_ABORT){ try{ BATCH_ABORT.abort(); }catch(_){} } toast("Cancelling after this frame…"); }
+let BATCH_CANCEL=false, BATCH_ABORT=null, CUR_BATCH_ID=null;
+async function cancelBatch(){
+  if(CUR_BATCH_ID){ try{ const d=await api("/api/images/queue/"+CUR_BATCH_ID+"/cancel",{method:"POST"}); _renderBatch(d); }catch(_){}
+    toast("Stopping queue — completed frames kept",""); }
+  BATCH_CANCEL=true; if(BATCH_ABORT){ try{ BATCH_ABORT.abort(); }catch(_){} }
+}
 
 function useUrlForAnalyse(u){
   $("#anUrl").value=u;
@@ -3338,6 +3401,25 @@ async function genVoiceoverScenes(){
     $("#editVidWrap").scrollIntoView({behavior:"smooth",block:"center"});
   }catch(e){ toast(e.message,"err"); } finally{ busy(b,false); }
 }
+async function genVoiceoverFlow(){
+  if(!CFG.has_elevenlabs_key){ toast("Add your ElevenLabs key in Settings","err"); openSettings(); return; }
+  if(!STATE.sequence.length){ toast("Render frames in the Sequence tab first","err"); return; }
+  if(!_hasVOText()){ toast("Generate a script in tab 02 first","err"); return; }
+  const b=$("#voFlowBtn"); busy(b,true,"Voicing → timing frames → rendering…");
+  $("#planOut").textContent="① ElevenLabs voicing the full script as one natural track…\n② Timing each frame to the narration…\n③ Adding micro-cuts to any frame that sits too long…";
+  try{
+    const maxHold=parseFloat(($("#flowMaxHold")||{}).value)||6;
+    const body={ voice_id:_voiceId(), transition:$("#editTrans").value||"cut", max_hold:maxHold, ..._fmt(), motion:isOn("tgMotion"), music:isOn("tgUseMusic") };
+    const d=await api("/api/voiceover/auto-flow",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    try{ STATE=await api("/api/state").then(r=>r.state); renderAudio&&renderAudio(); }catch(_){ STATE.edits=STATE.edits||[]; STATE.edits.push(d.edit); }
+    renderEditsList();
+    const lines=[`Natural-flow video · ${Number(d.total_duration||0).toFixed(2)}s · ${(d.plan&&d.plan.rendered_clips)||0} clips (incl. micro-cuts)`,""];
+    (d.scenes||[]).forEach(sc=>lines.push(`  seq ${pad(sc.index)}  hold ${Number(sc.hold_seconds||0).toFixed(2)}s   ${sc.vo||""}`));
+    $("#planOut").textContent=lines.join("\n");
+    toast("Natural-flow video built ✓","ok");
+    $("#editVidWrap").scrollIntoView({behavior:"smooth",block:"center"});
+  }catch(e){ toast(e.message,"err"); $("#planOut").textContent="Failed: "+e.message; } finally{ busy(b,false); }
+}
 async function genVoiceoverAuto(){
   if(!CFG.has_elevenlabs_key){ toast("Add your ElevenLabs key in Settings","err"); openSettings(); return; }
   if(!CFG.has_claude_key){ toast("Add your Claude key in Settings","err"); openSettings(); return; }
@@ -3886,34 +3968,85 @@ function renderUsage(){
 }
 
 /* ---------- AUTOPILOT ---------- */
+let AP_RUN_ID=null, AP_TIMER=null, AP_STEP_START=0, AP_CUR_STEP=0, AP_STEP_LIMIT=60;
+async function loadApVoices(){
+  if(!CFG.has_elevenlabs_key){ toast("Add your ElevenLabs key in Settings","err"); openSettings(); return; }
+  const b=$("#apVoiceBtn"); busy(b,true,"…");
+  try{
+    const d=await api("/api/voices");
+    const sel=$("#apVoice"); const cur=sel.value;
+    sel.innerHTML='<option value="">Default voice</option>';
+    (d.voices||[]).forEach(v=>{ const o=document.createElement("option"); o.value=v.id; o.textContent=v.name+(v.category?` · ${v.category}`:""); if(v.id===(cur||d.current))o.selected=true; sel.appendChild(o); });
+    toast(`${(d.voices||[]).length} voices`,"ok");
+  }catch(e){ toast(e.message,"err"); } finally{ busy(b,false); }
+}
+async function stopAutopilot(){
+  if(!AP_RUN_ID) return;
+  try{ await api("/api/autopilot/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({run_id:AP_RUN_ID})}); toast("Stopping after the current step…",""); }
+  catch(e){ toast(e.message,"err"); }
+}
+const AP_STEP_NAMES=["Analysing YouTube video","Generating script with Claude","Creating character sheets","Rendering sequence frames","Building narrated video","Designing thumbnail"];
+function apMark(i,cls){const d=document.querySelector(`#aps${i} .ap-dot`);if(d){d.className="ap-dot "+cls;}}
+function apSetStep(i){
+  // advance the visible "active" dot and (re)start the per-step countdown.
+  for(let k=0;k<i;k++) apMark(k,"done");
+  apMark(i,"active");
+  AP_CUR_STEP=i; AP_STEP_START=Date.now();
+}
+function apStartTimer(){
+  clearInterval(AP_TIMER);
+  AP_TIMER=setInterval(()=>{
+    const el=document.querySelector(`#aps${AP_CUR_STEP} .ap-time`); if(!el) return;
+    const sec=Math.floor((Date.now()-AP_STEP_START)/1000);
+    const over=sec>=AP_STEP_LIMIT;
+    el.textContent = `${sec}s`+(over?` · proceeding…`:` / ${AP_STEP_LIMIT}s`);
+    el.style.color = over? "var(--amber)":"var(--muted)";
+  },500);
+}
 async function runAutopilot(){
   const url=($("#apUrl")||{}).value||""; if(!url.trim()){toast("Paste a YouTube link","err");return;}
   if(!CFG.has_api_key||!CFG.has_claude_key||!CFG.has_elevenlabs_key){ toast("Set all 3 API keys (image, Claude, ElevenLabs) in Settings first","err"); openSettings(); return; }
   const nudge=($("#apNudge")||{}).value||"";
+  const target_seconds=parseFloat(($("#apLength")||{}).value)||null;
+  const voice_id=($("#apVoice")||{}).value||undefined;
+  const step_timeout=parseFloat(($("#apStepTimeout")||{}).value)||60;
+  AP_STEP_LIMIT=step_timeout;
+  AP_RUN_ID="run_"+Date.now()+"_"+Math.random().toString(36).slice(2,7);
   const prog=$("#apProgress"); prog.style.display="block";
-  const STEPS=["Analysing YouTube video","Generating script with Claude","Creating character sheets","Rendering sequence frames","Building narrated video","Designing thumbnail"];
-  prog.innerHTML=STEPS.map((s,i)=>`<div class="ap-step" id="aps${i}"><div class="ap-dot wait"></div><span>${s}</span></div>`).join("");
-  function mark(i,cls){const d=document.querySelector(`#aps${i} .ap-dot`);if(d){d.className="ap-dot "+cls;}}
-  mark(0,"active");
+  prog.innerHTML=AP_STEP_NAMES.map((s,i)=>`<div class="ap-step" id="aps${i}"><div class="ap-dot wait"></div><span>${s}</span> <span class="ap-time" style="font-size:11px;color:var(--muted);margin-left:auto"></span></div>`).join("");
+  apSetStep(0); apStartTimer();
+  // The backend runs steps server-side; we advance the visible dots on a soft
+  // schedule and let the per-step timer show when it's overrunning. The real
+  // Stop is enforced between steps server-side.
+  const softAdvance=setInterval(()=>{ if(AP_CUR_STEP<AP_STEP_NAMES.length-1){ const sec=(Date.now()-AP_STEP_START)/1000; if(sec>AP_STEP_LIMIT) apSetStep(AP_CUR_STEP+1); } },1000);
   const b=$("#apBtn"); busy(b,true,"Running — this may take several minutes…");
+  $("#apStopBtn").style.display="inline-flex"; $("#apRegenBtn").style.display="none";
   try{
-    const d=await api("/api/autopilot",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url,nudge})});
-    STEPS.forEach((_,i)=>mark(i,"done"));
+    const d=await api("/api/autopilot",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url,nudge,target_seconds,voice_id,run_id:AP_RUN_ID,step_timeout})});
+    clearInterval(softAdvance); clearInterval(AP_TIMER);
     STATE=await api("/api/state").then(r=>r.state);
     renderBoard(); renderCharacters(); renderCast(); renderEditsList();
-    let html='<div class="ap-result">';
-    if(d.video_url) html+=`<div><video controls src="${d.video_url}" style="max-width:340px;border-radius:10px;border:1px solid var(--line)"></video><div style="font-size:12px;color:var(--teal);margin-top:4px">${d.total_duration||0}s · ${(d.steps||[]).find(s=>s.step==="frames")?.rendered||0} frames</div></div>`;
-    if(d.thumbnail_url) html+=`<div><img src="${d.thumbnail_url}" style="max-width:200px;border-radius:8px;border:1px solid var(--line)"/><div style="font-size:12px;color:var(--muted);margin-top:4px">Thumbnail</div></div>`;
-    html+=`<div style="font-size:13px;color:var(--ink)"><strong>${_esc(d.suggestion?.title||'')}</strong><br><span style="color:var(--muted)">${_esc(d.suggestion?.logline||'')}</span></div>`;
-    html+='</div>';
-    if(d.video_url) html+=`<div style="margin-top:10px"><a class="btn outline sm" href="${d.video_url}" download>Download MP4</a></div>`;
-    $("#apResult").innerHTML=html;
-    toast("Autopilot complete — video + thumbnail ready","ok"); confettiBurst();
+    if(d.stopped){
+      AP_STEP_NAMES.forEach((_,i)=>{const dot=document.querySelector(`#aps${i} .ap-dot`);if(dot&&dot.classList.contains("wait"))dot.className="ap-dot";});
+      $("#apResult").innerHTML=`<div style="color:var(--amber);font-size:13px">⏹ Stopped — finished steps were kept. Press Regenerate to run again.</div>`;
+      toast("Autopilot stopped","");
+    } else {
+      AP_STEP_NAMES.forEach((_,i)=>apMark(i,"done"));
+      let html='<div class="ap-result">';
+      if(d.video_url) html+=`<div><video controls src="${d.video_url}" style="max-width:340px;border-radius:10px;border:1px solid var(--line)"></video><div style="font-size:12px;color:var(--teal);margin-top:4px">${d.total_duration||0}s · ${(d.steps||[]).find(s=>s.step==="frames")?.rendered||0} frames</div></div>`;
+      if(d.thumbnail_url) html+=`<div><img src="${d.thumbnail_url}" style="max-width:200px;border-radius:8px;border:1px solid var(--line)"/><div style="font-size:12px;color:var(--muted);margin-top:4px">Thumbnail</div></div>`;
+      html+=`<div style="font-size:13px;color:var(--ink)"><strong>${_esc(d.suggestion?.title||'')}</strong><br><span style="color:var(--muted)">${_esc(d.suggestion?.logline||'')}</span></div>`;
+      html+='</div>';
+      if(d.video_url) html+=`<div style="margin-top:10px"><a class="btn outline sm" href="${d.video_url}" download>Download MP4</a></div>`;
+      $("#apResult").innerHTML=html;
+      toast("Autopilot complete — video + thumbnail ready","ok"); confettiBurst();
+    }
   }catch(e){
-    STEPS.forEach((_,i)=>{const d=document.querySelector(`#aps${i} .ap-dot`);if(d&&d.classList.contains("wait"))d.className="ap-dot";});
+    clearInterval(softAdvance); clearInterval(AP_TIMER);
+    AP_STEP_NAMES.forEach((_,i)=>{const dot=document.querySelector(`#aps${i} .ap-dot`);if(dot&&dot.classList.contains("wait"))dot.className="ap-dot";});
     toast(e.message,"err");
     $("#apResult").innerHTML=`<div style="color:var(--red);font-size:13px">Failed: ${_esc(e.message)}</div>`;
-  }finally{ busy(b,false); }
+  }finally{ busy(b,false); $("#apStopBtn").style.display="none"; $("#apRegenBtn").style.display="inline-flex"; AP_RUN_ID=null; }
 }
 
 /* ---------- WORKFLOW CANVAS (n8n-style) ---------- */

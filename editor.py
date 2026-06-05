@@ -4,11 +4,40 @@ We assemble final cuts from generated frames + uploaded audio according to an
 EDL produced by Claude (see claude_client.ClaudeClient.plan_edit).
 """
 import json
+import math
 import os
 import subprocess
 from typing import List, Dict, Optional
 
 import store
+
+
+def split_long_holds(shots: List[Dict], max_hold: float = 6.0,
+                     zoom_step: float = 0.05) -> List[Dict]:
+    """Keep a single image from sitting on screen too long.
+
+    Any shot held longer than ``max_hold`` seconds is split into several shorter
+    sub-shots of the SAME image, each at a slightly tighter zoom. Because each
+    sub-shot is a static clip at a different framing, the boundaries read as
+    subtle "micro-cuts" — the picture appears to step in rather than freeze.
+    The total duration is preserved, so audio sync is untouched.
+    """
+    out: List[Dict] = []
+    for sh in shots:
+        dur = float(sh.get("duration") or 0)
+        if dur <= max_hold or dur <= 0:
+            out.append(sh)
+            continue
+        k = int(math.ceil(dur / max_hold))
+        seg = dur / k
+        for j in range(k):
+            nsh = dict(sh)
+            nsh["duration"] = round(seg, 3)
+            nsh["zoom"] = round(1.0 + zoom_step * j, 3)   # 1.00, 1.05, 1.10 ...
+            if j:
+                nsh["note"] = (sh.get("note") or "") + f" · micro-cut {j+1}/{k}"
+            out.append(nsh)
+    return out
 
 
 def probe_duration(path: str) -> float:
@@ -180,6 +209,12 @@ def assemble_video(
                 f"scale={width}:{height}:force_original_aspect_ratio=increase,"
                 f"crop={width}:{height},setsar=1"
             )
+        # Optional per-shot static zoom (used by micro-cuts): center-crop tighter
+        # then scale back up, giving a fixed punched-in framing for this segment.
+        zoom = float(sh.get("zoom") or 1.0)
+        if zoom > 1.001:
+            vf += (f",crop=iw/{zoom:.4f}:ih/{zoom:.4f},"
+                   f"scale={width}:{height},setsar=1")
         if motion:
             frames = max(2, round(dur * fps))
             vf += (f",zoompan=z='min(zoom+0.0010,1.18)':"
