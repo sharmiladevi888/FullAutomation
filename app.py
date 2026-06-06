@@ -2342,35 +2342,9 @@ def _word_count(s: str) -> int:
 
 
 # --------------------------------------------------------------------------- #
-#  ElevenLabs sound design — generate real SFX and mix them into the edit.
+#  ElevenLabs sound design — Claude-driven SFX planning + generation.
 # --------------------------------------------------------------------------- #
 _SFX_CACHE_DIR = os.path.join(config.DATA_DIR, "sfx_cache")
-
-# Map words in the narration to a sound-effect description + intensity. Whichever
-# matches first wins; "high" intensity scenes also get an impact boom.
-_SFX_KEYWORDS = [
-    (("lava", "molten", "magma"), "bubbling molten lava crackle and hiss", "high"),
-    (("meteor", "asteroid", "comet", "impact", "crash", "collide"),
-     "huge meteor impact explosion boom", "high"),
-    (("explos", "erupt", "volcano", "blast", "burst"),
-     "volcanic eruption explosion rumble", "high"),
-    (("poison", "toxic", "gas", "fume", "cough", "choke", "breathe", "air"),
-     "toxic gas hiss with a human cough", "normal"),
-    (("heat", "burn", "1200", "1,200", "degree", "boil", "scorch"),
-     "intense roaring fire whoosh", "high"),
-    (("die", "death", "dead", "gone", "vanish", "destroy"),
-     "dramatic deep cinematic impact hit", "high"),
-    (("wind", "storm", "ash", "smoke", "cloud"), "howling wind with ash storm", "normal"),
-    (("water", "ocean", "rain", "flood"), "rushing water surge", "normal"),
-]
-
-
-def _sfx_for_text(text):
-    low = (text or "").lower()
-    for keys, desc, intensity in _SFX_KEYWORDS:
-        if any(k in low for k in keys):
-            return desc, intensity
-    return None, "normal"
 
 
 def _generate_sfx_cached(request, text, duration=None):
@@ -2386,6 +2360,56 @@ def _generate_sfx_cached(request, text, duration=None):
             f.write(mp3)
     rel = os.path.relpath(path, store.DATA_DIR).replace(os.sep, "/")
     return f"/data/{rel}", path
+
+
+def _plan_sfx_with_claude(request, scene_map, total_seconds):
+    """Ask Claude to design a sound plan for the video. Returns a dict with
+    'bed' (ambient bed description) and 'cues' (list of point SFX)."""
+    scenes_text = []
+    t = 0.0
+    for sc in scene_map:
+        hold = float(sc.get("hold_seconds") or 0)
+        vo = (sc.get("vo") or "").strip()
+        scenes_text.append(f"  [{t:.1f}s - {t+hold:.1f}s] Scene {sc.get('index', '?')}: \"{vo}\"")
+        t += hold
+
+    prompt = (
+        f"You are a sound designer for a {total_seconds:.0f}-second short-form video.\n"
+        f"Here is the timeline with narration per scene:\n"
+        + "\n".join(scenes_text) + "\n\n"
+        "Design a SUBTLE, PROFESSIONAL sound plan. Return STRICT JSON ONLY:\n"
+        "{\n"
+        '  "bed": "short ElevenLabs SFX prompt for a loopable ambient bed that fits this video\'s mood/topic (8-15 words)",\n'
+        '  "cues": [\n'
+        '    { "at": float, "desc": "short ElevenLabs SFX prompt (5-12 words, natural/realistic)", "dur": float, "vol": float }\n'
+        "  ]\n"
+        "}\n\n"
+        "RULES:\n"
+        "- The bed is a SUBTLE ambient texture that loops under the voice — NOT a dramatic drone. "
+        "Match it to the video's world (e.g. soft city hum, gentle wind, quiet room tone, "
+        "distant nature sounds). Keep it textural and barely noticeable.\n"
+        "- Place at most 4-6 point cues across the WHOLE video. LESS IS MORE. "
+        "Only place a sound where it genuinely enhances a moment — a transition, a reveal, "
+        "an emotional beat. NOT on every scene.\n"
+        "- Minimum 4 seconds gap between any two cues. Never stack sounds.\n"
+        "- Volume: 0.15-0.30 for subtle accents, 0.35-0.50 ONLY for one big payoff moment. "
+        "The voice-over must ALWAYS be the loudest thing.\n"
+        "- Duration: 0.5-2.0 seconds for hits/whooshes, up to 3.0 for swells.\n"
+        "- SFX descriptions must be SPECIFIC and NATURAL sounding — "
+        "write them as short prompts for ElevenLabs Sound Generation API. "
+        "Good: 'soft camera shutter click', 'gentle rising orchestral swell'. "
+        "Bad: 'huge epic massive explosion boom impact', 'dramatic cinematic hit'.\n"
+        "- Match the TONE of the video. Comedy = playful sounds. Scary = tension sounds. "
+        "Educational = subtle transitions. Don't put horror sounds on a funny video.\n"
+        "- A subtle whoosh on the first scene transition is fine but not mandatory.\n"
+        "JSON only, no markdown."
+    )
+    try:
+        raw = get_claude_client(request).chat_text(prompt, max_tokens=1500)
+        return extract_json(raw)
+    except Exception as e:
+        print(f"[sound] Claude SFX planning failed: {e}", flush=True)
+        return None
 
 
 def _normalize_loud(video_path, target_lufs=-14.0):
@@ -2405,41 +2429,51 @@ def _normalize_loud(video_path, target_lufs=-14.0):
 
 
 def _auto_sound_design(request, scene_map, total_seconds):
-    """Build a sound plan from the scene narration and generate it via
-    ElevenLabs. Returns (rumble_path_or_None, sfx_entries). The rumble is meant
-    for the looped 'music' bed; sfx_entries drop into st['sfx'] (point sounds).
-    Generates only a handful of UNIQUE clips (cached + reused) to control cost."""
+    """Claude-driven sound design. Asks Claude to analyse the narration and
+    design a tasteful, sparse sound plan, then generates the clips via
+    ElevenLabs. Returns (rumble_path_or_None, sfx_entries)."""
     sfx_entries = []
     rumble_path = None
-    try:
-        _, rumble_path = _generate_sfx_cached(
-            request, "deep continuous low ominous cinematic rumble drone, seamless",
-            duration=22)
-    except Exception as e:
-        print(f"[sound] rumble skipped: {e}", flush=True)
 
-    # whoosh at the very start (into the hook/first frame)
-    def _add(desc, at, vol, dur=None):
+    plan = _plan_sfx_with_claude(request, scene_map, total_seconds)
+
+    if plan and plan.get("bed"):
+        bed_desc = str(plan["bed"]).strip()
+        if not bed_desc.lower().endswith("seamless"):
+            bed_desc += ", seamless loop"
+        try:
+            _, rumble_path = _generate_sfx_cached(request, bed_desc, duration=22)
+        except Exception as e:
+            print(f"[sound] bed skipped: {e}", flush=True)
+
+    cues = (plan or {}).get("cues") or []
+    last_at = -5.0
+    for cue in cues[:6]:
+        at = float(cue.get("at", 0))
+        if at - last_at < 4.0:
+            continue
+        desc = str(cue.get("desc", "")).strip()
+        if not desc:
+            continue
+        dur = max(0.5, min(3.0, float(cue.get("dur", 1.5))))
+        vol = max(0.10, min(0.50, float(cue.get("vol", 0.25))))
         try:
             url, _p = _generate_sfx_cached(request, desc, duration=dur)
             sfx_entries.append({"id": store.new_id("sfx"), "url": url,
                                 "name": desc[:40], "at_seconds": round(max(0, at), 2),
                                 "volume": vol})
+            last_at = at
         except Exception as e:
             print(f"[sound] sfx '{desc[:24]}' skipped: {e}", flush=True)
 
-    _add("fast cinematic whoosh transition", 0.0, 0.5, dur=1.0)
-    t = 0.0
-    last_boom = -5.0
-    for sc in scene_map:
-        hold = float(sc.get("hold_seconds") or 0)
-        desc, intensity = _sfx_for_text(sc.get("vo") or "")
-        if desc and (t - last_boom) >= 2.0:      # don't stack sounds too densely
-            _add(desc, t + 0.05, 0.55, dur=2.0)
-            last_boom = t
-        t += hold
-    # final comedic/dramatic hit on the payoff
-    _add("hard dramatic comedic impact hit", max(0.0, total_seconds - 1.4), 0.7, dur=1.5)
+    if not plan:
+        try:
+            _, rumble_path = _generate_sfx_cached(
+                request, "soft subtle ambient room tone texture, seamless loop",
+                duration=22)
+        except Exception:
+            pass
+
     return rumble_path, sfx_entries
 
 
@@ -2476,6 +2510,8 @@ def _build_flow_video(st, request, *, voice_id, text, transition="cut",
 
     # 2. Weight each frame by its scene's narration length so images change in
     #    step with the speech. Frames beyond the last scene line share evenly.
+    #    HOOK PACING: the first ~30s of audio get fast-paced frames (1.0-1.3s
+    #    each) so the opening is visually intense and scroll-stopping.
     lines = _scene_vo_lines(st)
     n = len(seq)
     weights = []
@@ -2487,6 +2523,28 @@ def _build_flow_video(st, request, *, voice_id, text, transition="cut",
     # Re-normalise so the holds sum to the real audio length (keeps A/V locked).
     scale = dur / (sum(holds) or 1.0)
     holds = [round(h * scale, 3) for h in holds]
+
+    # Hook zone: cap the first frames (covering ~30s of audio) to 1.0-1.3s
+    # and redistribute the stolen time to later frames so total stays locked.
+    hook_budget = min(30.0, dur * 0.4)
+    hook_cap = 1.15
+    cum, stolen = 0.0, 0.0
+    hook_end_idx = 0
+    for i in range(n):
+        cum += holds[i]
+        if cum > hook_budget:
+            hook_end_idx = i
+            break
+        if holds[i] > hook_cap:
+            stolen += holds[i] - hook_cap
+            holds[i] = hook_cap
+        hook_end_idx = i + 1
+    # Spread stolen time across remaining (non-hook) frames proportionally.
+    rest = list(range(hook_end_idx, n))
+    rest_total = sum(holds[j] for j in rest) or 1.0
+    if stolen > 0 and rest:
+        for j in rest:
+            holds[j] = round(holds[j] + stolen * (holds[j] / rest_total), 3)
 
     shots, scene_map = [], []
     for i in range(n):
@@ -2515,7 +2573,7 @@ def _build_flow_video(st, request, *, voice_id, text, transition="cut",
         try:
             rumble_path, sfx_entries = _auto_sound_design(request, scene_map, dur)
             if rumble_path and not music_path:   # use rumble as the ducked bed
-                music_path, music_vol = rumble_path, 0.16
+                music_path, music_vol = rumble_path, 0.10
         except Exception as ex:
             print(f"[sound] design skipped: {ex}", flush=True)
 
@@ -3578,7 +3636,7 @@ def _seo_text(seo: dict, title: str) -> str:
 def api_export_package(script: bool = True, prompts: bool = True,
                        characters: bool = True, frames: bool = True,
                        voiceover: bool = True, video: bool = True,
-                       seo: bool = True):
+                       seo: bool = True, thumbnails: bool = True):
     """Bundle the project into one ZIP. Query flags select what to include
     (selective export): script, prompts, characters, frames, voiceover, video, seo."""
     st = store.load_state()
@@ -3661,6 +3719,16 @@ def api_export_package(script: bool = True, prompts: bool = True,
                         z.writestr(f"{root}/video/{os.path.basename(path)}", fh.read())
                 except Exception:
                     continue
+
+        if thumbnails:
+            for i, t in enumerate(st.get("thumbnails", []), 1):
+                try:
+                    data = store.read_image(t["url"])
+                except Exception:
+                    continue
+                ext = os.path.splitext(t["url"])[1].lstrip(".") or "png"
+                label = _safe_name(t.get("title", ""), "thumbnail")
+                z.writestr(f"{root}/thumbnails/{label}_{i}.{ext}", data)
 
         if not z.namelist():
             z.writestr(f"{root}/README.txt",

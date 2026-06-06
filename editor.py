@@ -353,7 +353,7 @@ def mix_sfx(video_path: str, sfx_list: List[Dict], output_path: str = None) -> s
     filt_parts = []
     for i, sfx in enumerate(sfx_list):
         delay_ms = int(max(0, sfx.get("at_seconds", 0)) * 1000)
-        vol = max(0, min(1.0, sfx.get("volume", 0.8)))
+        vol = max(0, min(0.5, sfx.get("volume", 0.25)))
         filt_parts.append(f"[{i+1}:a]adelay={delay_ms}|{delay_ms},volume={vol}[sfx{i}]")
 
     main_audio = "[0:a]"
