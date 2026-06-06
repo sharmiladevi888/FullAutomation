@@ -371,7 +371,14 @@ class ClaudeClient:
             '- Each character "sheet_prompt" is ONE rich paragraph describing that '
             "character's canonical look (face, hair, build, outfit, colors, vibe) — "
             "written so it can be sent straight to a character-sheet generator. Use "
-            "the exact same names as in the scene prompts."
+            "the exact same names as in the scene prompts.\n"
+            "- HOOK IS EVERYTHING. The first 3-5 scenes (the first ~30 seconds) MUST "
+            "be a rapid-fire, scroll-stopping opening. Write SHORT, punchy VO lines "
+            "for these scenes (5-10 words each) so images flash fast. Open with a "
+            "shocking question, wild claim, or visceral image — something that makes "
+            "a viewer stop scrolling IMMEDIATELY. Never open with slow setup or "
+            "generic intro. The hook must create curiosity or tension that DEMANDS "
+            "the viewer keeps watching. After the hook, settle into normal pacing."
         )
         if dynamic:
             system += (
