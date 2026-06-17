@@ -350,25 +350,6 @@ def _voice_default_id(s):
     return s.get("elevenlabs_voice_id") or ""
 
 
-@app.post("/api/analyse-scene")
-def api_analyse_scene(a: AnalyseIn, request: Request):
-    try:
-        img = store.read_image(a.image_url)
-    except Exception as e:
-        raise HTTPException(400, f"unreadable image: {e}")
-    try:
-        text = get_claude_client(request).analyse_scene(
-            pipeline.downsize_for_vision(img), a.question
-        )
-    except Exception as e:
-        raise HTTPException(500, f"analysis failed: {e}")
-    return {"analysis": text}
-@app.post("/api/prompts-from-video")
-def api_prompts_from_video(p: AnalyseIn, request: Request):
-    # ... existing implementation uses get_claude_client ...
-    pass
-
-
 # --------------------------------------------------------------------------- #
 #  Static page
 # --------------------------------------------------------------------------- #
