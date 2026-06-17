@@ -43,6 +43,55 @@ class ImageClient:
             base_url=self.base_url,
             timeout=self.timeout,
         )
+        # Lazily-built OpenRouter client used as a fallback when the primary
+        # derouter endpoint returns an HTTP 402 billing/wallet error. Only
+        # created on first need and only if a key + the toggle are present.
+        self._or_fallback = None
+
+    # ------------------------------------------------------------------ #
+    #  Billing / 402 handling
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _status_code(e):
+        """Best-effort HTTP status from an OpenAI SDK exception."""
+        code = getattr(e, "status_code", None)
+        if code:
+            return code
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            return getattr(resp, "status_code", None)
+        return None
+
+    @classmethod
+    def _is_billing_error(cls, e):
+        """True if an exception looks like an HTTP 402 wallet/balance error."""
+        if cls._status_code(e) == 402:
+            return True
+        low = (str(e) or "").lower()
+        return ("402" in low or "wallet-balance" in low
+                or "wallet balance" in low or "slot reservation failed" in low
+                or "payment_required" in low or "insufficient_quota" in low)
+
+    def _billing_message(self, e):
+        return (
+            "Image provider billing error (HTTP 402) at "
+            f"{self.base_url}: the derouter wallet balance is too low to "
+            "reserve a render slot (\"Slot reservation failed (wallet-balance)\"). "
+            "Top up the derouter wallet, lower DEFAULT_QUALITY, or set "
+            "OPENROUTER_API_KEY to fall back to a free OpenRouter image model. "
+            f"[{self._format_openai_error(e)}]"
+        )
+
+    def _openrouter_fallback(self):
+        """Return a ready OpenRouterImageClient if fallback is enabled and a
+        key is configured, else None."""
+        if not config.IMAGE_FALLBACK_ON_402:
+            return None
+        if not config.OPENROUTER_API_KEY:
+            return None
+        if self._or_fallback is None:
+            self._or_fallback = OpenRouterImageClient()
+        return self._or_fallback
 
     def _require_key(self):
         if not self.api_key:
@@ -166,6 +215,15 @@ class ImageClient:
                 f"image API rejected the key — {self._format_openai_error(e)}"
             )
         except APIError as e:
+            # HTTP 402 wallet/balance: try the OpenRouter fallback (if a key is
+            # set + the toggle is on), otherwise raise a clear billing message.
+            if self._is_billing_error(e):
+                fb = self._openrouter_fallback()
+                if fb is not None:
+                    _log("derouter 402 (wallet-balance) — falling back to "
+                         f"OpenRouter model={fb.model}")
+                    return fb._generate_once(prompt, size, quality)
+                raise RuntimeError(self._billing_message(e))
             raise RuntimeError(
                 f"image API error — {self._format_openai_error(e)}"
             )
@@ -272,6 +330,16 @@ class ImageClient:
                 _log(f"edits endpoint unsupported at {self.base_url} — "
                      f"falling back to generate() for this and future frames")
                 return self._generate_once(prompt, size, quality)
+            # HTTP 402 wallet/balance: try the OpenRouter fallback (with refs),
+            # otherwise raise a clear, actionable billing message.
+            if resp.status_code == 402 or self._is_billing_error(resp.text):
+                fb = self._openrouter_fallback()
+                if fb is not None:
+                    _log("derouter 402 (wallet-balance) on edit — falling back "
+                         f"to OpenRouter model={fb.model}")
+                    return fb._edit_once(prompt, images, size, quality)
+                raise RuntimeError(self._billing_message(
+                    f"HTTP 402 @ {url} response: {resp.text[:300]}"))
             raise RuntimeError(
                 f"image edit failed [HTTP {resp.status_code}] @ {url} "
                 f"response: {resp.text[:600]}"
