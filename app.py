@@ -1693,6 +1693,29 @@ def _ensure_virality(sugs):
     return sugs
 
 
+def _fallback_suggestions(sources, n_suggestions):
+    """Build a minimal but VALID suggestions list when the LLM never returned a
+    usable one. Seeds each idea from a source video title so the cards are at
+    least grounded in the references, and flags them as estimated. Guarantees a
+    non-empty list (never raises) so the caller can avoid a hard 500."""
+    titles = [(s.get("title") or "").strip()
+              for s in (sources or []) if (s.get("title") or "").strip()]
+    out = []
+    for i in range(max(1, int(n_suggestions or 1))):
+        base = titles[i % len(titles)] if titles else ""
+        title = (f"Idea inspired by: {base}" if base
+                 else f"Reference-style idea #{i + 1}")
+        out.append({
+            "title": title[:120],
+            "logline": ("A short-form video in the same style and pacing as the "
+                        "reference set."),
+            "virality_reason": ("Auto-generated fallback — refine with a clearer "
+                                "reference set for a real score."),
+            "_fallback": True,
+        })
+    return out
+
+
 # Canonical scene fields -> aliases the model sometimes emits instead. The big
 # one: the VISUAL image description lands under "visual" (or art/imagery/…)
 # instead of "prompt", so frames were being rendered from the narration text and
@@ -1793,6 +1816,8 @@ def _deep_analyze_urls(urls, nudge, model, request, n_suggestions=10):
             master_prompt=st["master_prompt"], n_suggestions=n_suggestions)
         return _as_analysis_dict(extract_json(raw))
 
+    data, sugs = {}, []
+    analysis_warning = ""
     try:
         data = _ask()
         sugs = _normalize_suggestions(data.get("suggestions"))
@@ -1811,11 +1836,41 @@ def _deep_analyze_urls(urls, nudge, model, request, n_suggestions=10):
             sugs2 = _normalize_suggestions(data2.get("suggestions"))
             if not _suggestions_need_fix(sugs2) or len(sugs2) > len(sugs):
                 data, sugs = data2, sugs2
-        data["suggestions"] = _ensure_virality(sugs)
+        if _suggestions_need_fix(sugs):
+            # Third attempt with a SIMPLER schema — drop the rich fields and ask
+            # only for the bare minimum a card needs. Easier for the model to
+            # honour when it keeps mangling the full schema.
+            data3 = _ask(
+                "\n\nSIMPLIFIED OUTPUT: return \"suggestions\" as an array of "
+                "objects with ONLY these keys: title (string), logline (one "
+                "sentence), virality_score (INTEGER 1-100). Nothing else is "
+                "required. Sort most-viral first. JSON only.")
+            sugs3 = _normalize_suggestions(data3.get("suggestions"))
+            if not _suggestions_need_fix(sugs3) or len(sugs3) > len(sugs):
+                # Keep the richer analysis axes from the best earlier attempt
+                # but take the simpler-schema suggestions.
+                data = data or data3
+                sugs = sugs3
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(500, f"analysis failed: {e}")
+        # Don't hard-500 — degrade to a minimal valid response with a warning so
+        # the UI still renders something actionable.
+        analysis_warning = f"analysis degraded: {e}"
+        data = data if isinstance(data, dict) else {}
+        sugs = sugs or []
+
+    if not sugs:
+        # All attempts failed to yield usable suggestions — synthesize a minimal
+        # valid list from the source titles so the caller never gets a 500.
+        analysis_warning = analysis_warning or (
+            "Couldn't extract clean idea suggestions from these videos — showing "
+            "minimal fallback ideas. Try different reference links.")
+        sugs = _fallback_suggestions(sources, n_suggestions)
+
+    data["suggestions"] = _ensure_virality(sugs)
+    if analysis_warning:
+        data["warning"] = analysis_warning
 
     return data, src_meta, errors, pooled_frames
 
@@ -4336,6 +4391,26 @@ def api_edit_plan(e: EditPlanIn, request: Request):
         raise HTTPException(500, f"edit planning failed: {ex}")
     if e.transition:
         plan["transition"] = e.transition
+    # Deterministic post-process: never trust the LLM's arithmetic. Force the
+    # shot hold-times to sum EXACTLY to the real audio duration so the cut stays
+    # locked to the audio. Scale proportionally, clamp to a 0.2s floor, then
+    # absorb any rounding residue into the final shot.
+    audio_dur = float(st["audio"]["duration"]) or 0.0
+    shots = plan.get("shots") or []
+    if audio_dur > 0 and shots:
+        cur = sum(max(0.0, float(s.get("duration") or 0.0)) for s in shots)
+        if cur > 0:
+            k = audio_dur / cur
+            for s in shots:
+                s["duration"] = round(max(0.2, float(s.get("duration") or 0.0) * k), 3)
+        else:
+            even = round(audio_dur / len(shots), 3)
+            for s in shots:
+                s["duration"] = even
+        drift = round(audio_dur - sum(float(s["duration"]) for s in shots), 3)
+        if abs(drift) >= 0.01:
+            shots[-1]["duration"] = round(max(0.2, float(shots[-1]["duration"]) + drift), 3)
+        plan["total_duration"] = round(audio_dur, 2)
     return plan
 
 
