@@ -195,3 +195,13 @@ OPENROUTER_MODELS = [
     "sourceful/riverflow-v2.5-fast:free",
     "sourceful/riverflow-v2.5-pro:free",
 ]
+
+# When the primary derouter image endpoint returns an HTTP 402 billing error
+# (e.g. "Slot reservation failed (wallet-balance)") and an OpenRouter image key
+# is configured, automatically retry that single request on OpenRouter instead
+# of failing. Defaults to True so a depleted derouter wallet doesn't halt a run
+# when a free OpenRouter image model is available; set IMAGE_FALLBACK_ON_402=
+# false in .env to disable and surface the billing error directly.
+IMAGE_FALLBACK_ON_402 = _get("IMAGE_FALLBACK_ON_402", "true").lower() in (
+    "1", "true", "yes",
+)

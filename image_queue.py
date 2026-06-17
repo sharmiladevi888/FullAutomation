@@ -63,7 +63,15 @@ _TRANSIENT_MARKERS = ("timeout", "timed out", "connection", "could not reach",
 _FATAL_MARKERS = ("authenticationerror", "rejected the key", "unauthorized",
                   "401", "invalid_api_key", "no image api key",
                   "content_policy", "invalid_request_error",
-                  "moderation", "billing", "insufficient_quota")
+                  "moderation", "billing", "insufficient_quota",
+                  "402", "wallet-balance", "wallet balance",
+                  "slot reservation failed", "payment_required")
+# Billing / wallet markers — a fatal sub-class that gets its own clear,
+# actionable message (top up the wallet or configure an OpenRouter fallback)
+# instead of the generic "request was rejected".
+_BILLING_MARKERS = ("402", "wallet-balance", "wallet balance",
+                    "slot reservation failed", "insufficient_quota",
+                    "payment_required", "billing")
 
 
 def classify_error(exc) -> str:
@@ -87,6 +95,17 @@ def classify_error(exc) -> str:
     return "server"
 
 
+def is_billing_error(exc) -> bool:
+    """True when the failure is a payment/wallet/quota problem (HTTP 402 etc.).
+    These are fatal — never retried — but warrant a top-up / fallback message
+    rather than the generic rejection text."""
+    low = str(exc or "").lower()
+    if any(m in low for m in _BILLING_MARKERS):
+        # A 429 quota that's really a rate-limit isn't a billing wall.
+        return not any(m in low for m in _RATE_MARKERS)
+    return False
+
+
 def user_message(kind: str, exc=None) -> str:
     if kind == "rate_limit":
         secs = round(config.IMAGE_RATE_LIMIT_COOLDOWN_MS / 1000)
@@ -95,6 +114,13 @@ def user_message(kind: str, exc=None) -> str:
     if kind == "server":
         return "OpenAI server error. Retrying automatically with backoff."
     # fatal
+    if is_billing_error(exc):
+        hint = ("Image provider billing error (HTTP 402): the derouter wallet "
+                "balance is too low to reserve a render slot. Top up the "
+                "derouter wallet, or set an OpenRouter image key "
+                "(OPENROUTER_API_KEY) to fall back to a free image model.")
+        detail = _scrub(exc) if exc else ""
+        return f"{hint} ({detail[:160]})" if detail else hint
     msg = _scrub(exc) if exc else "the request was rejected"
     return f"Image generation failed: {msg[:200]}"
 
