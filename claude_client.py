@@ -1139,8 +1139,23 @@ class ClaudeClient:
         transition = None
         rationales = []
         vo_lines = vo_lines or []
+        # Per-frame VO line length (word count) drives proportional time: a
+        # batch covering longer narration should fill a bigger slice of audio,
+        # and within a batch each shot's hold is tied to its line length.
+        def _line_len(i):
+            line = (vo_lines[i] or "").strip() if i < len(vo_lines) else ""
+            return len(line.split())
+        vo_weights = [_line_len(i) for i in range(n)]
+        total_vo = sum(vo_weights)
         for offset, batch in batches:
-            share = audio_duration * (len(batch) / n) if n else audio_duration
+            # Weight this batch's audio share by the VO words spoken over it when
+            # we have narration; otherwise fall back to an even split by frames.
+            batch_vo = sum(vo_weights[offset:offset + len(batch)])
+            if total_vo > 0:
+                share = audio_duration * (batch_vo / total_vo) if batch_vo else \
+                    audio_duration * (len(batch) / n)
+            else:
+                share = audio_duration * (len(batch) / n) if n else audio_duration
             lo, hi = offset + 1, offset + len(batch)
             # Give Claude the narration spoken over this batch so the cut can
             # match imagery to WHAT IS BEING SAID, not just fill the runtime.
@@ -1199,14 +1214,20 @@ class ClaudeClient:
             '"shots": [{"index": int, "duration": float, "note": str}], '
             '"rationale": str }\n'
             "Rules: index is the GLOBAL 1-based frame number shown below — use "
-            "those numbers exactly. You may repeat or omit frames. The sum of "
-            "durations should be about the batch audio share. Keep shots between "
+            "those numbers exactly. Output EXACTLY ONE shot per frame in this "
+            "batch (shots count MUST equal the number of frames; do not omit or "
+            "repeat frames). The sum of all durations MUST equal the batch audio "
+            "share given below. Tie each shot's duration to how long its matched "
+            "narration line takes to speak — a longer line gets a longer hold, a "
+            "short line a shorter one. Keep shots between "
             "0.4 and 8 seconds unless the brief says otherwise."
         )
         instr = [
             f"This batch contains frames {lo}..{hi} of {total} total "
             f"(use ONLY indices {lo}..{hi}).",
-            f"Fill about {share_duration:.2f} seconds of audio with this batch.",
+            f"Return EXACTLY {hi - lo + 1} shots — one per frame.",
+            f"The durations MUST sum to exactly {share_duration:.2f} seconds "
+            f"(the audio share for this batch).",
         ]
         if (narration or "").strip():
             instr.append(
