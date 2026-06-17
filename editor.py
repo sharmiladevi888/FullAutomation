@@ -53,6 +53,29 @@ def probe_duration(path: str) -> float:
     return float((data.get("format") or {}).get("duration") or 0)
 
 
+def trim_silence(input_path: str, output_path: str = None,
+                 threshold_db: int = -35, min_dur: float = 0.15) -> str:
+    """Strip leading and trailing silence from an audio file using ffmpeg
+    silenceremove. Keeps a tiny pad (``min_dur`` s) so words don't clip.
+    Returns the output path (overwrites in-place if ``output_path`` is None)."""
+    out = output_path or (input_path + ".trimmed.mp3")
+    af = (
+        f"silenceremove=start_periods=1:start_duration={min_dur}:"
+        f"start_threshold={threshold_db}dB:"
+        f"stop_periods=-1:stop_duration={min_dur}:"
+        f"stop_threshold={threshold_db}dB"
+    )
+    cmd = ["ffmpeg", "-y", "-i", input_path, "-af", af,
+           "-c:a", "libmp3lame", "-q:a", "4", out]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0 or not os.path.exists(out):
+        return input_path
+    if not output_path:
+        os.replace(out, input_path)
+        return input_path
+    return out
+
+
 def detect_scenes(video_path: str, threshold: float = 0.4) -> List[float]:
     """Return a list of scene-change timestamps (seconds) using ffmpeg's
     scene detector. Threshold 0..1 (lower = more cuts)."""
@@ -333,6 +356,61 @@ def assemble_video(
         pass
 
     return output_path
+
+
+def _stream_has_audio(path: str) -> bool:
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a",
+                        "-show_entries", "stream=index", "-of", "csv=p=0", path],
+                       capture_output=True, text=True)
+    return bool(r.stdout.strip())
+
+
+def add_cut_clicks(video_path: str, click_path: str, cut_times: List[float],
+                   volume: float = 0.30, output_path: str = None) -> str:
+    """Overlay one short click sound at every cut timestamp in ``cut_times``.
+
+    Uses a single ffmpeg pass with only two inputs: the click file is asplit
+    into N copies, each adelay-ed to its cut time, then amix-ed over the
+    existing track — so it scales to hundreds of cuts without hitting input
+    limits. Overwrites in place when ``output_path`` is None.
+    """
+    times = sorted({round(float(t), 3) for t in (cut_times or [])
+                    if t is not None and float(t) > 0.05})
+    if not times or not os.path.exists(video_path) or not os.path.exists(click_path):
+        return video_path
+    out = output_path or (video_path + ".clicks.mp4")
+    vol = max(0.02, min(1.0, float(volume)))
+    n = len(times)
+
+    parts = ["[1:a]asplit=" + str(n) + "".join(f"[c{i}]" for i in range(n)) + ";"]
+    for i, t in enumerate(times):
+        ms = int(t * 1000)
+        parts.append(f"[c{i}]adelay={ms}|{ms},volume={vol}[k{i}];")
+
+    if _stream_has_audio(video_path):
+        labels = "[0:a]" + "".join(f"[k{i}]" for i in range(n))
+        # duration=first keeps the original track's length authoritative.
+        parts.append(f"{labels}amix=inputs={n + 1}:duration=first:normalize=0[out]")
+        extra = []
+    else:
+        labels = "".join(f"[k{i}]" for i in range(n))
+        if n > 1:
+            parts.append(f"{labels}amix=inputs={n}:duration=longest:normalize=0,apad[out]")
+        else:
+            parts.append(f"{labels}apad[out]")
+        extra = ["-shortest"]
+
+    cmd = ["ffmpeg", "-y", "-i", video_path, "-i", click_path,
+           "-filter_complex", "".join(parts),
+           "-map", "0:v:0", "-map", "[out]",
+           "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", *extra, out]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0 or not os.path.exists(out):
+        raise RuntimeError(f"cut-click mix failed: {proc.stderr[-500:]}")
+    if output_path is None:
+        os.replace(out, video_path)
+        return video_path
+    return out
 
 
 def mix_sfx(video_path: str, sfx_list: List[Dict], output_path: str = None) -> str:

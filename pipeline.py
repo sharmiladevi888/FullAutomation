@@ -99,11 +99,55 @@ _MASTER_HINT = (
 )
 
 
-def build_full_prompt(master_prompt, shot_prompt, matched, has_previous, style_locked):
+# When the reference style is a flat 2D / stick-figure / explainer cartoon (like
+# the Zenn / "The Bliss Point" look), gpt-image-2 tends to drift toward soft
+# shading, gradients and 3D depth. This directive forces it back to the crisp,
+# 100%-flat, bold-outline cartoon look. Applied ONLY when the style looks flat,
+# so photoreal / 3D styles are unaffected.
+_FLAT_STYLE_HINTS = (
+    "flat 2d", "flat colour", "flat color", "2d cartoon", "cartoon",
+    "stick figure", "stick-figure", "stick man", "vector", "line art",
+    "line-art", "marker", "hand-drawn", "hand drawn", "doodle", "explainer",
+    "comic", "cel-shad", "cel shad",
+)
+_FLAT_DIRECTIVE = (
+    "FLAT-CARTOON RENDERING — MANDATORY: bold, even BLACK outlines of uniform "
+    "weight on every shape; fill each shape with ONE solid flat colour. "
+    "ABSOLUTELY NO gradients, NO soft/cel shading, NO ambient occlusion, NO 3D "
+    "depth, NO photographic texture, NO drop shadows, NO highlights. Backgrounds "
+    "are clean white or a single flat colour block. Characters are simple stick "
+    "figures: round bald heads, tiny simple oval/dot eyes, thin single-line "
+    "limbs, minimal facial detail. Props are simple shapes with the same bold "
+    "outline. Crisp, clean, 2D — like a modern hand-inked explainer cartoon."
+)
+
+
+def _is_flat_style(*texts):
+    blob = " ".join(t for t in texts if t).lower()
+    return any(h in blob for h in _FLAT_STYLE_HINTS)
+
+
+def build_full_prompt(master_prompt, shot_prompt, matched, has_previous,
+                      style_locked, style_notes=""):
     parts = [_MASTER_HINT]
+    _flat = _is_flat_style(style_notes, master_prompt)
 
     if (master_prompt or "").strip():
         parts.append("WORLD / STYLE BIBLE:\n" + master_prompt.strip())
+
+    # Explicit text style description from the reference video analysis.
+    # Written twice: once as a system-level mandate, once prepended to the shot.
+    if (style_notes or "").strip():
+        parts.append(
+            "MANDATORY ART STYLE — reproduce this EXACTLY. "
+            "This style overrides any default tendencies of the model. "
+            "Every pixel must match: same rendering technique, same palette, "
+            "same line weight, same lighting, same proportions:\n"
+            + style_notes.strip()
+        )
+
+    if _flat:
+        parts.append(_FLAT_DIRECTIVE)
 
     if matched:
         names = ", ".join(c["name"] for c in matched)
@@ -124,15 +168,30 @@ def build_full_prompt(master_prompt, shot_prompt, matched, has_previous, style_l
 
     if style_locked:
         parts.append(
-            "STYLE ANCHORS: the attached video frames define the target "
-            "cinematography, mood, grade and texture. Match them."
+            "STYLE ANCHORS: the FIRST attached reference images are frames taken "
+            "straight from the source video (in a labelled grid they are marked "
+            "\"STYLE REF\"). They define the EXACT rendering technique, line work, "
+            "colour palette, shading, lighting, texture and proportions to "
+            "reproduce. Copy that look faithfully — do NOT drift toward a generic "
+            "or more detailed/realistic style. Any character-sheet image defines "
+            "character identity ONLY; the previous-frame image is for continuity "
+            "ONLY. If the reference look and your defaults disagree, the source "
+            "video frames win."
         )
 
-    parts.append("NEW FRAME TO RENDER:\n" + strip_tags(shot_prompt).strip())
+    # Prepend the style notes directly onto the shot prompt as well so it
+    # appears twice (instruction block + prompt prefix) — this strongly anchors
+    # the model to the right look even when references are ignored.
+    raw_shot = strip_tags(shot_prompt).strip()
+    if (style_notes or "").strip() and not raw_shot.lower().startswith(
+            style_notes.strip()[:20].lower()):
+        raw_shot = style_notes.strip().rstrip(".") + ". " + raw_shot
+
+    parts.append("NEW FRAME TO RENDER:\n" + raw_shot)
     return "\n\n".join(parts)
 
 
-def build_sheet_prompt(master_prompt, name, description):
+def build_sheet_prompt(master_prompt, name, description, style_notes=""):
     parts = [f'Character model / reference sheet for "{name}".']
     if (description or "").strip():
         parts.append(f"Character description: {description.strip()}.")
@@ -146,15 +205,28 @@ def build_sheet_prompt(master_prompt, name, description):
         f'Print the name "{name}" clearly as a label at the top of the sheet so '
         "it can be referenced by name later."
     )
+    if (style_notes or "").strip():
+        parts.append(
+            "Art style for this character (must match the reference video look):\n"
+            + style_notes.strip()
+        )
+    if _is_flat_style(style_notes, master_prompt):
+        parts.append(_FLAT_DIRECTIVE)
     if (master_prompt or "").strip():
-        parts.append("Render in this world / art style:\n" + master_prompt.strip())
+        parts.append("World / style bible:\n" + master_prompt.strip())
     return "\n".join(parts)
 
 
 # --------------------------------------------------------------------------- #
 #  Contact sheet fallback
 # --------------------------------------------------------------------------- #
-def contact_sheet(images, max_cols=2, cell=768, bg=(17, 17, 19)):
+def contact_sheet(images, labels=None, max_cols=2, cell=896, bg=(17, 17, 19)):
+    """Composite reference images into one grid. When ``labels`` is given, each
+    cell gets a readable caption (e.g. "STYLE REF", "CHAR: Maya", "PREV FRAME")
+    so the image model can tell the style anchor from a character sheet from the
+    previous frame — critical for faithfully copying the reference art style
+    instead of blending all the refs together."""
+    from PIL import ImageDraw, ImageFont
     imgs = []
     for b in images:
         try:
@@ -164,10 +236,25 @@ def contact_sheet(images, max_cols=2, cell=768, bg=(17, 17, 19)):
     if not imgs:
         raise ValueError("no valid reference images to composite")
 
+    labels = list(labels or [])
     n = len(imgs)
     cols = 1 if n == 1 else min(max_cols, n)
     rows = (n + cols - 1) // cols
     canvas = Image.new("RGB", (cols * cell, rows * cell), bg)
+    draw = ImageDraw.Draw(canvas)
+    font = None
+    for _fname in ("arialbd.ttf", "Arial_Bold.ttf", "DejaVuSans-Bold.ttf", "arial.ttf"):
+        try:
+            font = ImageFont.truetype(_fname, max(22, cell // 28))
+            break
+        except Exception:
+            continue
+    if font is None:
+        try:
+            font = ImageFont.load_default()
+        except Exception:
+            font = None
+
     for idx, im in enumerate(imgs):
         im = im.copy()
         im.thumbnail((cell, cell))
@@ -175,6 +262,17 @@ def contact_sheet(images, max_cols=2, cell=768, bg=(17, 17, 19)):
         x = c * cell + (cell - im.width) // 2
         y = r * cell + (cell - im.height) // 2
         canvas.paste(im, (x, y))
+        lbl = labels[idx] if idx < len(labels) else ""
+        if lbl and font is not None:
+            bx, by = c * cell, r * cell
+            try:
+                tw = int(draw.textlength(lbl, font=font))
+            except Exception:
+                tw = len(lbl) * (cell // 28)
+            pad = cell // 80
+            draw.rectangle([bx, by, bx + tw + pad * 3, by + (cell // 18)],
+                           fill=(0, 0, 0))
+            draw.text((bx + pad, by + pad), lbl, fill=(255, 214, 110), font=font)
     out = BytesIO()
     canvas.save(out, format="PNG")
     return out.getvalue()

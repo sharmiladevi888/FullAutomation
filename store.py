@@ -13,10 +13,16 @@ is active.
 """
 import json
 import os
+import threading
 import time
 import uuid
 
 import config
+
+# Serializes read-modify-write of the project index (projects.json) so
+# concurrent background workers (e.g. the image queue) can't clobber each
+# other's index updates. Reentrant: some mutators call _add_project nested.
+_INDEX_LOCK = threading.RLock()
 
 DATA_DIR = config.DATA_DIR
 IMAGES_DIR = os.path.join(DATA_DIR, "images")
@@ -98,14 +104,15 @@ def _save_project(pid, state):
 def _add_project(name, state=None, make_current=True):
     pid = new_id("proj")
     _save_project(pid, state if state is not None else _default_state())
-    idx = _read_index()
-    idx.setdefault("projects", []).append({
-        "id": pid, "name": (name or "Untitled project").strip()[:80] or "Untitled project",
-        "created": now(), "updated": now(),
-    })
-    if make_current or not idx.get("current"):
-        idx["current"] = pid
-    _write_index(idx)
+    with _INDEX_LOCK:
+        idx = _read_index()
+        idx.setdefault("projects", []).append({
+            "id": pid, "name": (name or "Untitled project").strip()[:80] or "Untitled project",
+            "created": now(), "updated": now(),
+        })
+        if make_current or not idx.get("current"):
+            idx["current"] = pid
+        _write_index(idx)
     return pid
 
 
@@ -127,15 +134,16 @@ def init():
 
 
 def current_project_id():
-    idx = _read_index()
-    pid = idx.get("current")
-    ids = [p["id"] for p in idx.get("projects", [])]
-    if pid in ids:
-        return pid
-    if ids:
-        idx["current"] = ids[0]
-        _write_index(idx)
-        return ids[0]
+    with _INDEX_LOCK:
+        idx = _read_index()
+        pid = idx.get("current")
+        ids = [p["id"] for p in idx.get("projects", [])]
+        if pid in ids:
+            return pid
+        if ids:
+            idx["current"] = ids[0]
+            _write_index(idx)
+            return ids[0]
     return _add_project("My first project")
 
 
@@ -157,11 +165,12 @@ def load_state():
 def save_state(state):
     pid = current_project_id()
     _save_project(pid, state)
-    idx = _read_index()
-    for p in idx.get("projects", []):
-        if p["id"] == pid:
-            p["updated"] = now()
-    _write_index(idx)
+    with _INDEX_LOCK:
+        idx = _read_index()
+        for p in idx.get("projects", []):
+            if p["id"] == pid:
+                p["updated"] = now()
+        _write_index(idx)
     return state
 
 
@@ -185,11 +194,12 @@ def save_state_for(pid, state):
     if not pid:
         return save_state(state)
     _save_project(pid, state)
-    idx = _read_index()
-    for p in idx.get("projects", []):
-        if p["id"] == pid:
-            p["updated"] = now()
-    _write_index(idx)
+    with _INDEX_LOCK:
+        idx = _read_index()
+        for p in idx.get("projects", []):
+            if p["id"] == pid:
+                p["updated"] = now()
+        _write_index(idx)
     return state
 
 
@@ -223,34 +233,38 @@ def duplicate_project(pid):
 
 
 def switch_project(pid):
-    idx = _read_index()
-    if not any(p["id"] == pid for p in idx.get("projects", [])):
-        raise ValueError("no such project")
-    idx["current"] = pid
-    _write_index(idx)
+    with _INDEX_LOCK:
+        idx = _read_index()
+        if not any(p["id"] == pid for p in idx.get("projects", [])):
+            raise ValueError("no such project")
+        idx["current"] = pid
+        _write_index(idx)
     return pid
 
 
 def rename_project(pid, name):
-    idx = _read_index()
-    for p in idx.get("projects", []):
-        if p["id"] == pid:
-            p["name"] = (name or "").strip()[:80] or p["name"]
-            p["updated"] = now()
-    _write_index(idx)
+    with _INDEX_LOCK:
+        idx = _read_index()
+        for p in idx.get("projects", []):
+            if p["id"] == pid:
+                p["name"] = (name or "").strip()[:80] or p["name"]
+                p["updated"] = now()
+        _write_index(idx)
 
 
 def delete_project(pid):
-    idx = _read_index()
-    idx["projects"] = [p for p in idx.get("projects", []) if p["id"] != pid]
-    try:
-        os.remove(_project_path(pid))
-    except OSError:
-        pass
-    if idx.get("current") == pid:
-        idx["current"] = idx["projects"][0]["id"] if idx["projects"] else None
-    _write_index(idx)
-    if not idx["projects"]:
+    with _INDEX_LOCK:
+        idx = _read_index()
+        idx["projects"] = [p for p in idx.get("projects", []) if p["id"] != pid]
+        try:
+            os.remove(_project_path(pid))
+        except OSError:
+            pass
+        if idx.get("current") == pid:
+            idx["current"] = idx["projects"][0]["id"] if idx["projects"] else None
+        _write_index(idx)
+        empty = not idx["projects"]
+    if empty:
         _add_project("My first project")   # always keep at least one
 
 
@@ -296,7 +310,13 @@ def write_binary(kind, data, ext, name_hint=None):
 def url_to_path(url):
     if not url or not url.startswith("/data/"):
         raise ValueError(f"not a managed media url: {url!r}")
-    return os.path.join(DATA_DIR, url[len("/data/"):])
+    rel = url[len("/data/"):]
+    path = os.path.realpath(os.path.join(DATA_DIR, rel))
+    root = os.path.realpath(DATA_DIR)
+    # Containment check: reject any path that escapes DATA_DIR via ../ etc.
+    if path != root and not path.startswith(root + os.sep):
+        raise ValueError(f"path escapes data directory: {url!r}")
+    return path
 
 
 def read_image(url):

@@ -26,6 +26,63 @@ CLAUDE_API_KEY = _get("CLAUDE_API_KEY", _get("ANTHROPIC_API_KEY", ""))
 CLAUDE_BASE_URL = _get("CLAUDE_BASE_URL", "https://api.derouter.network/proxy")
 CLAUDE_MODEL = _get("CLAUDE_MODEL", "claude-sonnet-4-6")
 
+# --- Direct Anthropic API (alternative to derouter for Claude) --------------
+ANTHROPIC_DIRECT_API_KEY = _get("ANTHROPIC_DIRECT_API_KEY", "")
+ANTHROPIC_DIRECT_BASE_URL = "https://api.anthropic.com"
+
+# --- 9Router (local AI router / token-saver proxy) -------------------------
+# Optional: route Claude calls through a locally-running 9Router instance
+# (https://github.com/decolua/9router). Install with `npm i -g 9router`, run
+# `9router`, connect a provider in its dashboard, then in Settings pick the
+# "9Router" provider here. 9Router serves an Anthropic-compatible API at
+# http://localhost:20128, so the same Anthropic SDK works unchanged — we just
+# point base_url at it. Benefits: RTK token-saving (20-40%), multi-provider
+# fallback (free -> cheap -> subscription) and quota tracking.
+#
+# NOTE: this only affects Claude/text calls (script gen, vision prompts, edit
+# planning). Image generation still goes through the image provider (derouter /
+# OpenRouter) — 9Router routes chat/code models, not gpt-image.
+NINEROUTER_API_KEY = _get("NINEROUTER_API_KEY", "")
+NINEROUTER_BASE_URL = _get("NINEROUTER_BASE_URL", "http://localhost:20128")
+NINEROUTER_MODEL = _get("NINEROUTER_MODEL", "cc/claude-sonnet-4-6")
+# Image generation through 9Router uses its OpenAI-compatible endpoint (note the
+# trailing /v1 — the images API lives under it, unlike the Anthropic base above).
+# NOTE: 9Router is built for chat/code LLMs; whether it proxies the OpenAI images
+# endpoint depends on the provider/account you connect in its dashboard. If image
+# gen returns an error, keep image generation on the derouter provider.
+NINEROUTER_IMAGE_BASE_URL = _get("NINEROUTER_IMAGE_BASE_URL", "http://localhost:20128/v1")
+NINEROUTER_IMAGE_MODEL = _get("NINEROUTER_IMAGE_MODEL", "gpt-image-2")
+# When the local-router Claude route keeps stalling/502ing, the SAME call is
+# rerouted to this model on the router's OpenAI endpoint (the user's ChatGPT
+# account). Empty string disables the fallback.
+CLAUDE_FALLBACK_MODEL = _get("CLAUDE_FALLBACK_MODEL", "cx/gpt-5.5")
+# Fallback 9Router model ids (provider-prefixed) used only when the live
+# /v1/models fetch fails. The Settings UI loads the real list from your
+# running 9Router, so this just needs sane defaults. cc/ = Claude (OAuth),
+# cx/ = Codex; kr/oc/glm entries only work if those providers are connected.
+NINEROUTER_MODELS = [
+    "cc/claude-sonnet-4-6",
+    "cc/claude-opus-4-8",
+    "cc/claude-opus-4-7",
+    "cc/claude-haiku-4-5-20251001",
+    "cx/gpt-5.5",
+    "kr/claude-sonnet-4.5",
+]
+
+# --- AgentRouter (Anthropic-compatible Claude proxy) -----------------------
+# Drop-in Claude proxy — set base_url to https://agentrouter.org and auth via
+# Authorization: Bearer key. Uses the same Anthropic SDK path as derouter.
+AGENTROUTER_API_KEY = _get("AGENTROUTER_API_KEY", "")
+AGENTROUTER_BASE_URL = _get("AGENTROUTER_BASE_URL", "https://agentrouter.org")
+AGENTROUTER_MODEL = _get("AGENTROUTER_MODEL", "claude-sonnet-4-6")
+AGENTROUTER_MODELS = [
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5",
+]
+
 # --- ElevenLabs (voice-over text-to-speech) --------------------------------
 # Turns the script's voice-over text into real spoken audio. Get a key at
 # https://elevenlabs.io (Profile -> API key). Can also be pasted in Settings.
@@ -35,9 +92,23 @@ ELEVENLABS_BASE_URL = _get("ELEVENLABS_BASE_URL", "https://api.elevenlabs.io/v1"
 ELEVENLABS_VOICE_ID = _get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
 ELEVENLABS_MODEL = _get("ELEVENLABS_MODEL", "eleven_multilingual_v2")
 
+# --- Xiaomi MiMo TTS (free/cheap voice-over alternative to ElevenLabs) ------
+# Speech synthesis v2.5. Get a key at https://mimo.mi.com (Console). Can also be
+# pasted in Settings. Returns WAV audio; no character-level timestamps.
+MIMO_API_KEY = _get("MIMO_API_KEY", "")
+MIMO_BASE_URL = _get("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")
+MIMO_MODEL = _get("MIMO_MODEL", "mimo-v2.5-tts")
+MIMO_VOICE_ID = _get("MIMO_VOICE_ID", "Chloe")
+# Natural-language style instruction sent as the MiMo 'user' message.
+MIMO_STYLE = _get("MIMO_STYLE", "Clear, natural, engaging narration voice.")
+
 # --- default render settings -----------------------------------------------
 DEFAULT_SIZE = _get("DEFAULT_SIZE", "1536x1024")
-DEFAULT_QUALITY = _get("DEFAULT_QUALITY", "high")
+# "medium" by default: ~half the per-image cost of "high", visually near-identical
+# for flat illustration styles, and low derouter wallet balances can't reserve
+# "high" edit slots (402 wallet-balance). Set DEFAULT_QUALITY=high in .env to
+# restore maximum quality when the wallet is topped up.
+DEFAULT_QUALITY = _get("DEFAULT_QUALITY", "medium")
 
 # Whether the image proxy supports multiple reference images on /images/edits
 # via the `image[]` multipart field.  The derouter docs only document a single
@@ -84,7 +155,7 @@ FRAME_FPS = float(_get("FRAME_FPS", "1"))
 DATA_DIR = _get("DATA_DIR", "data")
 
 SUPPORTED_SIZES = [
-    "1024x1024", "1024x1536", "1536x1024", "2048x2048", "3840x2160", "auto",
+    "1920x1080", "1024x1024", "1024x1536", "1536x1024", "2048x2048", "3840x2160", "auto",
 ]
 SUPPORTED_QUALITIES = ["low", "medium", "high", "auto"]
 
@@ -102,4 +173,25 @@ CLAUDE_MODELS = [
     "claude-opus-4-6",
     "claude-sonnet-4-6",
     "claude-haiku-4-5",
+]
+
+# --- OpenAI direct (alternative AI provider) ---------------------------------
+OPENAI_API_KEY = _get("OPENAI_API_KEY", "")
+OPENAI_BASE_URL = "https://api.openai.com/v1"
+OPENAI_MODEL = _get("OPENAI_MODEL", "gpt-5.4-mini")
+OPENAI_MODELS = [
+    "gpt-5.4-mini",
+    "gpt-4.1-mini",
+    "gpt-4.1-nano",
+]
+
+# --- OpenRouter (alternative image generation via chat completions) ---------
+OPENROUTER_API_KEY = _get("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE_URL = _get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+OPENROUTER_MODEL = _get("OPENROUTER_MODEL", "sourceful/riverflow-v2.5-pro:free")
+OPENROUTER_TIMEOUT = int(_get("OPENROUTER_TIMEOUT", "600"))
+
+OPENROUTER_MODELS = [
+    "sourceful/riverflow-v2.5-fast:free",
+    "sourceful/riverflow-v2.5-pro:free",
 ]

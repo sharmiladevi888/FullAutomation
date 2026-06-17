@@ -4,14 +4,27 @@ Run:  uvicorn app:app --reload --port 8000   then open http://localhost:8000
 """
 import io
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import zipfile
 from typing import List, Optional
+
+# Windows consoles default to cp1252; our log lines contain emoji, arrows and
+# em-dashes (— 🔁 ✗ →). Without this, a single print() of such a character
+# raises UnicodeEncodeError, which can turn a HANDLED error into a 500 (e.g. the
+# autopilot 'video step FAILED: …' log line). Force UTF-8 with replacement so a
+# log line can never crash a request.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 try:
     from dotenv import load_dotenv
@@ -104,6 +117,19 @@ def _hash_password(password: str, salt: str) -> str:
     return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 260_000).hex()
 
 
+def _run_capture(args, timeout=600):
+    """subprocess.run(capture_output, text) with a hard timeout. A hung ffmpeg
+    would otherwise block the worker thread forever; on timeout we return a
+    CompletedProcess with a non-zero returncode so callers' existing
+    `returncode != 0` checks treat it as a normal failure instead of hanging."""
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        return subprocess.CompletedProcess(
+            args, 124, e.stdout or "",
+            (e.stderr or "") + f"\nffmpeg timed out after {timeout}s")
+
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     email = ""
@@ -132,7 +158,21 @@ async def auth_middleware(request: Request, call_next):
         "elevenlabs_api_key": user_data.get("elevenlabs_api_key", getattr(config, "ELEVENLABS_API_KEY", "")),
         "elevenlabs_voice_id": user_data.get("elevenlabs_voice_id", getattr(config, "ELEVENLABS_VOICE_ID", "")),
         "elevenlabs_model": user_data.get("elevenlabs_model", getattr(config, "ELEVENLABS_MODEL", "")),
+        "voice_provider": user_data.get("voice_provider", "elevenlabs"),
+        "mimo_api_key": user_data.get("mimo_api_key", getattr(config, "MIMO_API_KEY", "")),
+        "mimo_voice_id": user_data.get("mimo_voice_id", getattr(config, "MIMO_VOICE_ID", "Chloe")),
+        "mimo_model": user_data.get("mimo_model", getattr(config, "MIMO_MODEL", "mimo-v2.5-tts")),
         "webhook_url": user_data.get("webhook_url", ""),
+        "image_provider": user_data.get("image_provider", "derouter"),
+        "anthropic_api_key": user_data.get("anthropic_api_key", getattr(config, "ANTHROPIC_DIRECT_API_KEY", "")),
+        "claude_provider": user_data.get("claude_provider", "derouter"),
+        "ninerouter_api_key": user_data.get("ninerouter_api_key", getattr(config, "NINEROUTER_API_KEY", "")),
+        "ninerouter_base_url": user_data.get("ninerouter_base_url", config.NINEROUTER_BASE_URL),
+        "ninerouter_model": user_data.get("ninerouter_model", config.NINEROUTER_MODEL),
+        "ninerouter_image_base_url": user_data.get("ninerouter_image_base_url", config.NINEROUTER_IMAGE_BASE_URL),
+        "ninerouter_image_model": user_data.get("ninerouter_image_model", config.NINEROUTER_IMAGE_MODEL),
+        "agentrouter_api_key": user_data.get("agentrouter_api_key", getattr(config, "AGENTROUTER_API_KEY", "")),
+        "agentrouter_model": user_data.get("agentrouter_model", getattr(config, "AGENTROUTER_MODEL", "claude-sonnet-4-6")),
     }
     return await call_next(request)
 
@@ -201,30 +241,113 @@ app.mount("/data", StaticFiles(directory=config.DATA_DIR), name="data")
 def get_user_settings(request: Request):
     return request.state.settings
 
-def get_image_client(request: Request) -> ImageClient:
+def _has_ai_key(s: dict) -> bool:
+    """True if the user has an API key for the active AI provider."""
+    p = s.get("claude_provider", "derouter")
+    if p == "anthropic":
+        return bool(s.get("anthropic_api_key"))
+    if p == "9router":
+        return bool(s.get("ninerouter_api_key"))
+    if p == "agentrouter":
+        return bool(s.get("agentrouter_api_key"))
+    return bool(s.get("claude_api_key"))
+
+
+def _resolve_claude(s: dict, model: str = None):
+    """Return (api_key, base_url, model) for the active claude_provider.
+
+    Providers:
+      - 'derouter'     (default) — the derouter Anthropic-compatible proxy
+      - 'anthropic'              — Anthropic's API directly
+      - '9router'                — a local 9Router instance (token-saver / fallback
+                                   router) serving an Anthropic-compatible API
+      - 'agentrouter'            — AgentRouter proxy (https://agentrouter.org),
+                                   Anthropic-compatible, auth via Bearer token
+    """
+    p = s.get("claude_provider", "derouter")
+    if p == "anthropic" and s.get("anthropic_api_key"):
+        return (s["anthropic_api_key"], config.ANTHROPIC_DIRECT_BASE_URL,
+                model or s.get("claude_model"))
+    if p == "9router":
+        return (s.get("ninerouter_api_key", ""),
+                (s.get("ninerouter_base_url") or config.NINEROUTER_BASE_URL),
+                model or s.get("ninerouter_model") or config.NINEROUTER_MODEL)
+    if p == "agentrouter":
+        return (s.get("agentrouter_api_key", ""),
+                getattr(config, "AGENTROUTER_BASE_URL", "https://agentrouter.org"),
+                model or s.get("agentrouter_model") or getattr(config, "AGENTROUTER_MODEL", "claude-sonnet-4-6"))
+    return (s.get("claude_api_key", ""),
+            (s.get("claude_base_url") or config.CLAUDE_BASE_URL),
+            model or s.get("claude_model"))
+
+def _has_image_key(request: Request) -> bool:
     s = request.state.settings
-    return ImageClient(api_key=s["api_key"], base_url=s["base_url"], model=s["model"])
+    if s.get("image_provider") == "9router":
+        return bool(s.get("ninerouter_api_key"))
+    return bool(s.get("api_key"))
+
+
+def _resolve_image(s: dict):
+    """Return (api_key, base_url, model) for the active image_provider.
+
+    Providers:
+      - 'derouter' (default) — the configured image key / OpenAI-compatible proxy
+      - '9router'            — route image gen through a local 9Router instance's
+                               OpenAI-compatible endpoint, reusing the shared
+                               9Router API key.
+    """
+    if s.get("image_provider") == "9router":
+        return (s.get("ninerouter_api_key", ""),
+                (s.get("ninerouter_image_base_url") or config.NINEROUTER_IMAGE_BASE_URL),
+                s.get("ninerouter_image_model") or config.NINEROUTER_IMAGE_MODEL)
+    return (s.get("api_key", ""),
+            s.get("base_url", config.BASE_URL),
+            s.get("model", config.MODEL))
+
+
+def get_image_client(request: Request):
+    api_key, base_url, model = _resolve_image(request.state.settings)
+    return ImageClient(api_key=api_key, base_url=base_url, model=model)
 
 def get_claude_client(request: Request = None) -> ClaudeClient:
     if request:
-        s = request.state.settings
+        api_key, base_url, model = _resolve_claude(request.state.settings)
     else:
-        s = {
-            "claude_api_key": config.CLAUDE_API_KEY, 
-            "claude_base_url": config.CLAUDE_BASE_URL, 
-            "claude_model": config.CLAUDE_MODEL
-        }
-    return ClaudeClient(api_key=s["claude_api_key"], base_url=s["claude_base_url"], model=s["claude_model"])
+        api_key, base_url, model = (config.CLAUDE_API_KEY,
+                                    config.CLAUDE_BASE_URL, config.CLAUDE_MODEL)
+    return ClaudeClient(api_key=api_key, base_url=base_url, model=model)
 
 
 def get_voice_client(request: Request, voice_id: str = None):
     import voice
     s = request.state.settings
+    if (s.get("voice_provider") or "elevenlabs") == "mimo":
+        return voice.MimoVoiceClient(
+            api_key=s.get("mimo_api_key", ""),
+            model=s.get("mimo_model", ""),
+            voice_id=voice_id or s.get("mimo_voice_id", ""),
+        )
     return voice.VoiceClient(
         api_key=s["elevenlabs_api_key"],
         model=s["elevenlabs_model"],
         voice_id=voice_id or s["elevenlabs_voice_id"],
     )
+
+
+def _has_voice_key(s) -> bool:
+    """True if the active voice provider has a key configured."""
+    if (s.get("voice_provider") or "elevenlabs") == "mimo":
+        return bool(s.get("mimo_api_key"))
+    return bool(s.get("elevenlabs_api_key"))
+
+
+def _voice_default_id(s):
+    """Default voice id for the ACTIVE provider. MiMo voice names (Chloe, Mia…)
+    are NOT valid ElevenLabs ids and vice-versa, so defaulting to the wrong
+    provider's voice makes TTS 400. Always pick the active provider's voice."""
+    if (s.get("voice_provider") or "elevenlabs") == "mimo":
+        return s.get("mimo_voice_id") or "Chloe"
+    return s.get("elevenlabs_voice_id") or ""
 
 
 @app.post("/api/analyse-scene")
@@ -270,11 +393,15 @@ def api_state(request: Request):
             "multi_image_edit": s["multi_image_edit"],
             "claude_model": s["claude_model"],
             "claude_base_url": s["claude_base_url"],
-            "has_claude_key": bool(s["claude_api_key"]),
+            "has_claude_key": bool(s["claude_api_key"] or s.get("anthropic_api_key") or s.get("agentrouter_api_key")),
             "claude_models": config.CLAUDE_MODELS,
             "has_elevenlabs_key": bool(s["elevenlabs_api_key"]),
             "elevenlabs_voice_id": s["elevenlabs_voice_id"],
             "elevenlabs_model": s["elevenlabs_model"],
+            "voice_provider": s.get("voice_provider", "elevenlabs"),
+            "has_mimo_key": bool(s.get("mimo_api_key")),
+            "mimo_voice_id": s.get("mimo_voice_id", "Chloe"),
+            "has_voice_key": _has_voice_key(s),
             "webhook_url": s.get("webhook_url", ""),
             "has_webhook": bool(s.get("webhook_url")),
             "default_size": config.DEFAULT_SIZE,
@@ -283,6 +410,18 @@ def api_state(request: Request):
             "qualities": config.SUPPORTED_QUALITIES,
             "vault_encrypted": vault_crypto.is_encrypted(),
             "google_configured": bool(config.GOOGLE_CLIENT_ID),
+            "image_provider": s.get("image_provider", "derouter"),
+            "has_anthropic_key": bool(s.get("anthropic_api_key")),
+            "claude_provider": s.get("claude_provider", "derouter"),
+            "ninerouter_base_url": s.get("ninerouter_base_url", config.NINEROUTER_BASE_URL),
+            "ninerouter_model": s.get("ninerouter_model", config.NINEROUTER_MODEL),
+            "ninerouter_models": config.NINEROUTER_MODELS,
+            "ninerouter_image_base_url": s.get("ninerouter_image_base_url", config.NINEROUTER_IMAGE_BASE_URL),
+            "ninerouter_image_model": s.get("ninerouter_image_model", config.NINEROUTER_IMAGE_MODEL),
+            "has_ninerouter_key": bool(s.get("ninerouter_api_key")),
+            "agentrouter_model": s.get("agentrouter_model", getattr(config, "AGENTROUTER_MODEL", "claude-sonnet-4-6")),
+            "agentrouter_models": getattr(config, "AGENTROUTER_MODELS", []),
+            "has_agentrouter_key": bool(s.get("agentrouter_api_key")),
         },
     }
 
@@ -351,7 +490,21 @@ class SettingsIn(BaseModel):
     elevenlabs_api_key: Optional[str] = None
     elevenlabs_voice_id: Optional[str] = None
     elevenlabs_model: Optional[str] = None
+    voice_provider: Optional[str] = None
+    mimo_api_key: Optional[str] = None
+    mimo_voice_id: Optional[str] = None
+    mimo_model: Optional[str] = None
     webhook_url: Optional[str] = None
+    image_provider: Optional[str] = None
+    anthropic_api_key: Optional[str] = None
+    claude_provider: Optional[str] = None
+    ninerouter_api_key: Optional[str] = None
+    ninerouter_base_url: Optional[str] = None
+    ninerouter_model: Optional[str] = None
+    ninerouter_image_base_url: Optional[str] = None
+    ninerouter_image_model: Optional[str] = None
+    agentrouter_api_key: Optional[str] = None
+    agentrouter_model: Optional[str] = None
 
 
 @app.post("/api/settings")
@@ -370,7 +523,21 @@ def api_settings(s: SettingsIn, request: Request):
     if s.elevenlabs_api_key is not None: user_settings["elevenlabs_api_key"] = s.elevenlabs_api_key.strip()
     if s.elevenlabs_voice_id: user_settings["elevenlabs_voice_id"] = s.elevenlabs_voice_id.strip()
     if s.elevenlabs_model: user_settings["elevenlabs_model"] = s.elevenlabs_model.strip()
+    if s.voice_provider: user_settings["voice_provider"] = s.voice_provider.strip()
+    if s.mimo_api_key is not None: user_settings["mimo_api_key"] = s.mimo_api_key.strip()
+    if s.mimo_voice_id: user_settings["mimo_voice_id"] = s.mimo_voice_id.strip()
+    if s.mimo_model: user_settings["mimo_model"] = s.mimo_model.strip()
     if s.webhook_url is not None: user_settings["webhook_url"] = s.webhook_url.strip()
+    if s.image_provider: user_settings["image_provider"] = s.image_provider.strip()
+    if s.anthropic_api_key is not None: user_settings["anthropic_api_key"] = s.anthropic_api_key.strip()
+    if s.claude_provider: user_settings["claude_provider"] = s.claude_provider.strip()
+    if s.ninerouter_api_key is not None: user_settings["ninerouter_api_key"] = s.ninerouter_api_key.strip()
+    if s.ninerouter_base_url: user_settings["ninerouter_base_url"] = s.ninerouter_base_url.strip().rstrip("/")
+    if s.ninerouter_model: user_settings["ninerouter_model"] = s.ninerouter_model.strip()
+    if s.ninerouter_image_base_url: user_settings["ninerouter_image_base_url"] = s.ninerouter_image_base_url.strip().rstrip("/")
+    if s.ninerouter_image_model: user_settings["ninerouter_image_model"] = s.ninerouter_image_model.strip()
+    if s.agentrouter_api_key is not None: user_settings["agentrouter_api_key"] = s.agentrouter_api_key.strip()
+    if s.agentrouter_model: user_settings["agentrouter_model"] = s.agentrouter_model.strip()
 
     vault[email] = user_settings
     save_vault(vault)
@@ -378,19 +545,58 @@ def api_settings(s: SettingsIn, request: Request):
     return {
         "ok": True,
         "has_api_key": bool(user_settings.get("api_key")),
-        "has_claude_key": bool(user_settings.get("claude_api_key")),
+        "has_claude_key": bool(user_settings.get("claude_api_key") or user_settings.get("anthropic_api_key") or user_settings.get("agentrouter_api_key")),
         "has_elevenlabs_key": bool(user_settings.get("elevenlabs_api_key")),
+        "voice_provider": user_settings.get("voice_provider", "elevenlabs"),
+        "has_mimo_key": bool(user_settings.get("mimo_api_key")),
+        "has_voice_key": bool(user_settings.get("mimo_api_key")) if (user_settings.get("voice_provider") == "mimo") else bool(user_settings.get("elevenlabs_api_key")),
+        "has_anthropic_key": bool(user_settings.get("anthropic_api_key")),
+        "has_ninerouter_key": bool(user_settings.get("ninerouter_api_key")),
+        "has_agentrouter_key": bool(user_settings.get("agentrouter_api_key")),
+        "image_provider": user_settings.get("image_provider", "derouter"),
+        "claude_provider": user_settings.get("claude_provider", "derouter"),
     }
+
+
+class NineRouterModelsIn(BaseModel):
+    api_key: Optional[str] = None      # falls back to the saved key
+    base_url: Optional[str] = None     # falls back to the saved base URL
+
+
+@app.post("/api/9router/models")
+def api_9router_models(body: NineRouterModelsIn, request: Request):
+    """List the model ids actually served by the user's running 9Router, so the
+    Settings picker only offers models whose provider is really connected
+    (avoids 'No active credentials for provider: …' errors)."""
+    s = request.state.settings
+    key = (body.api_key or s.get("ninerouter_api_key") or "").strip()
+    base = (body.base_url or s.get("ninerouter_base_url")
+            or config.NINEROUTER_BASE_URL).strip().rstrip("/")
+    if base.endswith("/v1"):           # image section passes the /v1 endpoint
+        base = base[:-3].rstrip("/")
+    if not key:
+        raise HTTPException(400, "no 9Router API key — paste one first")
+    try:
+        import requests as _rq
+        r = _rq.get(f"{base}/v1/models",
+                    headers={"Authorization": f"Bearer {key}"}, timeout=10)
+        r.raise_for_status()
+        ids = [m.get("id") for m in (r.json().get("data") or []) if m.get("id")]
+    except Exception as e:
+        raise HTTPException(502, f"could not list 9Router models: {e}")
+    return {"models": ids, "base_url": base}
 
 
 @app.get("/api/health")
 def api_health(request: Request):
     s = request.state.settings
+    img_provider = s.get("image_provider", "derouter")
     image_status = get_image_client(request).ping()
     image_status["multi_image_edit"] = s["multi_image_edit"]
     claude_status = get_claude_client(request).ping()
     voice_status = get_voice_client(request).ping()
-    return {"image": image_status, "claude": claude_status, "voice": voice_status}
+    return {"image": image_status, "claude": claude_status, "voice": voice_status,
+            "derouter": image_status, "image_provider": img_provider}
 
 
 @app.get("/api/usage")
@@ -620,7 +826,7 @@ _POSE_SET = ["neutral front turnaround", "happy, smiling warmly",
 @app.post("/api/characters/{cid}/pack")
 def api_character_pack(cid: str, request: Request, count: int = 4):
     """Generate a pose/expression pack from a character's reference sheet."""
-    if not request.state.settings["api_key"]:
+    if not _has_image_key(request):
         raise HTTPException(400, "Connect your image API key in Settings first.")
     st = store.load_state()
     ch = next((c for c in st["characters"] if c["id"] == cid), None)
@@ -658,7 +864,7 @@ class VariantIn(BaseModel):
 def api_character_variant(cid: str, body: VariantIn, request: Request):
     """Create an alternate look of a character (e.g. 'winter outfit') as a new
     character entry, using the original sheet as the identity anchor."""
-    if not request.state.settings["api_key"]:
+    if not _has_image_key(request):
         raise HTTPException(400, "Connect your image API key in Settings first.")
     if not body.note.strip():
         raise HTTPException(400, "describe the variant (e.g. 'battle armour')")
@@ -696,8 +902,8 @@ def api_character_variant(cid: str, body: VariantIn, request: Request):
 def api_character_check(cid: str, request: Request):
     """Claude compares the character's sheet to every story frame they appear in
     and flags drift."""
-    if not request.state.settings["claude_api_key"]:
-        raise HTTPException(400, "Connect your Claude API key in Settings first.")
+    if not _has_ai_key(request.state.settings):
+        raise HTTPException(400, "Connect an AI key (Claude or OpenAI) in Settings first.")
     st = store.load_state()
     ch = next((c for c in st["characters"] if c["id"] == cid), None)
     if not ch:
@@ -723,6 +929,7 @@ def api_character_check(cid: str, request: Request):
         data = extract_json(raw)
     except Exception as e:
         raise HTTPException(500, f"consistency check failed: {e}")
+    data = _as_analysis_dict(data)
     for it in (data.get("issues") or []):
         fi = int(it.get("frame", 0))
         if 1 <= fi <= len(idxs):
@@ -739,7 +946,7 @@ async def api_character_from_photo(
 ):
     """Upload a photo/reference and have the image model build a clean, on-style
     character reference sheet from it."""
-    if not request.state.settings["api_key"]:
+    if not _has_image_key(request):
         raise HTTPException(400, "Connect your image API key in Settings first.")
     if not name.strip():
         raise HTTPException(400, "name is required")
@@ -785,8 +992,12 @@ class GenerateIn(BaseModel):
 def _render_one(g_prompt, size, quality, continue_prev, style_lock,
                 character_ids=None, request: Request = None):
     """Shared engine for /api/generate and /api/generate-batch."""
+    g_prompt = _sanitize_prompt(g_prompt or "")
     st = store.load_state()
     client = get_image_client(request)
+
+    # Style notes from the reference video analysis — prepended to every prompt.
+    style_notes = (st.get("style_notes") or "").strip()
 
     # 1. characters
     if character_ids:
@@ -798,11 +1009,19 @@ def _render_one(g_prompt, size, quality, continue_prev, style_lock,
     # 2. previous frame
     prev = st["sequence"][-1] if (continue_prev and st["sequence"]) else None
 
-    # 3. style anchors
+    # 3. style anchors (reference video frames as visual refs)
     style_frames = st["style_frames"] if style_lock else []
 
-    # 4. assemble refs
+    # 4. assemble refs: style frames FIRST → characters → previous frame
+    # Style frames lead so they get the most prominent position in the contact
+    # sheet (top-left, highest visual weight) and are seen first in multi-image mode.
     refs, ref_meta = [], []
+    for sf in style_frames[:4]:
+        try:
+            refs.append(store.read_image(sf["url"]))
+            ref_meta.append({"type": "style"})
+        except Exception:
+            pass
     for c in matched:
         try:
             refs.append(store.read_image(c["sheet_url"]))
@@ -815,27 +1034,34 @@ def _render_one(g_prompt, size, quality, continue_prev, style_lock,
             ref_meta.append({"type": "previous", "id": prev["id"]})
         except Exception:
             pass
-    for sf in style_frames[:3]:
-        try:
-            refs.append(store.read_image(sf["url"]))
-            ref_meta.append({"type": "style"})
-        except Exception:
-            pass
 
     full_prompt = pipeline.build_full_prompt(
         st["master_prompt"], g_prompt, matched,
         has_previous=bool(prev), style_locked=bool(style_frames),
+        style_notes=style_notes,
     )
 
     if refs:
+        # Per-ref captions so the model can tell the STYLE anchor from a
+        # character sheet from the previous frame in the composited grid.
+        def _ref_label(m):
+            t = m.get("type")
+            if t == "style":
+                return "STYLE REF — COPY THIS LOOK"
+            if t == "character":
+                return f"CHAR: {(m.get('name') or '').strip()}"[:22]
+            if t == "previous":
+                return "PREV FRAME (continuity)"
+            return ""
+        ref_labels = [_ref_label(m) for m in ref_meta]
         # If the proxy isn't confirmed to support repeated `image[]` fields,
-        # composite multiple refs into a single contact-sheet PNG so we hit
-        # the documented one-`image`-field path.
+        # composite multiple refs into a single LABELED contact-sheet PNG so we
+        # hit the documented one-`image`-field path without blending the refs.
         multi_image_edit = (request.state.settings["multi_image_edit"]
                             if request else config.MULTI_IMAGE_EDIT)
         if not multi_image_edit and len(refs) > 1:
-            send = [pipeline.contact_sheet(refs)]
-            mode_note = f"edit (contact-sheet of {len(refs)} refs)"
+            send = [pipeline.contact_sheet(refs, labels=ref_labels)]
+            mode_note = f"edit (labeled contact-sheet of {len(refs)} refs)"
         else:
             send = refs
             mode_note = f"edit ({len(refs)} refs)"
@@ -850,7 +1076,8 @@ def _render_one(g_prompt, size, quality, continue_prev, style_lock,
             if len(send) > 1:
                 print(f"[render] multi-ref edit failed ({edit_err}); "
                       f"retrying as contact-sheet", flush=True)
-                img = client.edit(full_prompt, [pipeline.contact_sheet(refs)],
+                img = client.edit(full_prompt,
+                                  [pipeline.contact_sheet(refs, labels=ref_labels)],
                                   size=size, quality=quality)
             else:
                 raise
@@ -974,16 +1201,18 @@ def _render_one_for_queue(g_prompt, params, settings, project_id):
             ref_meta.append({"type": "previous", "id": prev["id"]})
         except Exception:
             pass
-    for sf in style_frames[:3]:
+    for sf in style_frames[:4]:
         try:
             refs.append(store.read_image(sf["url"]))
             ref_meta.append({"type": "style"})
         except Exception:
             pass
 
+    _queue_style_notes = (st.get("style_notes") or "").strip()
     full_prompt = pipeline.build_full_prompt(
         st["master_prompt"], g_prompt, matched,
-        has_previous=bool(prev), style_locked=bool(style_frames))
+        has_previous=bool(prev), style_locked=bool(style_frames),
+        style_notes=_queue_style_notes)
 
     if refs:
         if not multi_image_edit and len(refs) > 1:
@@ -1037,9 +1266,13 @@ def _start_image_queue():
 
 def _img_settings_snapshot(request: Request) -> dict:
     s = request.state.settings
+    # Resolve against the active image_provider so the queue's render workers
+    # (which read these flat keys) use 9Router when it's selected.
+    api_key, base_url, model = _resolve_image(s)
     return {
-        "api_key": s["api_key"], "base_url": s["base_url"],
-        "model": s["model"], "multi_image_edit": s["multi_image_edit"],
+        "api_key": api_key, "base_url": base_url,
+        "model": model, "multi_image_edit": s["multi_image_edit"],
+        "image_provider": s.get("image_provider", "derouter"),
     }
 
 
@@ -1055,7 +1288,7 @@ class QueueSubmitIn(BaseModel):
 @app.post("/api/images/queue")
 def api_images_queue_submit(b: QueueSubmitIn, request: Request):
     """Enqueue a bulk batch. Returns the batch id + initial job list to poll."""
-    if not request.state.settings["api_key"]:
+    if not _has_image_key(request):
         raise HTTPException(400, "Connect your image API key in Settings first.")
     prompts = pipeline.split_lines_batch(b.text, mode=b.mode)
     if not prompts:
@@ -1155,9 +1388,11 @@ def _shot_image(st, prev, g_prompt, size, quality, request):
             refs.append(store.read_image(sf["url"]))
         except Exception:
             pass
+    _shot_style_notes = (st.get("style_notes") or "").strip()
     full_prompt = pipeline.build_full_prompt(
         st["master_prompt"], g_prompt, matched,
-        has_previous=bool(prev), style_locked=bool(st.get("style_frames")))
+        has_previous=bool(prev), style_locked=bool(st.get("style_frames")),
+        style_notes=_shot_style_notes)
     if refs:
         multi = request.state.settings["multi_image_edit"]
         send = refs if (multi and len(refs) > 1) else (
@@ -1252,7 +1487,7 @@ async def api_shot_inpaint(sid: str, request: Request,
                            mask: UploadFile = File(...)):
     """Mask-based inpaint: repaint only the masked region of a frame.
     Experimental — depends on your image proxy supporting the `mask` field."""
-    if not request.state.settings["api_key"]:
+    if not _has_image_key(request):
         raise HTTPException(400, "Connect your image API key in Settings first.")
     st = store.load_state()
     shot = next((s for s in st["sequence"] if s["id"] == sid), None)
@@ -1315,8 +1550,8 @@ def api_youtube_analyze(body: YouTubeAnalyzeIn, request: Request):
     """Paste a YouTube link -> Claude analyses its look, topic and way of
     speaking, then returns 10 ready-to-produce video ideas in the same vein."""
     s = request.state.settings
-    if not s["claude_api_key"]:
-        raise HTTPException(400, "No Claude API key set — add it in Settings.")
+    if not _has_ai_key(s):
+        raise HTTPException(400, "No AI key set — add Claude or OpenAI key in Settings.")
     import youtube
     if not youtube.is_youtube_url(body.url):
         raise HTTPException(400, "That doesn't look like a YouTube link.")
@@ -1349,6 +1584,7 @@ def api_youtube_analyze(body: YouTubeAnalyzeIn, request: Request):
     except Exception as e:
         raise HTTPException(500, f"analysis failed: {e}")
 
+    data = _as_analysis_dict(data)
     suggestions = data.get("suggestions") or []
     insp = {
         "url": ref["url"], "video_id": ref["video_id"],
@@ -1379,8 +1615,8 @@ def api_youtube_analyze_multi(body: YouTubeMultiIn, request: Request):
     PACING, WAY OF SPEAKING and STORYTELLING, then pitches 10 video ideas in
     that combined vein. Picking one auto-loads the Script Generator."""
     s = request.state.settings
-    if not s["claude_api_key"]:
-        raise HTTPException(400, "No Claude API key set — add it in Settings.")
+    if not _has_ai_key(s):
+        raise HTTPException(400, "No AI key set — add Claude or OpenAI key in Settings.")
     import youtube
 
     # Validate + dedupe by video id, preserving paste order.
@@ -1399,13 +1635,143 @@ def api_youtube_analyze_multi(body: YouTubeMultiIn, request: Request):
     return _analyze_urls(urls, body.nudge, body.model, request)
 
 
-def _analyze_urls(urls, nudge, model, request):
-    """Shared core: ingest a list of YouTube urls, pool frames + transcripts,
-    and have Claude deconstruct style/pacing/voice/story + pitch 10 ideas."""
+# Canonical suggestion fields the UI renders -> aliases the model SOMETIMES
+# emits instead (opus-4-8 via agentrouter occasionally renames fields and drops
+# virality_score). We map them back so cards always show a score + details.
+_SUGGESTION_ALIASES = {
+    "title": ["title", "name", "headline", "video_title"],
+    "logline": ["logline", "concept", "summary", "description", "premise",
+                "idea", "synopsis", "pitch"],
+    "hook": ["hook", "hook_line", "opening", "opener", "cold_open", "first_line",
+             "narration_beat"],
+    "distinct_angle": ["distinct_angle", "angle", "fresh_angle", "new_angle",
+                       "twist", "differentiator", "art_direction"],
+    "virality_reason": ["virality_reason", "why", "reason", "why_it_works",
+                        "why_viral", "why_it_pops", "pacing_note"],
+    "image_prompt_style": ["image_prompt_style", "art_direction", "visual_style",
+                           "art_style", "look", "style_spec", "style_notes",
+                           "style", "art"],
+    "voiceover_style": ["voiceover_style", "narration_beat", "narration",
+                        "vo_style", "voice_over", "narration_style"],
+}
+
+
+def _coerce_score(v):
+    """Best-effort 1-100 int from whatever the model put in virality_score."""
+    try:
+        return max(1, min(100, int(round(float(v)))))
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_suggestions(sugs):
+    """Map alias field names onto the canonical keys the UI renders and coerce
+    virality_score to an int. Non-dict entries are dropped."""
+    out = []
+    for s in (sugs or []):
+        if not isinstance(s, dict):
+            continue
+        n = dict(s)
+        for canon, alts in _SUGGESTION_ALIASES.items():
+            if not n.get(canon):
+                for a in alts:
+                    if s.get(a):
+                        n[canon] = s[a]
+                        break
+        score = _coerce_score(n.get("virality_score"))
+        if score is not None:
+            n["virality_score"] = score
+        else:
+            n.pop("virality_score", None)
+        out.append(n)
+    return out
+
+
+def _suggestions_need_fix(sugs):
+    """True if the batch is missing what the cards must show — a numeric
+    virality_score or a logline — for at least half the entries."""
+    if not sugs:
+        return True
+    scored = sum(1 for s in sugs if isinstance(s.get("virality_score"), int))
+    lined = sum(1 for s in sugs if (s.get("logline") or "").strip())
+    half = max(1, len(sugs) // 2)
+    return scored < half or lined < half
+
+
+def _ensure_virality(sugs):
+    """Last-resort floor so the UI never shows an unrated card: keep real scores;
+    synthesize a believable descending score from rank (model returns most-viral
+    first) and a generic reason for any that are still missing."""
+    for i, s in enumerate(sugs):
+        if not isinstance(s.get("virality_score"), int):
+            s["virality_score"] = max(45, 92 - i * 4)
+            s["_score_estimated"] = True
+        if not (s.get("virality_reason") or "").strip():
+            s["virality_reason"] = ("Strong hook and a clear, repeatable format "
+                                    "true to this style.")
+    return sugs
+
+
+# Canonical scene fields -> aliases the model sometimes emits instead. The big
+# one: the VISUAL image description lands under "visual" (or art/imagery/…)
+# instead of "prompt", so frames were being rendered from the narration text and
+# came out off-topic. Mapping it back is critical.
+_SCENE_ALIASES = {
+    "n": ["n", "scene", "index", "number", "no", "shot", "id"],
+    "heading": ["heading", "slug", "label", "header", "scene_title"],
+    "action": ["action", "description", "desc", "beat"],
+    "vo": ["vo", "voiceover", "narration", "line", "vo_line", "voice_over",
+           "narration_line", "script"],
+    "prompt": ["prompt", "visual", "image_prompt", "image", "visual_description",
+               "visual_desc", "scene_visual", "imagery", "image_desc", "art",
+               "art_direction", "visuals", "picture"],
+}
+
+
+def _normalize_scenes(scenes):
+    """Map alias scene-field names onto the canonical keys the renderer uses, so
+    the model's real VISUAL description drives image generation (not the
+    narration). Also folds an on-screen 'caption' into the image prompt so the
+    bold explainer-style caption text actually gets drawn on the frame."""
+    out = []
+    for i, s in enumerate(scenes or [], 1):
+        if not isinstance(s, dict):
+            continue
+        n = dict(s)
+        for canon, alts in _SCENE_ALIASES.items():
+            cur = n.get(canon)
+            if isinstance(cur, str) and cur.strip():
+                continue
+            if cur not in (None, "", [], {}):
+                continue
+            for a in alts:
+                v = s.get(a)
+                if (isinstance(v, str) and v.strip()) or (v not in (None, "", [], {}) and not isinstance(v, str)):
+                    n[canon] = v
+                    break
+        if not n.get("n"):
+            n["n"] = i
+        # Bake the on-screen caption (e.g. "IT KNOWS") into the visual prompt so
+        # it's drawn as bold caption text, matching the explainer style.
+        cap = (s.get("caption") or s.get("on_screen_text") or s.get("text") or "").strip()
+        p = (n.get("prompt") or "").strip()
+        if cap and p and cap.lower() not in p.lower() and len(cap) <= 60:
+            n["prompt"] = p.rstrip(". ") + f'. Big bold on-screen caption text reading "{cap}".'
+        out.append(n)
+    return out
+
+
+def _deep_analyze_urls(urls, nudge, model, request, n_suggestions=10):
+    """Shared core used by BOTH the YT Analyser tab and the Autopilot workflow.
+    Ingest a list of YouTube urls, pool frames + transcripts, and have Claude
+    deconstruct the shared style/pacing/voice/story along 4 axes + pitch
+    ``n_suggestions`` virality-ranked ideas. Returns
+    (data_dict, src_meta, errors, pooled_frame_urls). Raises HTTPException on
+    no readable videos / analysis failure."""
     import youtube
-    urls = urls[:10]   # bound the job — Anthropic caps a request near 20 images
+    urls = list(urls)[:10]   # bound the job — Anthropic caps a request near 20 images
     per_video = max(3, min(8, 16 // max(1, len(urls))))
-    sources, frame_imgs, src_meta, errors = [], [], [], []
+    sources, frame_imgs, src_meta, errors, pooled_frames = [], [], [], [], []
     for u in urls:
         try:
             ref = youtube.ingest(u, max_frames=per_video)
@@ -1429,6 +1795,7 @@ def _analyze_urls(urls, nudge, model, request):
             "notes": ref.get("notes", ""),
         })
         frame_imgs.extend(imgs)
+        pooled_frames.extend(ref.get("frame_urls", []))
 
     if not sources:
         raise HTTPException(400, "Couldn't read any of those videos. Try links "
@@ -1436,14 +1803,46 @@ def _analyze_urls(urls, nudge, model, request):
     frame_imgs = frame_imgs[:16]
 
     st = store.load_state()
+    client = _claude_client_for(model, request)
+
+    def _ask(extra_nudge=""):
+        raw = client.suggest_from_references(
+            frames=frame_imgs, sources=sources,
+            nudge=(nudge + extra_nudge).strip(),
+            master_prompt=st["master_prompt"], n_suggestions=n_suggestions)
+        return _as_analysis_dict(extract_json(raw))
+
     try:
-        raw = _claude_client_for(model, request).suggest_from_references(
-            frames=frame_imgs, sources=sources, nudge=nudge,
-            master_prompt=st["master_prompt"], n_suggestions=10)
-        data = extract_json(raw)
+        data = _ask()
+        sugs = _normalize_suggestions(data.get("suggestions"))
+        if _suggestions_need_fix(sugs):
+            # The model ignored the schema (renamed fields / dropped scores).
+            # Re-ask ONCE — frames already in hand, so no re-ingest — hammering
+            # the EXACT field names and the required integer virality_score.
+            data2 = _ask(
+                "\n\nCRITICAL OUTPUT RULE: every item in \"suggestions\" MUST use "
+                "these EXACT key names and NEVER rename them — title, logline, "
+                "hook, distinct_angle, virality_score (an INTEGER 1-100), "
+                "virality_reason, voiceover_style, image_prompt_style, "
+                "pacing_seconds, total_duration, scene_count. Include "
+                "virality_score and virality_reason for EVERY suggestion. Sort "
+                "most-viral first.")
+            sugs2 = _normalize_suggestions(data2.get("suggestions"))
+            if not _suggestions_need_fix(sugs2) or len(sugs2) > len(sugs):
+                data, sugs = data2, sugs2
+        data["suggestions"] = _ensure_virality(sugs)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, f"analysis failed: {e}")
 
+    return data, src_meta, errors, pooled_frames
+
+
+def _analyze_urls(urls, nudge, model, request):
+    """YT Analyser tab: deep multi-video analysis stored as yt_analysis."""
+    data, src_meta, errors, _frames = _deep_analyze_urls(
+        urls, nudge, model, request, n_suggestions=10)
     out = {
         "sources": src_meta, "errors": errors,
         "art_style": data.get("art_style", ""),
@@ -1454,6 +1853,7 @@ def _analyze_urls(urls, nudge, model, request):
         "suggestions": data.get("suggestions") or [],
         "created": store.now(),
     }
+    st = store.load_state()
     st["yt_analysis"] = out
     store.save_state(st)
     return out
@@ -1470,8 +1870,8 @@ class ChannelIn(BaseModel):
 def api_youtube_channel(b: ChannelIn, request: Request):
     """Analyse a whole channel: list its recent videos, then run the same
     multi-video style deconstruction + 10 ideas."""
-    if not request.state.settings["claude_api_key"]:
-        raise HTTPException(400, "No Claude API key set — add it in Settings.")
+    if not _has_ai_key(request.state.settings):
+        raise HTTPException(400, "No AI key set — add Claude or OpenAI key in Settings.")
     import youtube
     info = youtube.channel_info(b.url, max(2, min(12, b.limit)))
     urls = [it["url"] for it in info.get("items", []) if it.get("url")]
@@ -1490,8 +1890,8 @@ class GapsIn(BaseModel):
 def api_youtube_gaps(b: GapsIn, request: Request):
     """Find content gaps: list a channel's recent titles and ask Claude what it
     hasn't covered."""
-    if not request.state.settings["claude_api_key"]:
-        raise HTTPException(400, "No Claude API key set — add it in Settings.")
+    if not _has_ai_key(request.state.settings):
+        raise HTTPException(400, "No AI key set — add Claude or OpenAI key in Settings.")
     import youtube
     info = youtube.channel_info(b.url, 50)
     titles = [it.get("title", "") for it in info.get("items", []) if it.get("title")]
@@ -1513,8 +1913,8 @@ class TrendsIn(BaseModel):
 @app.post("/api/youtube/trends")
 def api_youtube_trends(b: TrendsIn, request: Request):
     """Pull what's working in a niche via YouTube search, then distill angles."""
-    if not request.state.settings["claude_api_key"]:
-        raise HTTPException(400, "No Claude API key set — add it in Settings.")
+    if not _has_ai_key(request.state.settings):
+        raise HTTPException(400, "No AI key set — add Claude or OpenAI key in Settings.")
     if not b.niche.strip():
         raise HTTPException(400, "Enter a niche or topic.")
     import youtube
@@ -1539,8 +1939,8 @@ class SeoIn(BaseModel):
 @app.post("/api/seo")
 def api_seo(b: SeoIn, request: Request):
     """Generate optimized titles, description and tags for the current topic."""
-    if not request.state.settings["claude_api_key"]:
-        raise HTTPException(400, "No Claude API key set — add it in Settings.")
+    if not _has_ai_key(request.state.settings):
+        raise HTTPException(400, "No AI key set — add Claude or OpenAI key in Settings.")
     st = store.load_state()
     sc = st.get("script") or {}
     title = b.title.strip() or sc.get("title", "")
@@ -1571,7 +1971,7 @@ def api_youtube_thumbnail(body: YTThumbnailIn, request: Request):
     the visual style of the analysed reference videos. Uses the image model;
     when reference frames are supplied it edits from them so the palette/mood
     matches the source channel's look."""
-    if not request.state.settings["api_key"]:
+    if not _has_image_key(request):
         raise HTTPException(400, "Connect your image API key in Settings first.")
     if not (body.title.strip() or body.style.strip()):
         raise HTTPException(400, "Give the thumbnail a title or a style to work from.")
@@ -1797,13 +2197,68 @@ class ScriptIn(BaseModel):
 
 
 def _claude_client_for(model: Optional[str], request: Request) -> ClaudeClient:
-    """Claude client (per-user keys from the vault) honouring a model override."""
-    s = request.state.settings
-    return ClaudeClient(
-        api_key=s["claude_api_key"],
-        base_url=s["claude_base_url"],
-        model=(model or s["claude_model"]),
-    )
+    """AI client (per-user keys from the vault) honouring a model override.
+    Routes to Anthropic direct, the 9Router proxy, or the derouter proxy based
+    on claude_provider."""
+    api_key, base_url, mdl = _resolve_claude(request.state.settings, model)
+    return ClaudeClient(api_key=api_key, base_url=base_url, model=mdl)
+
+
+def _as_analysis_dict(data):
+    """Normalize an analyzer's parsed JSON to a dict. The model usually returns
+    an object, but sometimes a bare list of suggestions — wrap that so callers
+    can safely use .get(). Anything else becomes an empty dict."""
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list):
+        return {"suggestions": data}
+    return {}
+
+
+def _looks_like_script(data) -> bool:
+    """A valid script is an object carrying a non-empty `scenes` list. Claude
+    occasionally returns the wrong shape (e.g. just the characters array, or a
+    bare list) — we treat those as failures so the caller can retry."""
+    return (isinstance(data, dict)
+            and isinstance(data.get("scenes"), list)
+            and len(data["scenes"]) > 0)
+
+
+def _generate_script_validated(client, **kwargs):
+    """generate_script + extract_json + shape validation, with ONE corrective
+    retry if the model returns malformed/mis-shaped JSON (no scenes). Raises
+    ValueError only if both attempts fail. Returns the parsed script dict."""
+    raw = client.generate_script(**kwargs)
+    try:
+        data = extract_json(raw)
+    except Exception as e:
+        data = None
+        _first_err = e
+    else:
+        _first_err = None
+    if _looks_like_script(data):
+        data["scenes"] = _normalize_scenes(data.get("scenes"))
+        return data
+    # Retry once, explicitly demanding the full object shape.
+    kw2 = dict(kwargs)
+    kw2["description"] = (
+        (kwargs.get("description") or "")
+        + "\n\nCRITICAL OUTPUT RULE: Return ONE JSON OBJECT exactly shaped "
+          '{ "title", "logline", "voiceover", "pacing_seconds", "total_duration", '
+          '"scene_count", "characters":[...], "scenes":[...] }. The "scenes" array '
+          "is REQUIRED and must be non-empty. Do NOT return a bare array or only "
+          "the characters. JSON only, no prose.")
+    raw2 = client.generate_script(**kw2)
+    data2 = extract_json(raw2)          # may raise — that's a real failure
+    if _looks_like_script(data2):
+        data2["scenes"] = _normalize_scenes(data2.get("scenes"))
+        return data2
+    # Both attempts produced an unusable shape.
+    if isinstance(data2, dict):
+        return data2                    # let downstream surface "no scenes"
+    raise ValueError(
+        "model did not return a script object with scenes"
+        + (f" ({_first_err})" if _first_err else ""))
 
 
 @app.post("/api/script")
@@ -1817,7 +2272,8 @@ def api_script(s: ScriptIn, request: Request):
     if s.scene_count and not s.total_duration:
         total_duration = s.scene_count * pacing
     try:
-        raw = _claude_client_for(s.model, request).generate_script(
+        data = _generate_script_validated(
+            _claude_client_for(s.model, request),
             title=s.title,
             description=s.description,
             total_duration=max(1.0, total_duration or 60.0),
@@ -1828,7 +2284,6 @@ def api_script(s: ScriptIn, request: Request):
             brief=s.brief,
             dialogue=s.dialogue,
         )
-        data = extract_json(raw)
     except Exception as e:
         raise HTTPException(500, f"script generation failed: {e}")
     st["script"] = data
@@ -1882,6 +2337,7 @@ def api_script_scene_regen(b: SceneRegenIn, request: Request):
         data = extract_json(raw)
     except Exception as e:
         raise HTTPException(500, f"scene rewrite failed: {e}")
+    data = _as_analysis_dict(data)
     for k in ("heading", "action", "vo", "prompt"):
         if data.get(k) is not None:
             s[k] = data[k]
@@ -1911,6 +2367,7 @@ def api_script_translate(b: TranslateIn, request: Request):
         data = extract_json(raw)
     except Exception as e:
         raise HTTPException(500, f"translation failed: {e}")
+    data = _as_analysis_dict(data)
     tmap = {int(x.get("n", 0)): x.get("vo", "") for x in (data.get("scenes") or [])}
     for i, s in enumerate(sc["scenes"], 1):
         if i in tmap:
@@ -1947,6 +2404,7 @@ def api_script_rewrite(b: RewriteIn, request: Request):
         data = extract_json(raw)
     except Exception as e:
         raise HTTPException(500, f"rewrite failed: {e}")
+    data = _as_analysis_dict(data)
     rmap = {int(x.get("n", 0)): x for x in (data.get("scenes") or [])}
     for i, s in enumerate(sc["scenes"], 1):
         r = rmap.get(int(s.get("n", i)))
@@ -1973,13 +2431,13 @@ def api_script_hooks(b: HooksIn, request: Request):
     st = store.load_state()
     sc = st.get("script") or {}
     title = sc.get("title", "") or ""
-    desc = sc.get("logline", "") or sc.get("voiceover", "")[:300]
+    desc = sc.get("logline", "") or (sc.get("voiceover") or "")[:300]
     try:
         raw = _claude_client_for(b.model, request).hooks(title, desc, max(1, min(12, b.n)))
         data = extract_json(raw)
     except Exception as e:
         raise HTTPException(500, f"hooks failed: {e}")
-    return {"hooks": data.get("hooks") or []}
+    return {"hooks": _as_analysis_dict(data).get("hooks") or []}
 
 
 class OutlineIn(BaseModel):
@@ -1999,7 +2457,7 @@ def api_script_outline(b: OutlineIn, request: Request):
         data = extract_json(raw)
     except Exception as e:
         raise HTTPException(500, f"outline failed: {e}")
-    return {"beats": data.get("beats") or []}
+    return {"beats": _as_analysis_dict(data).get("beats") or []}
 
 
 @app.get("/api/script/character-prompts")
@@ -2065,6 +2523,7 @@ def api_prompts_from_video(p: PromptsFromVideoIn, request: Request):
         data = extract_json(raw)
     except Exception as e:
         raise HTTPException(500, f"prompt generation failed: {e}")
+    data = _as_analysis_dict(data)
     st["suggested_prompts"] = data.get("prompts") or []
     store.save_state(st)
     return data
@@ -2163,8 +2622,8 @@ class VoicePreviewIn(BaseModel):
 @app.post("/api/voice/preview")
 def api_voice_preview(b: VoicePreviewIn, request: Request):
     s = request.state.settings
-    if not s["elevenlabs_api_key"]:
-        raise HTTPException(400, "No ElevenLabs API key set — add it in Settings.")
+    if not _has_voice_key(s):
+        raise HTTPException(400, "No voice/TTS key set — add ElevenLabs or MiMo in Settings.")
     text = (b.text or "").strip() or "This is a quick preview of how this voice sounds."
     try:
         mp3 = get_voice_client(request, b.voice_id).synthesize(text[:300])
@@ -2314,13 +2773,15 @@ def _scene_vo_lines(st):
 def api_voices(request: Request):
     """List the ElevenLabs voices available on the configured account."""
     s = request.state.settings
-    if not s["elevenlabs_api_key"]:
-        raise HTTPException(400, "No ElevenLabs API key set — add it in Settings.")
+    if not _has_voice_key(s):
+        raise HTTPException(400, "No voice/TTS key set — add ElevenLabs or MiMo in Settings.")
     try:
         voices = get_voice_client(request).list_voices()
     except Exception as e:
         raise HTTPException(500, str(e))
-    return {"voices": voices, "current": s["elevenlabs_voice_id"]}
+    _provider = s.get("voice_provider") or "elevenlabs"
+    current = s.get("mimo_voice_id") if _provider == "mimo" else s["elevenlabs_voice_id"]
+    return {"voices": voices, "current": current, "provider": _provider}
 
 
 # --------------------------------------------------------------------------- #
@@ -2339,6 +2800,221 @@ def api_voices(request: Request):
 # --------------------------------------------------------------------------- #
 def _word_count(s: str) -> int:
     return len([w for w in re.split(r"\s+", (s or "").strip()) if w])
+
+
+# ---------------------------------------------------------------------------
+# Style sanitizer — globally bans doodle / hand-drawn aesthetics and replaces
+# them with stick-man / stick-figure style throughout prompts and style notes.
+# ---------------------------------------------------------------------------
+_DOODLE_RE = re.compile(
+    r"\b(hand[\s\-]?drawn|hand[\s\-]?sketched|hand[\s\-]?painted|"
+    r"doodle[ds]?|doodle[\s\-]?style|"
+    r"whiteboard[\s\-]?(?:animation|style|art)?|"
+    r"marker[\s\-]?sketch|pencil[\s\-]?sketch|chalk[\s\-]?(?:art|drawing|style)?|"
+    r"crayon[\s\-]?(?:art|style)?|scribble[ds]?|"
+    r"rough[\s\-]?sketch|childlike[\s\-]?drawing|napkin[\s\-]?sketch|"
+    r"line[\s\-]?art[\s\-]?style(?:\s+illustration)?)\b",
+    re.IGNORECASE,
+)
+
+_STICK_REPLACEMENT = "stick man / stick figure style"
+
+
+def _sanitize_prompt(text: str) -> str:
+    """Replace any doodle / hand-drawn style keywords with stick-man style."""
+    if not text:
+        return text
+    return _DOODLE_RE.sub(_STICK_REPLACEMENT, text)
+
+
+_CAM_CUES = [
+    "extreme close-up on face", "wide cinematic shot", "medium shot",
+    "low dramatic angle", "over-the-shoulder", "dutch tilt",
+    "high angle overview", "tight close-up", "establishing wide shot",
+    "ground-level shot",
+]
+
+# Temporal moment progressions — make each split sub-frame a genuinely
+# different visual beat (not just a re-angle of the same moment).
+_MOMENT_CUES = [
+    "",                                                    # 0: original prompt, no modifier
+    "extreme close-up on face showing raw emotion",
+    "wide establishing shot, full environment revealed",
+    "low angle dramatic upshot, subject looks powerful",
+    "cutaway — tight focus on a key prop or environmental detail",
+    "reaction shot, secondary element responding to the action",
+    "high angle overview, small subject in a large world",
+    "medium shot, action at its peak intensity",
+    "over-the-shoulder, slight push-in toward the subject",
+    "transition beat, camera pulling back to show wider context",
+]
+
+# Error fragments that mean the IMAGE account itself is broken (no credits / bad
+# key). Every remaining image call will fail the same way, so the pipeline stops
+# burning attempts and surfaces the cause. Shared by the character + frame steps.
+_FATAL_IMAGE_MARKERS = (
+    "billing hard limit", "billing_hard_limit", "insufficient credit",
+    "insufficient_quota", "exceeded your current quota", "billing_error",
+    "wallet-balance", "slot reservation failed", "http 402", "[402]",
+    "rejected the key", "invalid api key",
+)
+
+
+def _is_fatal_image_error(msg: str) -> bool:
+    low = (msg or "").lower()
+    return any(k in low for k in _FATAL_IMAGE_MARKERS)
+
+
+# Words that already denote a camera framing/angle in a prompt — if present we
+# DON'T append an angle cue (avoids fighting the model's own composition).
+_CAMERA_WORDS = (
+    "close-up", "closeup", "close up", "wide shot", "wide-shot", "establishing",
+    "low angle", "high angle", "overhead", "bird's eye", "birds-eye", "aerial",
+    "over-the-shoulder", "over the shoulder", "dutch tilt", "pov", "point of view",
+    "medium shot", "long shot", "extreme close", "macro", "from above", "from below",
+)
+
+
+def _has_camera_language(prompt: str) -> bool:
+    low = (prompt or "").lower()
+    return any(w in low for w in _CAMERA_WORDS)
+
+
+def _angle_cue_for(index: int) -> str:
+    """Cycle through the non-empty camera cues so consecutive frames change
+    angle — the 'micro-cut' look. index 0..N -> cue 1..len-1, skipping the
+    empty placeholder at [0]."""
+    span = len(_MOMENT_CUES) - 1
+    return _MOMENT_CUES[(index % span) + 1] if span > 0 else ""
+
+
+def _split_script_scenes(script: dict, target_count: int) -> dict:
+    """Expand an under-populated scenes list by splitting each scene into
+    sub-scenes until we reach ``target_count``.
+
+    Each sub-scene uses a temporal moment cue (opening → close-up → reaction →
+    cutaway → wide → detail → payoff) so consecutive frames feel like genuine
+    cuts rather than repeated stills with different angles.
+    """
+    scenes = script.get("scenes") or []
+    if not scenes or len(scenes) >= target_count:
+        return script
+
+    split_factor = math.ceil(target_count / len(scenes))
+    new_scenes: list = []
+
+    for orig in scenes:
+        words = (orig.get("vo") or "").split()
+        base_prompt = (orig.get("prompt") or "").strip()
+        heading = (orig.get("heading") or "").strip()
+        action = (orig.get("action") or "").strip()
+        full_vo = orig.get("vo") or ""
+
+        # Distribute VO words evenly across sub-frames so each carries a
+        # proportional speech slice (important for audio-sync hold calculation).
+        chunk_sz = max(1, math.ceil(len(words) / split_factor)) if words else 0
+
+        for j in range(split_factor):
+            if len(new_scenes) >= target_count:
+                break
+
+            if words and chunk_sz:
+                start_w = j * chunk_sz
+                vo_slice = " ".join(words[start_w:start_w + chunk_sz])
+            else:
+                vo_slice = ""
+
+            moment_idx = j % len(_MOMENT_CUES)
+            cue = _MOMENT_CUES[moment_idx]
+            if cue:
+                prompt = f"{base_prompt}, {cue}" if base_prompt else base_prompt
+            else:
+                # j==0: no moment cue — add a camera cut for variety
+                cam = _CAM_CUES[len(new_scenes) % len(_CAM_CUES)]
+                prompt = f"{base_prompt}, {cam}" if base_prompt else base_prompt
+
+            new_scenes.append({
+                "n": len(new_scenes) + 1,
+                "heading": heading,
+                "action": action,
+                "vo": vo_slice,
+                "prompt": prompt,
+            })
+
+    script["scenes"] = new_scenes
+    script["scene_count"] = len(new_scenes)
+    return script
+
+
+def _holds_from_alignment(tts_lines: list, alignment, total_dur: float):
+    """Convert ElevenLabs character-level timestamps to per-scene hold durations.
+
+    ``tts_lines`` must be exactly the per-scene VO lines that were joined with
+    '\\n\\n' and sent to the TTS API.  ``alignment`` is the dict returned by
+    ``synthesize_with_timestamps`` (normalized_alignment preferred).
+
+    Returns a list of floats (seconds per scene) summing to ``total_dur``,
+    or ``None`` if the alignment data is missing / inconsistent.
+    """
+    if not alignment:
+        return None
+    chars = alignment.get("characters", [])
+    t_starts = alignment.get("character_start_times_seconds", [])
+    t_ends = alignment.get("character_end_times_seconds", [])
+    if not chars or not t_starts or len(chars) != len(t_starts):
+        return None
+
+    align_text = "".join(chars)
+    if not align_text.strip():
+        return None
+
+    n = len(tts_lines)
+    scene_start_times = []
+    search_from = 0
+
+    for line in tts_lines:
+        stripped = line.strip()
+        if not stripped:
+            # Empty VO — record current position's time; will be interpolated.
+            scene_start_times.append(None)
+            continue
+        # Try to locate first 20 chars of the line in the alignment text.
+        for needle_len in (20, 12, 8, 5):
+            needle = stripped[:needle_len].strip()
+            if not needle:
+                continue
+            pos = align_text.find(needle, search_from)
+            if pos >= 0:
+                scene_start_times.append(t_starts[pos])
+                search_from = pos + max(1, len(stripped) // 3)
+                break
+        else:
+            # Could not find the line; interpolate from current position.
+            scene_start_times.append(t_starts[min(search_from, len(t_starts) - 1)])
+
+    # Fill gaps (None entries) by linear interpolation.
+    audio_end = t_ends[-1] if t_ends else total_dur
+    for i in range(len(scene_start_times)):
+        if scene_start_times[i] is None:
+            prev = next((scene_start_times[j] for j in range(i - 1, -1, -1)
+                         if scene_start_times[j] is not None), 0.0)
+            nxt = next((scene_start_times[j] for j in range(i + 1, len(scene_start_times))
+                        if scene_start_times[j] is not None), audio_end)
+            scene_start_times[i] = (prev + nxt) / 2.0
+
+    holds = []
+    for i in range(n):
+        t_start = scene_start_times[i] if i < len(scene_start_times) else 0.0
+        t_end = (scene_start_times[i + 1]
+                 if i + 1 < len(scene_start_times) else audio_end)
+        holds.append(max(0.3, round(t_end - t_start, 3)))
+
+    total = sum(holds)
+    if total <= 0:
+        return None
+    # Normalize so the holds sum to exactly total_dur (keeps A/V locked).
+    scale = total_dur / total
+    return [round(h * scale, 3) for h in holds]
 
 
 # --------------------------------------------------------------------------- #
@@ -2360,6 +3036,59 @@ def _generate_sfx_cached(request, text, duration=None):
             f.write(mp3)
     rel = os.path.relpath(path, store.DATA_DIR).replace(os.sep, "/")
     return f"/data/{rel}", path
+
+
+# Short percussive sounds used for the "click on every frame change" feature.
+# Each style maps to an ElevenLabs sound-generation prompt + duration; results
+# are disk-cached by _generate_sfx_cached so each style is only paid for once.
+_CLICK_STYLES = {
+    "click":   ("single sharp tactile mouse click, dry, instant, no reverb, no echo", 0.6),
+    "camera":  ("single crisp camera shutter click, punchy, dry, fast", 0.7),
+    "whoosh":  ("very short fast air whoosh swipe transition, subtle", 0.8),
+    "pop":     ("single soft bubble pop, very short, clean, dry", 0.6),
+    "tick":    ("single mechanical clock tick, dry, precise", 0.6),
+}
+
+
+def _cut_click_file(request, style="click"):
+    """Return a local path to the click sound for ``style``. Generates it via
+    ElevenLabs (cached) and falls back to an ffmpeg-synthesized blip when the
+    ElevenLabs call is unavailable, so renders never fail because of it."""
+    desc, dur = _CLICK_STYLES.get((style or "click").lower(), _CLICK_STYLES["click"])
+    try:
+        _url, path = _generate_sfx_cached(request, desc, duration=dur)
+        return path
+    except Exception as e:
+        print(f"[clicks] ElevenLabs click unavailable ({e}); using synth fallback",
+              flush=True)
+    path = os.path.join(_SFX_CACHE_DIR, "_fallback_click.wav")
+    if not os.path.exists(path):
+        os.makedirs(_SFX_CACHE_DIR, exist_ok=True)
+        _run_capture(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=1800:duration=0.05",
+             "-af", "afade=t=out:st=0.012:d=0.038,volume=0.9", path],
+            timeout=60)
+    return path if os.path.exists(path) else None
+
+
+def _apply_cut_clicks(request, video_path, durations, volume=0.30, style="click"):
+    """Mix a click at every frame change. ``durations`` is the per-shot
+    on-screen time, in play order; clicks land on each boundary (not at 0 or
+    the very end). Best-effort — failures never break the render."""
+    cuts, t = [], 0.0
+    for d in (durations or [])[:-1]:
+        t += max(0.0, float(d or 0))
+        cuts.append(round(t, 3))
+    if not cuts:
+        return
+    click = _cut_click_file(request, style)
+    if not click:
+        return
+    try:
+        editor.add_cut_clicks(video_path, click, cuts, volume=volume)
+        print(f"[clicks] mixed {len(cuts)} cut clicks ({style})", flush=True)
+    except Exception as e:
+        print(f"[clicks] skipped: {e}", flush=True)
 
 
 def _plan_sfx_with_claude(request, scene_map, total_seconds):
@@ -2418,10 +3147,9 @@ def _normalize_loud(video_path, target_lufs=-14.0):
     tmp = video_path + ".loud.mp4"
     af = (f"acompressor=threshold=-18dB:ratio=3:attack=5:release=120,"
           f"loudnorm=I={target_lufs}:TP=-1.0:LRA=11,alimiter=limit=0.97")
-    proc = subprocess.run(
+    proc = _run_capture(
         ["ffmpeg", "-y", "-i", video_path, "-af", af,
-         "-c:v", "copy", "-c:a", "aac", "-b:a", "256k", tmp],
-        capture_output=True, text=True)
+         "-c:v", "copy", "-c:a", "aac", "-b:a", "256k", tmp])
     if proc.returncode == 0 and os.path.exists(tmp):
         os.replace(tmp, video_path)
     else:
@@ -2477,10 +3205,62 @@ def _auto_sound_design(request, scene_map, total_seconds):
     return rumble_path, sfx_entries
 
 
+def _synth_per_scene_track(vc, tts_lines, name_hint, pad=0.04):
+    """Synthesize each scene's narration SEPARATELY, measure its real spoken
+    length, and concat the clips (each padded to its hold) into one track.
+    Returns (track_path, total_duration, holds) — one hold per scene line. This
+    gives exact A/V sync for ANY TTS provider, including ones without
+    character-level timestamps (e.g. MiMo), where the single-track path can only
+    estimate frame timing from word counts. Mirrors /api/voiceover/scenes."""
+    n = len(tts_lines)
+    work = os.path.join(store.VIDEOS_DIR, f"_aps_{store.new_id('tmp')}")
+    os.makedirs(work, exist_ok=True)
+    clip_paths, holds = [], []
+    for i in range(n):
+        line = (tts_lines[i] or "").strip()
+        mp3 = vc.synthesize(line if line else " ")
+        ap = os.path.join(work, f"vo_{i:03d}.mp3")
+        with open(ap, "wb") as f:
+            f.write(mp3)
+        try:
+            editor.trim_silence(ap)
+        except Exception:
+            pass
+        try:
+            d = float(editor.probe_duration(ap))
+        except Exception:
+            d = 0.0
+        if d <= 0.05:
+            d = 0.8
+        hold = round(d + max(0.0, pad), 3)
+        holds.append(hold)
+        clip_paths.append((ap, hold))
+    concat_inputs, filt = [], ""
+    for j, (ap, hold) in enumerate(clip_paths):
+        concat_inputs += ["-i", ap]
+        # pad each clip with trailing silence to its hold so audio lines up with
+        # the image timing exactly; normalize format so concat never mismatches.
+        filt += (f"[{j}:a]aformat=sample_rates=44100:channel_layouts=stereo,"
+                 f"apad=whole_dur={hold}[a{j}];")
+    filt += "".join(f"[a{j}]" for j in range(len(clip_paths)))
+    filt += f"concat=n={len(clip_paths)}:v=0:a=1[out]"
+    track = os.path.join(work, "track.mp3")
+    cc = _run_capture(["ffmpeg", "-y", *concat_inputs, "-filter_complex", filt,
+                       "-map", "[out]", "-c:a", "libmp3lame", "-q:a", "4", track])
+    if cc.returncode != 0 or not os.path.exists(track):
+        raise RuntimeError(f"per-scene track concat failed: {(cc.stderr or '')[-200:]}")
+    with open(track, "rb") as f:
+        turl, ppath = store.write_binary("audio", f.read(), ext="mp3",
+                                         name_hint=name_hint)
+    return ppath, turl, round(sum(holds), 3), holds
+
+
 def _build_flow_video(st, request, *, voice_id, text, transition="cut",
-                      width=1920, height=1080, fps=30, max_hold=6.0,
+                      width=1920, height=1080, fps=30, max_hold=2.5,
                       motion=False, use_music=False, name_hint="flow",
-                      sound_design=False):
+                      sound_design=False, smart_edit=True,
+                      cut_clicks=False, cut_click_volume=0.30,
+                      cut_click_style="click", manual_holds=None):
     """Shared engine for the natural-flow video. Returns
     (edit_rec, video_url, total_seconds, scene_map). Mutates + saves `st`.
 
@@ -2495,56 +3275,130 @@ def _build_flow_video(st, request, *, voice_id, text, transition="cut",
     if not text:
         raise HTTPException(400, "No voice-over text. Generate a script first.")
 
-    # 1. ONE continuous narration track — natural, never stretched.
-    try:
-        mp3 = get_voice_client(request, voice_id).synthesize(text)
-    except Exception as e:
-        raise HTTPException(500, f"voice-over failed: {e}")
-    url, path = store.write_binary("audio", mp3, ext="mp3", name_hint=name_hint)
-    try:
-        dur = float(editor.probe_duration(path))
-    except Exception:
-        dur = 0.0
-    if dur <= 0.1:
-        dur = max(1.0, len(seq) * 2.0)
-
-    # 2. Weight each frame by its scene's narration length so images change in
-    #    step with the speech. Frames beyond the last scene line share evenly.
-    #    HOOK PACING: the first ~30s of audio get fast-paced frames (1.0-1.3s
-    #    each) so the opening is visually intense and scroll-stopping.
+    # 1. ONE continuous narration track — synthesized from per-scene VO lines
+    #    joined with double-newlines so that character timestamps map directly
+    #    to scene boundaries.  trim_silence removes dead air.
     lines = _scene_vo_lines(st)
     n = len(seq)
-    weights = []
-    for i in range(n):
-        line = lines[i] if i < len(lines) else ""
-        weights.append(float(max(1, _word_count(line))))
-    total_w = sum(weights) or float(n)
-    holds = [max(0.6, dur * w / total_w) for w in weights]
-    # Re-normalise so the holds sum to the real audio length (keeps A/V locked).
-    scale = dur / (sum(holds) or 1.0)
-    holds = [round(h * scale, 3) for h in holds]
+    tts_lines = [lines[i].strip() if i < len(lines) else "" for i in range(n)]
+    tts_text = "\n\n".join(l for l in tts_lines if l) or text
 
-    # Hook zone: cap the first frames (covering ~30s of audio) to 1.0-1.3s
-    # and redistribute the stolen time to later frames so total stays locked.
-    hook_budget = min(30.0, dur * 0.4)
-    hook_cap = 1.15
-    cum, stolen = 0.0, 0.0
-    hook_end_idx = 0
-    for i in range(n):
-        cum += holds[i]
-        if cum > hook_budget:
-            hook_end_idx = i
-            break
-        if holds[i] > hook_cap:
-            stolen += holds[i] - hook_cap
-            holds[i] = hook_cap
-        hook_end_idx = i + 1
-    # Spread stolen time across remaining (non-hook) frames proportionally.
-    rest = list(range(hook_end_idx, n))
-    rest_total = sum(holds[j] for j in rest) or 1.0
-    if stolen > 0 and rest:
-        for j in rest:
-            holds[j] = round(holds[j] + stolen * (holds[j] / rest_total), 3)
+    vc = get_voice_client(request, voice_id)
+    provider = (request.state.settings.get("voice_provider")
+                if request else "") or "elevenlabs"
+    alignment = None
+    measured_holds = None
+    path = None
+
+    # Providers without character-level timestamps (e.g. MiMo) can't give exact
+    # per-scene timing from a single track. Synthesize each scene separately and
+    # MEASURE its real length so every frame is held for exactly its narration —
+    # far tighter A/V sync than estimating from word counts. ElevenLabs keeps the
+    # single-track + timestamps path (its timestamps are already frame-exact).
+    url = None
+    if provider != "elevenlabs":
+        try:
+            path, url, dur, measured_holds = _synth_per_scene_track(
+                vc, tts_lines, name_hint)
+            print(f"[video] per-scene exact sync: {len(measured_holds)} clips, "
+                  f"{dur:.2f}s total", flush=True)
+        except Exception as _ps:
+            print(f"[video] per-scene synth failed ({_ps}); single-track fallback",
+                  flush=True)
+            measured_holds = None
+            path = None
+
+    if measured_holds is None:
+        try:
+            mp3, alignment = vc.synthesize_with_timestamps(tts_text)
+        except Exception as e:
+            raise HTTPException(500, f"voice-over failed: {e}")
+        url, path = store.write_binary("audio", mp3, ext="mp3", name_hint=name_hint)
+        try:
+            editor.trim_silence(path)
+        except Exception:
+            pass
+        try:
+            dur = float(editor.probe_duration(path))
+        except Exception:
+            dur = 0.0
+        if dur <= 0.1:
+            dur = max(1.0, n * 2.0)
+
+    # 2. Compute per-scene hold durations.
+    #    (0) MANUAL override from the Review & adjust popup — user-set seconds
+    #        per frame. Scaled to the actual audio duration so A/V stays locked
+    #        while honouring the user's relative pacing.
+    #    (a) ElevenLabs character timestamps — exact speech timing, best quality
+    #    (b) Pre-planned holds from autopilot cut planner (Claude, pre-TTS)
+    #    (c) Claude narration-sync estimate — linguistic proxy, decent
+    #    (d) Word-count proportional weighting — simple baseline
+    holds = None
+    if manual_holds and len(manual_holds) == n:
+        try:
+            mh = [max(0.15, float(v)) for v in manual_holds]
+            mh_sum = sum(mh) or 1.0
+            holds = [round(v * dur / mh_sum, 3) for v in mh]
+            print(f"[video] manual holds applied + scaled to {dur:.2f}s", flush=True)
+        except Exception as _mh_ex:
+            print(f"[video] manual holds ignored: {_mh_ex}", flush=True)
+            holds = None
+    # Per-scene measured holds (timestamp-less providers) are already frame-exact
+    # and sum to the track duration — use them directly.
+    if holds is None and measured_holds and len(measured_holds) == n:
+        holds = measured_holds
+        print(f"[video] per-scene measured holds for {n} frames (exact sync)",
+              flush=True)
+    if holds is None:
+        holds = _holds_from_alignment(tts_lines, alignment, dur)
+    if holds and len(holds) == n:
+        print(f"[video] timestamp-sync: exact holds for {n} frames", flush=True)
+    else:
+        # Try pre-planned holds set by the autopilot cut planner.
+        sc_list = (st.get("script") or {}).get("scenes") or []
+        pre_planned = [sc_list[i].get("planned_hold") if i < len(sc_list) else None
+                       for i in range(n)]
+        if all(v is not None for v in pre_planned):
+            # Scale pre-planned weights to actual audio duration.
+            _pp_sum = sum(float(v) for v in pre_planned) or 1.0
+            holds = [round(float(v) * dur / _pp_sum, 3) for v in pre_planned]
+            print(f"[video] cut-planner holds scaled to {dur:.2f}s", flush=True)
+        else:
+            # Fallback: word-count proportional weighting
+            weights = [float(max(1, _word_count(tts_lines[i]))) for i in range(n)]
+            total_w = sum(weights) or float(n)
+            holds = [max(0.6, dur * w / total_w) for w in weights]
+            scale = dur / (sum(holds) or 1.0)
+            holds = [round(h * scale, 3) for h in holds]
+            # Hook zone: cap the first ~30s of frames to ≤1.0s for fast opening pacing.
+            hook_budget = min(30.0, dur * 0.5)
+            hook_cap = 1.0
+            cum, stolen, hook_end_idx = 0.0, 0.0, 0
+            for i in range(n):
+                cum += holds[i]
+                if cum > hook_budget:
+                    hook_end_idx = i
+                    break
+                if holds[i] > hook_cap:
+                    stolen += holds[i] - hook_cap
+                    holds[i] = hook_cap
+                hook_end_idx = i + 1
+            rest = list(range(hook_end_idx, n))
+            rest_total = sum(holds[j] for j in rest) or 1.0
+            if stolen > 0 and rest:
+                for j in rest:
+                    holds[j] = round(holds[j] + stolen * (holds[j] / rest_total), 3)
+            # Claude narration-sync as second fallback when timestamps unavailable.
+            if smart_edit and request:
+                try:
+                    _claude = _claude_client_for(None, request)
+                    refined = _claude.edit_holds(tts_lines, dur)
+                    if refined and len(refined) == n:
+                        holds = refined
+                        print(f"[video] Claude smart-edit: holds refined for {n} frames",
+                              flush=True)
+                except Exception as _se:
+                    print(f"[video] Claude smart-edit skipped: {_se}", flush=True)
 
     shots, scene_map = [], []
     for i in range(n):
@@ -2601,6 +3455,14 @@ def _build_flow_video(st, request, *, voice_id, text, transition="cut",
                     os.replace(out_path + ".sfx.mp4", out_path)
             except Exception as ex:
                 print(f"[sound] sfx mix skipped: {ex}", flush=True)
+
+    # 3d. Click on every frame change (scene boundaries, not micro-cuts).
+    if cut_clicks:
+        _apply_cut_clicks(request, out_path,
+                          [sc["hold_seconds"] for sc in scene_map],
+                          volume=cut_click_volume, style=cut_click_style)
+
+    if do_sound:
         _normalize_loud(out_path)
 
     rel = os.path.relpath(out_path, store.DATA_DIR).replace(os.sep, "/")
@@ -2616,7 +3478,8 @@ def _build_flow_video(st, request, *, voice_id, text, transition="cut",
             "transition": (transition or "cut").lower(),
             "micro_cut_max_hold": max_hold, "shots": scene_map,
             "rendered_clips": len(shots),
-            "sound_design": bool(do_sound), "sfx_count": len(sfx_entries)}
+            "sound_design": bool(do_sound), "sfx_count": len(sfx_entries),
+            "cut_clicks": bool(cut_clicks)}
     edit_rec = {"id": store.new_id("edit"), "url": video_url,
                 "audio_id": st["audio"]["id"],
                 "transition": (transition or "cut").lower(),
@@ -2635,10 +3498,13 @@ class FlowVoiceoverIn(BaseModel):
     width: int = 1920
     height: int = 1080
     fps: int = 30
-    max_hold: float = 6.0          # split frames longer than this into micro-cuts
+    max_hold: float = 2.5          # split frames longer than this into micro-cuts
     motion: bool = False
     music: bool = False
     sound_design: bool = False     # generate + mix ElevenLabs SFX, then loudnorm
+    cut_clicks: bool = False       # ElevenLabs click on every frame change
+    cut_click_volume: float = 0.30
+    cut_click_style: str = "click"  # click | camera | whoosh | pop | tick
 
 
 @app.post("/api/voiceover/auto-flow")
@@ -2646,17 +3512,19 @@ def api_voiceover_auto_flow(body: FlowVoiceoverIn, request: Request):
     """Natural-flow narrated video: one continuous voice-over, frames timed to
     it, long holds broken into micro-cuts. See _build_flow_video."""
     s = request.state.settings
-    if not s["elevenlabs_api_key"]:
-        raise HTTPException(400, "No ElevenLabs API key set — add it in Settings.")
+    if not _has_voice_key(s):
+        raise HTTPException(400, "No voice/TTS key set — add ElevenLabs or MiMo in Settings.")
     st = store.load_state()
     text = (body.text or "").strip() or _script_voiceover_text(st)
-    voice_id = body.voice_id or s["elevenlabs_voice_id"]
+    voice_id = body.voice_id or _voice_default_id(s)
     edit_rec, video_url, total, scene_map = _build_flow_video(
         st, request, voice_id=voice_id, text=text,
         transition=body.transition or "cut", width=body.width,
         height=body.height, fps=body.fps, max_hold=body.max_hold,
         motion=body.motion, use_music=body.music, name_hint="voiceover_flow",
-        sound_design=body.sound_design)
+        sound_design=body.sound_design, cut_clicks=body.cut_clicks,
+        cut_click_volume=body.cut_click_volume,
+        cut_click_style=body.cut_click_style)
     return {"edit": edit_rec, "video_url": video_url, "total_duration": total,
             "scenes": scene_map, "plan": edit_rec["plan"]}
 
@@ -2672,13 +3540,13 @@ def api_voiceover(body: VoiceoverIn, request: Request):
     drop it into the existing `audio` slot, so Plan edit / Render video work
     unchanged. Returns the audio record (same shape as /api/audio)."""
     s = request.state.settings
-    if not s["elevenlabs_api_key"]:
-        raise HTTPException(400, "No ElevenLabs API key set — add it in Settings.")
+    if not _has_voice_key(s):
+        raise HTTPException(400, "No voice/TTS key set — add ElevenLabs or MiMo in Settings.")
     st = store.load_state()
     text = (body.text or "").strip() or _script_voiceover_text(st)
     if not text:
         raise HTTPException(400, "No voice-over text. Generate a script in tab 02 first.")
-    voice_id = body.voice_id or s["elevenlabs_voice_id"]
+    voice_id = body.voice_id or _voice_default_id(s)
     try:
         mp3 = get_voice_client(request, voice_id).synthesize(text)
     except Exception as e:
@@ -2711,11 +3579,14 @@ class SceneVoiceoverIn(BaseModel):
     width: int = 1920
     height: int = 1080
     fps: int = 30
-    pad: float = 0.12                # small breath of hold added after each clip
+    pad: float = 0.05                # tight gap after each clip for fast pacing
     motion: bool = False             # Ken Burns zoom
     music: bool = False              # mix the project's background music
     intro: Optional[str] = None      # intro title-card text
     outro: Optional[str] = None      # outro title-card text
+    cut_clicks: bool = False         # ElevenLabs click on every frame change
+    cut_click_volume: float = 0.30
+    cut_click_style: str = "click"
 
 
 @app.post("/api/voiceover/scenes")
@@ -2726,8 +3597,8 @@ def api_voiceover_scenes(body: SceneVoiceoverIn, request: Request):
     single narration track and muxes it. Returns the edit record + per-scene map.
     """
     s = request.state.settings
-    if not s["elevenlabs_api_key"]:
-        raise HTTPException(400, "No ElevenLabs API key set — add it in Settings.")
+    if not _has_voice_key(s):
+        raise HTTPException(400, "No voice/TTS key set — add ElevenLabs or MiMo in Settings.")
     st = store.load_state()
     seq = st.get("sequence") or []
     if not seq:
@@ -2736,7 +3607,7 @@ def api_voiceover_scenes(body: SceneVoiceoverIn, request: Request):
     if not any(lines):
         raise HTTPException(400, "No per-scene narration. Generate a script in tab 02 first.")
 
-    voice_id = body.voice_id or s["elevenlabs_voice_id"]
+    voice_id = body.voice_id or _voice_default_id(s)
     client = get_voice_client(request, voice_id)
 
     # one frame per scene, capped to whichever is shorter
@@ -2760,13 +3631,14 @@ def api_voiceover_scenes(body: SceneVoiceoverIn, request: Request):
             with open(ap, "wb") as f:
                 f.write(mp3)
             try:
+                editor.trim_silence(ap)
+            except Exception:
+                pass
+            try:
                 d = editor.probe_duration(ap)
             except Exception:
                 d = 0.0
             if d <= 0.05:
-                # silent/empty line -> brief hold only (a 2.5s freeze on a
-                # wordless scene is what made the cut drag); keep it short so
-                # the pacing stays tight.
                 d = 0.8
             hold = round(d + max(0.0, body.pad), 3)
             clip_paths.append((ap, hold, d))
@@ -2792,10 +3664,9 @@ def api_voiceover_scenes(body: SceneVoiceoverIn, request: Request):
             filt += f"[{j}:a]apad=whole_dur={hold}[a{j}];"
         filt += "".join(f"[a{j}]" for j in range(len(clip_paths)))
         filt += f"concat=n={len(clip_paths)}:v=0:a=1[out]"
-        cc = subprocess.run(
+        cc = _run_capture(
             ["ffmpeg", "-y", *concat_inputs, "-filter_complex", filt,
-             "-map", "[out]", "-c:a", "libmp3lame", "-q:a", "4", track],
-            capture_output=True, text=True)
+             "-map", "[out]", "-c:a", "libmp3lame", "-q:a", "4", track])
         track_path = track if (cc.returncode == 0 and os.path.exists(track)) else None
         track_url = None
         if track_path:
@@ -2813,6 +3684,11 @@ def api_voiceover_scenes(body: SceneVoiceoverIn, request: Request):
             width=body.width, height=body.height, fps=body.fps,
             motion=body.motion, music_path=music_path, music_volume=music_volume,
         )
+        if body.cut_clicks:
+            _apply_cut_clicks(request, out_path,
+                              [sh["duration"] for sh in shots],
+                              volume=body.cut_click_volume,
+                              style=body.cut_click_style)
         _bookend(out_path, body.intro, body.outro, body.width, body.height, body.fps)
         rel = os.path.relpath(out_path, store.DATA_DIR).replace(os.sep, "/")
         url = f"/data/{rel}"
@@ -2852,6 +3728,9 @@ class AutoVoiceoverIn(BaseModel):
     width: int = 1920
     height: int = 1080
     fps: int = 30
+    cut_clicks: bool = False
+    cut_click_volume: float = 0.30
+    cut_click_style: str = "click"
 
 
 @app.post("/api/voiceover/auto")
@@ -2862,10 +3741,10 @@ def api_voiceover_auto(body: AutoVoiceoverIn, request: Request):
     mp3 and the frames and makes a video matching the voice-over' path, end to
     end. Returns {audio, plan, edit}."""
     s = request.state.settings
-    if not s["elevenlabs_api_key"]:
-        raise HTTPException(400, "No ElevenLabs API key set — add it in Settings.")
-    if not s["claude_api_key"]:
-        raise HTTPException(400, "No Claude API key set — add it in Settings.")
+    if not _has_voice_key(s):
+        raise HTTPException(400, "No voice/TTS key set — add ElevenLabs or MiMo in Settings.")
+    if not _has_ai_key(s):
+        raise HTTPException(400, "No AI key set — add Claude or OpenAI key in Settings.")
     st = store.load_state()
     if not st.get("sequence"):
         raise HTTPException(400, "Render some frames in the Sequence tab first.")
@@ -2874,7 +3753,7 @@ def api_voiceover_auto(body: AutoVoiceoverIn, request: Request):
         raise HTTPException(400, "No voice-over text. Generate a script in tab 02 first.")
 
     # 1. ElevenLabs: script text -> one narration track, into the audio slot.
-    voice_id = body.voice_id or s["elevenlabs_voice_id"]
+    voice_id = body.voice_id or _voice_default_id(s)
     try:
         mp3 = get_voice_client(request, voice_id).synthesize(text)
     except Exception as e:
@@ -2906,6 +3785,7 @@ def api_voiceover_auto(body: AutoVoiceoverIn, request: Request):
             audio_duration=float(dur) or 0,
             user_brief=body.user_brief,
             master_prompt=st["master_prompt"],
+            vo_lines=_scene_vo_lines(st),        # match imagery to the words said
         )
     except Exception as ex:
         raise HTTPException(500, f"edit planning failed: {ex}")
@@ -2934,6 +3814,11 @@ def api_voiceover_auto(body: AutoVoiceoverIn, request: Request):
     try:
         editor.assemble_video(shots_out, path, out_path, transition=transition,
                               width=body.width, height=body.height, fps=body.fps)
+        if body.cut_clicks:
+            _apply_cut_clicks(request, out_path,
+                              [sh["duration"] for sh in shots_out],
+                              volume=body.cut_click_volume,
+                              style=body.cut_click_style)
     except Exception as ex:
         raise HTTPException(500, f"video assembly failed: {ex}")
     rel = os.path.relpath(out_path, store.DATA_DIR).replace(os.sep, "/")
@@ -2957,7 +3842,10 @@ class SyncedVoiceoverIn(BaseModel):
     width: int = 1920
     height: int = 1080
     fps: int = 30
-    pad: float = 0.12                 # small breath of hold added after each clip
+    pad: float = 0.05                 # tight gap after each clip for fast pacing
+    cut_clicks: bool = False
+    cut_click_volume: float = 0.30
+    cut_click_style: str = "click"
 
 
 @app.post("/api/voiceover/auto-synced")
@@ -2971,10 +3859,10 @@ def api_voiceover_auto_synced(body: SyncedVoiceoverIn, request: Request):
     narration track is rebuilt in Claude's chosen order so audio still lines up.
     """
     s = request.state.settings
-    if not s["elevenlabs_api_key"]:
-        raise HTTPException(400, "No ElevenLabs API key set — add it in Settings.")
-    if not s["claude_api_key"]:
-        raise HTTPException(400, "No Claude API key set — add it in Settings.")
+    if not _has_voice_key(s):
+        raise HTTPException(400, "No voice/TTS key set — add ElevenLabs or MiMo in Settings.")
+    if not _has_ai_key(s):
+        raise HTTPException(400, "No AI key set — add Claude or OpenAI key in Settings.")
     st = store.load_state()
     seq = st.get("sequence") or []
     if not seq:
@@ -2983,7 +3871,7 @@ def api_voiceover_auto_synced(body: SyncedVoiceoverIn, request: Request):
     if not any(lines):
         raise HTTPException(400, "No per-scene narration. Generate a script in tab 02 first.")
 
-    voice_id = body.voice_id or s["elevenlabs_voice_id"]
+    voice_id = body.voice_id or _voice_default_id(s)
     client = get_voice_client(request, voice_id)
     n = min(len(seq), len(lines))
     if n == 0:
@@ -3003,6 +3891,10 @@ def api_voiceover_auto_synced(body: SyncedVoiceoverIn, request: Request):
             ap = os.path.join(work, f"vo_{i:03d}.mp3")
             with open(ap, "wb") as f:
                 f.write(mp3)
+            try:
+                editor.trim_silence(ap)
+            except Exception:
+                pass
             try:
                 d = editor.probe_duration(ap)
             except Exception:
@@ -3067,10 +3959,9 @@ def api_voiceover_auto_synced(body: SyncedVoiceoverIn, request: Request):
             filt += f"[{j}:a]apad=whole_dur={c['hold']}[a{j}];"
         filt += "".join(f"[a{j}]" for j in range(len(ordered)))
         filt += f"concat=n={len(ordered)}:v=0:a=1[out]"
-        cc = subprocess.run(
+        cc = _run_capture(
             ["ffmpeg", "-y", *concat_inputs, "-filter_complex", filt,
-             "-map", "[out]", "-c:a", "libmp3lame", "-q:a", "4", track],
-            capture_output=True, text=True)
+             "-map", "[out]", "-c:a", "libmp3lame", "-q:a", "4", track])
         track_path = track if (cc.returncode == 0 and os.path.exists(track)) else None
         track_url = None
         if track_path:
@@ -3093,6 +3984,11 @@ def api_voiceover_auto_synced(body: SyncedVoiceoverIn, request: Request):
         try:
             editor.assemble_video(shots, track_path, out_path, transition=transition,
                                   width=body.width, height=body.height, fps=body.fps)
+            if body.cut_clicks:
+                _apply_cut_clicks(request, out_path,
+                                  [sh["duration"] for sh in shots],
+                                  volume=body.cut_click_volume,
+                                  style=body.cut_click_style)
         except Exception as ex:
             raise HTTPException(500, f"video assembly failed: {ex}")
         rel = os.path.relpath(out_path, store.DATA_DIR).replace(os.sep, "/")
@@ -3182,15 +4078,15 @@ def api_voiceover_multivoice(body: MultiVoiceIn, request: Request):
     """Multi-voice mode: parse speaker tags from the script VO, synthesize each
     segment with the character's assigned voice, concatenate into one track."""
     s = request.state.settings
-    if not s["elevenlabs_api_key"]:
-        raise HTTPException(400, "No ElevenLabs API key set — add it in Settings.")
+    if not _has_voice_key(s):
+        raise HTTPException(400, "No voice/TTS key set — add ElevenLabs or MiMo in Settings.")
     st = store.load_state()
     text = _script_voiceover_text(st)
     if not text:
         raise HTTPException(400, "No voice-over text. Generate a script first.")
 
     vm = body.voice_map or st.get("voice_map") or {}
-    default_vid = body.default_voice_id or s["elevenlabs_voice_id"]
+    default_vid = body.default_voice_id or _voice_default_id(s)
 
     segments = _parse_dialogue_lines(text)
     if not segments:
@@ -3227,10 +4123,9 @@ def api_voiceover_multivoice(body: MultiVoiceIn, request: Request):
                 concat_inputs += ["-i", cp]
                 filt_parts.append(f"[{j}:a]")
             filt = "".join(filt_parts) + f"concat=n={len(clip_paths)}:v=0:a=1[out]"
-            cc = subprocess.run(
+            cc = _run_capture(
                 ["ffmpeg", "-y", *concat_inputs, "-filter_complex", filt,
-                 "-map", "[out]", "-c:a", "libmp3lame", "-q:a", "4", track],
-                capture_output=True, text=True)
+                 "-map", "[out]", "-c:a", "libmp3lame", "-q:a", "4", track])
             if cc.returncode != 0:
                 raise HTTPException(500, f"audio concat failed: {cc.stderr[-300:]}")
 
@@ -3268,7 +4163,7 @@ class MultiVoiceScenesIn(BaseModel):
     width: int = 1920
     height: int = 1080
     fps: int = 30
-    pad: float = 0.12
+    pad: float = 0.05
     motion: bool = False
     music: bool = False
 
@@ -3278,8 +4173,8 @@ def api_voiceover_multivoice_scenes(body: MultiVoiceScenesIn, request: Request):
     """Per-scene multi-voice: each scene's VO is parsed for speaker tags and
     synthesized with per-character voices, then assembled into a timed video."""
     s = request.state.settings
-    if not s["elevenlabs_api_key"]:
-        raise HTTPException(400, "No ElevenLabs API key set — add it in Settings.")
+    if not _has_voice_key(s):
+        raise HTTPException(400, "No voice/TTS key set — add ElevenLabs or MiMo in Settings.")
     st = store.load_state()
     seq = st.get("sequence") or []
     if not seq:
@@ -3289,7 +4184,7 @@ def api_voiceover_multivoice_scenes(body: MultiVoiceScenesIn, request: Request):
         raise HTTPException(400, "No per-scene narration. Generate a script first.")
 
     vm = body.voice_map or st.get("voice_map") or {}
-    default_vid = body.default_voice_id or s["elevenlabs_voice_id"]
+    default_vid = body.default_voice_id or _voice_default_id(s)
     n = min(len(seq), len(lines))
 
     work = os.path.join(store.VIDEOS_DIR, f"_mv_{store.new_id('tmp')}")
@@ -3334,10 +4229,9 @@ def api_voiceover_multivoice_scenes(body: MultiVoiceScenesIn, request: Request):
                     ci += ["-i", cp]
                     fp.append(f"[{k}:a]")
                 filt = "".join(fp) + f"concat=n={len(scene_clips)}:v=0:a=1[out]"
-                cc = subprocess.run(
+                cc = _run_capture(
                     ["ffmpeg", "-y", *ci, "-filter_complex", filt,
-                     "-map", "[out]", "-c:a", "libmp3lame", "-q:a", "4", merged],
-                    capture_output=True, text=True)
+                     "-map", "[out]", "-c:a", "libmp3lame", "-q:a", "4", merged])
                 if cc.returncode == 0:
                     scene_clips = [merged]
                     try:
@@ -3373,10 +4267,9 @@ def api_voiceover_multivoice_scenes(body: MultiVoiceScenesIn, request: Request):
             filt += f"[{j}:a]apad=whole_dur={hold}[a{j}];"
         filt += "".join(f"[a{j}]" for j in range(len(clip_paths)))
         filt += f"concat=n={len(clip_paths)}:v=0:a=1[out]"
-        cc = subprocess.run(
+        cc = _run_capture(
             ["ffmpeg", "-y", *concat_inputs, "-filter_complex", filt,
-             "-map", "[out]", "-c:a", "libmp3lame", "-q:a", "4", track],
-            capture_output=True, text=True)
+             "-map", "[out]", "-c:a", "libmp3lame", "-q:a", "4", track])
         track_path = track if (cc.returncode == 0 and os.path.exists(track)) else None
         track_url = None
         if track_path:
@@ -3456,6 +4349,7 @@ def api_edit_plan(e: EditPlanIn, request: Request):
             audio_duration=float(st["audio"]["duration"]) or 0,
             user_brief=e.user_brief,
             master_prompt=st["master_prompt"],
+            vo_lines=_scene_vo_lines(st),        # match imagery to the words said
         )
     except Exception as ex:
         raise HTTPException(500, f"edit planning failed: {ex}")
@@ -3474,6 +4368,9 @@ class RenderVideoIn(BaseModel):
     music: bool = False
     intro: Optional[str] = None
     outro: Optional[str] = None
+    cut_clicks: bool = False
+    cut_click_volume: float = 0.30
+    cut_click_style: str = "click"
 
 
 @app.post("/api/render-video")
@@ -3520,6 +4417,11 @@ def api_render_video(r: RenderVideoIn, request: Request):
             width=r.width, height=r.height, fps=r.fps,
             motion=r.motion, music_path=music_path, music_volume=music_volume,
         )
+        # clicks before bookending so cut times aren't shifted by the intro card
+        if r.cut_clicks:
+            _apply_cut_clicks(request, out_path,
+                              [sh["duration"] for sh in shots_out],
+                              volume=r.cut_click_volume, style=r.cut_click_style)
         _bookend(out_path, r.intro, r.outro, r.width, r.height, r.fps)
         _apply_sfx(st, out_path)
     except Exception as ex:
@@ -4262,7 +5164,8 @@ def api_export_drive(body: DriveExportIn, request: Request):
 #  Autopilot: one-click YT link -> full video + thumbnail
 # --------------------------------------------------------------------------- #
 class AutopilotIn(BaseModel):
-    url: str                           # YouTube URL
+    url: str = ""                      # YouTube URL (legacy single-link)
+    urls: List[str] = []               # one OR MANY YouTube URLs (preferred)
     nudge: str = ""                    # creative direction
     suggestion_index: int = 0          # which suggestion to use (0 = first)
     width: int = 1920
@@ -4276,8 +5179,8 @@ class AutopilotIn(BaseModel):
     voice_id: Optional[str] = None     # ElevenLabs voice for the narration
     target_seconds: Optional[float] = None  # desired video length target
     run_id: Optional[str] = None       # client token so a run can be stopped
-    step_timeout: float = 60.0         # auto-proceed if a heavy step stalls past this
-    max_hold: float = 6.0              # split frames longer than this into micro-cuts
+    step_timeout: float = 300.0        # auto-proceed if a heavy step stalls past this
+    max_hold: float = 2.5              # split frames longer than this into micro-cuts
     from_cache: bool = False           # reuse the topics from a prior /suggest call
                                        # so the picked index maps to what the user saw
     sound_design: bool = True          # generate + mix ElevenLabs SFX + loudnorm
@@ -4286,6 +5189,17 @@ class AutopilotIn(BaseModel):
                                        # before generating so they don't mix
     orientation: Optional[str] = None  # "vertical" (9:16 Shorts), "square", or
                                        # "landscape" (default) — sets frame + video size
+    pacing_seconds: Optional[float] = None   # override AI-suggested pacing (s/image)
+    num_characters: Optional[int] = None     # override AI-suggested character count
+    smart_edit: bool = True            # use Claude to audio-sync image holds
+    angle_variety: bool = True         # cycle camera angles per frame (micro-cuts)
+                                       # so consecutive frames feel like real cuts
+    keep_style: bool = False           # keep the project's pinned style anchors +
+                                       # style notes instead of re-deriving them
+                                       # from the analysed video
+    cut_clicks: bool = True            # ElevenLabs click on every frame change
+    cut_click_volume: float = 0.30
+    cut_click_style: str = "click"     # click | camera | whoosh | pop | tick
 
 
 # --- Autopilot run control: stop flag + per-step deadline ------------------- #
@@ -4358,7 +5272,7 @@ def api_autopilot_stop(body: AutopilotStopIn):
 
 # --- Live autopilot progress (drives the progress bar + ETA in the UI) ------ #
 _AUTOPILOT_PROGRESS = {}
-AP_STEPS = ["analyse", "script", "characters", "frames", "video", "thumbnail", "seo"]
+AP_STEPS = ["analyse", "script", "plan", "characters", "frames", "video", "thumbnail", "seo"]
 
 
 def _ap_prog(run_id, **kw):
@@ -4444,50 +5358,118 @@ def _reset_generated(delete_files=True):
 
 
 def _sort_by_virality(suggestions):
-    """Most-viral-first, stable. Missing scores sink to the bottom."""
-    return sorted(suggestions or [],
-                  key=lambda x: float(x.get("virality_score") or 0), reverse=True)
-
-
-def _autopilot_analyze(url, nudge, model, request, n_suggestions=10):
-    """Shared step 1: ingest a YouTube ref, get fresh on-style ideas ranked by
-    virality, save them as yt_inspiration, and return the inspiration dict."""
-    import youtube
-    if not youtube.is_youtube_url(url):
-        raise HTTPException(400, "That doesn't look like a YouTube link.")
-    try:
-        ref = youtube.ingest(url, max_frames=12)
-    except Exception as e:
-        raise HTTPException(400, f"Couldn't read that video: {e}")
-    frame_imgs = []
-    for u in ref.get("frame_urls", [])[:12]:
+    """Most-viral-first, stable. Missing scores sink to the bottom. Non-dict
+    entries are dropped so a stray value can't crash the sort."""
+    items = [s for s in (suggestions or []) if isinstance(s, dict)]
+    def _score(x):
         try:
-            frame_imgs.append(pipeline.downsize_for_vision(store.read_image(u)))
-        except Exception:
-            pass
-    st = store.load_state()
-    claude = _claude_client_for(model, request)
-    try:
-        raw = claude.suggest_from_reference(
-            frames=frame_imgs, transcript=ref.get("transcript", ""),
-            source_title=ref.get("title", ""), source_channel=ref.get("channel", ""),
-            nudge=nudge, master_prompt=st["master_prompt"],
-            n_suggestions=n_suggestions)
-        analysis = extract_json(raw)
-    except Exception as e:
-        raise HTTPException(500, f"YT analysis failed: {e}")
-    suggestions = _sort_by_virality(analysis.get("suggestions") or [])
+            return float(x.get("virality_score") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    return sorted(items, key=_score, reverse=True)
+
+
+def _topic_constraint_nudge(c):
+    """Turn the creator's production inputs (length / orientation / pacing /
+    characters) into a directive so topics are pitched to FIT them."""
+    if not c:
+        return ""
+    bits = []
+    secs = c.get("target_seconds")
+    if secs and secs > 0:
+        bits.append(f"about {float(secs):.0f} seconds long")
+    orient = (c.get("orientation") or "").lower()
+    if orient in ("vertical", "portrait", "9:16", "shorts", "tiktok"):
+        bits.append("VERTICAL 9:16 (Shorts/TikTok) format")
+    elif orient in ("square", "1:1"):
+        bits.append("SQUARE 1:1 format")
+    elif orient:
+        bits.append("LANDSCAPE 16:9 (YouTube) format")
+    nc = c.get("num_characters")
+    if nc is not None and int(nc) >= 0:
+        bits.append(f"{int(nc)} recurring character(s)" if int(nc) > 0 else "pure narration, no characters")
+    if not bits:
+        return ""
+    return ("\n\nPRODUCTION CONSTRAINTS — pitch topics that fit a video that is "
+            + ", ".join(bits) + ". Scope each idea so it works at that length and "
+            "format (a 15s short needs ONE tight beat; a 2-minute video can go deeper).")
+
+
+def _apply_topic_constraints(suggestions, c):
+    """Bake the creator's chosen length / pacing / character count onto every
+    suggestion so the picked topic (and its script) is written to that timing."""
+    if not c:
+        return suggestions
+    secs = c.get("target_seconds")
+    pace = c.get("pacing_seconds")
+    nc = c.get("num_characters")
+    for s in suggestions:
+        if not isinstance(s, dict):
+            continue
+        if secs and secs > 0:
+            s["total_duration"] = float(secs)
+        if pace and pace > 0:
+            s["pacing_seconds"] = float(pace)
+        if nc is not None and int(nc) >= 0:
+            s["num_characters"] = int(nc)
+        _d = s.get("total_duration")
+        _p = s.get("pacing_seconds")
+        if _d and _p:
+            s["scene_count"] = max(1, round(float(_d) / max(0.1, float(_p))))
+    return suggestions
+
+
+def _autopilot_analyze(urls, nudge, model, request, n_suggestions=10, constraints=None):
+    """Autopilot workflow step 1: ingest one OR MANY YouTube refs and run the
+    SAME deep multi-video analysis the YT Analyser tab uses — deconstruct the
+    shared art style / pacing / way-of-speaking / storytelling and pitch fresh,
+    virality-ranked, fully-described ideas. Saved as yt_inspiration. The rich
+    4-axis fields are also mapped onto the legacy keys (style_summary, topic)
+    the rest of the pipeline reads. ``constraints`` (length/orientation/pacing/
+    characters) tailor the topics + bake the entered timing into each idea."""
+    import youtube
+    if isinstance(urls, str):
+        urls = [urls]
+    urls = [u.strip() for u in (urls or []) if u and u.strip()]
+    if not urls:
+        raise HTTPException(400, "Paste at least one YouTube link.")
+    for u in urls:
+        if not youtube.is_youtube_url(u):
+            raise HTTPException(400, f"That doesn't look like a YouTube link: {u}")
+
+    nudge = (nudge or "") + _topic_constraint_nudge(constraints)
+    data, src_meta, errors, pooled_frames = _deep_analyze_urls(
+        urls, nudge, model, request, n_suggestions=n_suggestions)
+    suggestions = _apply_topic_constraints(
+        _sort_by_virality(data.get("suggestions") or []), constraints)
     if not suggestions:
         raise HTTPException(500, "Analysis returned no suggestions.")
+
+    primary = src_meta[0] if src_meta else {}
+    art_style = data.get("art_style", "")
     insp = {
-        "url": url, "resolved_url": ref.get("url"), "video_id": ref.get("video_id"),
-        "title": ref.get("title", ""), "channel": ref.get("channel", ""),
-        "style_summary": analysis.get("style_summary", ""),
-        "speech_style": analysis.get("speech_style", ""),
-        "topic": analysis.get("topic", ""),
-        "frames": ref.get("frame_urls", []),
-        "suggestions": suggestions, "created": store.now(),
+        # legacy keys the downstream pipeline reads:
+        "url": primary.get("url") or urls[0],
+        "video_id": primary.get("video_id", ""),
+        "title": primary.get("title", ""),
+        "channel": primary.get("channel", ""),
+        "style_summary": art_style,
+        "speech_style": data.get("speech_style", ""),
+        "topic": data.get("sources_summary", ""),
+        "frames": pooled_frames,
+        "suggestions": suggestions,
+        # rich multi-video fields (same shape as yt_analysis):
+        "input_urls": urls,
+        "urls": [m.get("url") for m in src_meta] or urls,
+        "art_style": art_style,
+        "pacing": data.get("pacing", ""),
+        "storytelling": data.get("storytelling", ""),
+        "sources_summary": data.get("sources_summary", ""),
+        "sources": src_meta,
+        "errors": errors,
+        "created": store.now(),
     }
+    st = store.load_state()
     st["yt_inspiration"] = insp
     store.save_state(st)
     store.log_usage("script", 1, 0.01)
@@ -4495,10 +5477,33 @@ def _autopilot_analyze(url, nudge, model, request, n_suggestions=10):
 
 
 class AutopilotSuggestIn(BaseModel):
-    url: str
+    url: str = ""                      # legacy single-link
+    urls: List[str] = []               # one OR MANY YouTube URLs (preferred)
     nudge: str = ""
     model: Optional[str] = None
     n_suggestions: int = 10
+    # Production inputs entered BEFORE finding topics — tailor + bake into ideas.
+    target_seconds: Optional[float] = None
+    pacing_seconds: Optional[float] = None
+    num_characters: Optional[int] = None
+    orientation: Optional[str] = None
+
+
+def _autopilot_urls(body):
+    """Collect YouTube urls from an autopilot request — supports the new
+    multi-url `urls` list and falls back to the legacy single `url` field.
+    De-duped, order-preserving."""
+    raw = list(getattr(body, "urls", None) or [])
+    single = (getattr(body, "url", "") or "").strip()
+    if single:
+        raw.append(single)
+    seen, out = set(), []
+    for u in raw:
+        u = (u or "").strip()
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
 
 
 @app.post("/api/autopilot/suggest")
@@ -4507,13 +5512,26 @@ def api_autopilot_suggest(body: AutopilotSuggestIn, request: Request):
     video ideas ranked by predicted virality — so the user can PICK which one to
     produce (instead of always making the first/same one). No media is generated."""
     s = request.state.settings
-    if not s["claude_api_key"]:
-        raise HTTPException(400, "No Claude API key — add it in Settings.")
-    insp = _autopilot_analyze(body.url, body.nudge, body.model, request,
-                              max(1, min(15, body.n_suggestions)))
-    return {"ok": True, "url": insp["url"], "title": insp["title"],
-            "channel": insp["channel"], "style_summary": insp["style_summary"],
-            "topic": insp["topic"], "suggestions": insp["suggestions"]}
+    if not _has_ai_key(s):
+        raise HTTPException(400, "No AI key set — add Claude or OpenAI key in Settings.")
+    urls = _autopilot_urls(body)
+    constraints = {
+        "target_seconds": body.target_seconds,
+        "pacing_seconds": body.pacing_seconds,
+        "num_characters": body.num_characters,
+        "orientation": body.orientation,
+    }
+    insp = _autopilot_analyze(urls, body.nudge, body.model, request,
+                              max(1, min(15, body.n_suggestions)),
+                              constraints=constraints)
+    return {"ok": True, "url": insp["url"], "urls": insp.get("urls", []),
+            "title": insp["title"], "channel": insp["channel"],
+            "style_summary": insp["style_summary"], "topic": insp["topic"],
+            "art_style": insp.get("art_style", ""), "pacing": insp.get("pacing", ""),
+            "speech_style": insp.get("speech_style", ""),
+            "storytelling": insp.get("storytelling", ""),
+            "sources": insp.get("sources", []), "errors": insp.get("errors", []),
+            "suggestions": insp["suggestions"]}
 
 
 @app.post("/api/autopilot")
@@ -4521,14 +5539,18 @@ def api_autopilot(body: AutopilotIn, request: Request):
     """One-click pipeline: YouTube link -> analyse -> script -> characters ->
     frames -> voice-over video -> thumbnail. Returns progress at each step."""
     s = request.state.settings
-    if not s["claude_api_key"]:
-        raise HTTPException(400, "No Claude API key — add it in Settings.")
-    if not s["api_key"]:
+    if not _has_ai_key(s):
+        raise HTTPException(400, "No AI key set — add Claude or OpenAI key in Settings.")
+    if not _has_image_key(request):
         raise HTTPException(400, "No image API key — add it in Settings.")
-    if not s["elevenlabs_api_key"]:
-        raise HTTPException(400, "No ElevenLabs API key — add it in Settings.")
+    if not _has_voice_key(s):
+        raise HTTPException(400, "No voice/TTS key — add ElevenLabs or MiMo in Settings.")
 
     run_id = body.run_id or store.new_id("run")
+    print(f"[autopilot] START target_seconds={body.target_seconds!r} "
+          f"pacing_seconds={body.pacing_seconds!r} "
+          f"num_characters={body.num_characters!r} "
+          f"orientation={body.orientation!r}", flush=True)
     with _AUTOPILOT_LOCK:                      # clear any stale stop flag
         _AUTOPILOT_STOP.discard(run_id)
     step_to = max(15.0, float(body.step_timeout or 60.0))
@@ -4536,14 +5558,17 @@ def api_autopilot(body: AutopilotIn, request: Request):
     quality = body.quality or config.DEFAULT_QUALITY
     size = body.size or config.DEFAULT_SIZE
     width, height = body.width, body.height
-    orient = (body.orientation or "").lower()
+    orient = (body.orientation or "landscape").lower()
     if orient in ("vertical", "portrait", "9:16", "shorts", "tiktok"):
         size = body.size or "1024x1536"        # portrait frames
         width, height = 1080, 1920             # 9:16 video
     elif orient in ("square", "1:1"):
         size = body.size or "1024x1024"
         width, height = 1080, 1080
-    voice_id = body.voice_id or s["elevenlabs_voice_id"]
+    else:                                      # landscape / 16:9 / youtube / default
+        size = body.size or "1536x1024"        # landscape frames
+        width, height = 1920, 1080             # 16:9 video
+    voice_id = body.voice_id or _voice_default_id(s)
     claude = _claude_client_for(body.model, request)
     steps = []
 
@@ -4551,11 +5576,18 @@ def api_autopilot(body: AutopilotIn, request: Request):
     # Reuse the exact list the user picked from (so suggestion_index lines up);
     # otherwise analyse fresh. Either way they're ranked by virality.
     _ap_prog(run_id, step="analyse")
+    urls = _autopilot_urls(body)
+    if not urls:
+        raise HTTPException(400, "Paste at least one YouTube link.")
     cached = (store.load_state().get("yt_inspiration") or {})
     use_cache = (body.from_cache and cached.get("suggestions")
-                 and cached.get("url") == body.url)
+                 and (cached.get("input_urls") or [cached.get("url")]) == urls)
     insp = cached if use_cache else _autopilot_analyze(
-        body.url, body.nudge, body.model, request, 10)
+        urls, body.nudge, body.model, request, 10,
+        constraints={"target_seconds": body.target_seconds,
+                     "pacing_seconds": body.pacing_seconds,
+                     "num_characters": body.num_characters,
+                     "orientation": body.orientation})
     suggestions = insp["suggestions"]
     analysis = {"style_summary": insp.get("style_summary", ""),
                 "speech_style": insp.get("speech_style", ""),
@@ -4569,6 +5601,51 @@ def api_autopilot(body: AutopilotIn, request: Request):
     if body.fresh:
         _reset_generated(delete_files=True)
 
+    # Pin the reference-video frames as visual style anchors so every
+    # generated image (character sheets + scene frames) is guided by the
+    # actual look of the source video — not just the text style description.
+    ref_frame_urls = insp.get("frames", [])
+    if body.keep_style:
+        print("[autopilot] keep_style: existing style anchors + notes preserved",
+              flush=True)
+    elif ref_frame_urls:
+        # Pin 4 evenly-spaced frames from the uploaded reference video(s) as the
+        # style anchors that every generated frame must copy the look of.
+        step = max(1, len(ref_frame_urls) // 4)
+        _style_picks = ref_frame_urls[::step][:4]
+        with _state_write_lock:
+            _sf_st = store.load_state()
+            _sf_st["style_frames"] = [{"id": store.new_id("sf"), "url": u}
+                                       for u in _style_picks]
+            store.save_state(_sf_st)
+        print(f"[autopilot] style_frames pinned: {len(_style_picks)} frames "
+              f"from the reference video(s)", flush=True)
+
+    if not body.keep_style:
+        # COPY THE REFERENCE VIDEO'S LOOK COMPLETELY. The World Bible
+        # (master_prompt) is prepended to EVERY image prompt as "WORLD / STYLE
+        # BIBLE", so a bible left over from another project would override the
+        # analysed style no matter what anchors/notes are set. Replace it with
+        # one written from the analysis; the old bible is kept in
+        # master_prompt_backup (restore it in the Universe tab if needed).
+        _summary = (insp.get("style_summary") or "").strip()
+        if _summary:
+            _bible = ("VISUAL STYLE — match the reference video exactly: "
+                      + _summary)
+            _speech = (insp.get("speech_style") or "").strip()
+            if _speech:
+                _bible += "\n\nNARRATION STYLE: " + _speech
+            with _state_write_lock:
+                _mb_st = store.load_state()
+                _old_bible = (_mb_st.get("master_prompt") or "").strip()
+                if _old_bible and _old_bible != _bible:
+                    _mb_st["master_prompt_backup"] = _old_bible
+                _mb_st["master_prompt"] = _bible
+                store.save_state(_mb_st)
+            print("[autopilot] World Bible rewritten from reference-video "
+                  "analysis (old bible saved to master_prompt_backup)",
+                  flush=True)
+
     # ---- STEP 2: Pick a suggestion and generate a script ----
     _check_stop(run_id)
     _ap_prog(run_id, step="script")
@@ -4580,16 +5657,52 @@ def api_autopilot(body: AutopilotIn, request: Request):
         f"Visual style: {pick['image_prompt_style']}" if pick.get("image_prompt_style") else "",
         f"Voice-over: {pick['voiceover_style']}" if pick.get("voiceover_style") else "",
     ]))
-    pacing = pick.get("pacing_seconds", 1.0)
-    total_dur = pick.get("total_duration", 30.0)
-    # A user-supplied target length wins — drives how much script Claude writes.
+    # User values ALWAYS override AI suggestions.  Pacing defaults to 1s/frame
+    # so that video-length and frame-count are obvious (frames = length ÷ pacing).
+    total_dur = float(body.target_seconds) if (body.target_seconds and body.target_seconds > 0) \
+        else float(pick.get("total_duration", 30.0))
+    pacing = float(body.pacing_seconds) if (body.pacing_seconds and body.pacing_seconds > 0) \
+        else float(pick.get("pacing_seconds", 1.0))
+    # User pacing ALWAYS wins — never let the AI's suggestion override it.
+    # When the user gives a target length we also cap pacing so we never get
+    # fewer than 1 image per 2 seconds on long videos.
     if body.target_seconds and body.target_seconds > 0:
-        total_dur = float(body.target_seconds)
+        pacing = min(pacing, 2.0)
     num_chars = pick.get("num_characters", 2)
-    style_notes = (pick.get("image_prompt_style") or "")[:80]
+    if body.num_characters is not None and body.num_characters >= 0:
+        num_chars = int(body.num_characters)
+    style_notes = _sanitize_prompt(pick.get("image_prompt_style") or "")
+    if body.keep_style:
+        # Locked look: use the project's own style notes for every generation
+        # instead of the analysed video's suggested style.
+        style_notes = (st.get("style_notes") or "").strip() or style_notes
+    elif not style_notes:
+        # Copying the reference style but the pick has no image_prompt_style —
+        # use the analysed style summary rather than leaving another project's
+        # stale notes in place.
+        style_notes = _sanitize_prompt(analysis.get("style_summary") or "")
 
+    # Persist style_notes to state so _render_one can prepend it to every
+    # image-generation prompt — characters, scene frames, all of them.
+    # When copying the reference style this OVERWRITES stale notes (even with
+    # an empty string) so nothing from a previous project leaks in.
+    if not body.keep_style:
+        with _state_write_lock:
+            _sn_st = store.load_state()
+            _sn_st["style_notes"] = style_notes
+            store.save_state(_sn_st)
+        print(f"[autopilot] style_notes saved: {style_notes[:80]}", flush=True)
+
+    # The EXACT number of frames the user asked for.  Everything downstream
+    # is driven by this — script, planner, and image generation all target it.
+    expected_scenes = max(1, round(max(1.0, total_dur) / max(0.1, pacing)))
+    print(f"[autopilot] target: {expected_scenes} frames "
+          f"({total_dur}s ÷ {pacing}s/frame)", flush=True)
+
+    # ── Script generation (attempt 1) ──────────────────────────────────────
     try:
-        raw = claude.generate_script(
+        script = _generate_script_validated(
+            claude,
             title=title, description=desc,
             total_duration=max(1.0, total_dur),
             pacing_seconds=max(0.1, pacing),
@@ -4598,9 +5711,94 @@ def api_autopilot(body: AutopilotIn, request: Request):
             master_prompt=st["master_prompt"],
             dynamic=body.dynamic,
         )
-        script = extract_json(raw)
     except Exception as e:
         raise HTTPException(500, f"Script generation failed: {e}")
+
+    _pre_actual = len(script.get("scenes") or [])
+    print(f"[autopilot] script attempt 1: {_pre_actual}/{expected_scenes} scenes",
+          flush=True)
+
+    # ── Retry if Claude badly undershoots (<60 %) ──────────────────────────
+    if _pre_actual < expected_scenes * 0.6 and expected_scenes > 4:
+        try:
+            raw2 = claude.generate_script(
+                title=title,
+                description=(
+                    desc + f"\n\nCRITICAL: This is a FAST-CUT video that needs "
+                    f"EXACTLY {expected_scenes} scenes. The previous attempt only had "
+                    f"{_pre_actual} scenes — that is NOT acceptable. Write all "
+                    f"{expected_scenes} unique visual moments now, numbered 1 to "
+                    f"{expected_scenes}. Do not stop early."
+                ),
+                total_duration=max(1.0, total_dur),
+                pacing_seconds=max(0.1, pacing),
+                num_characters=max(0, num_chars),
+                style_notes=style_notes,
+                master_prompt=st["master_prompt"],
+                dynamic=body.dynamic,
+            )
+            script2 = extract_json(raw2)
+            if len(script2.get("scenes") or []) > _pre_actual:
+                script = script2
+                print(f"[autopilot] retry improved: "
+                      f"{len(script.get('scenes',[]))} scenes", flush=True)
+        except Exception:
+            pass
+
+    # ── Fill remaining missing scenes with unique Claude-generated prompts ──
+    # This replaces the mechanical camera-angle split: Claude writes genuinely
+    # different visual moments for every missing slot.
+    _actual_now = len(script.get("scenes") or [])
+    if _actual_now < expected_scenes:
+        _missing = expected_scenes - _actual_now
+        print(f"[autopilot] filling {_missing} missing scenes via Claude",
+              flush=True)
+        try:
+            raw_fill = claude.generate_missing_scenes(
+                existing_scenes=script.get("scenes") or [],
+                needed=_missing,
+                voiceover=script.get("voiceover", ""),
+                style_notes=style_notes,
+                master_prompt=st["master_prompt"],
+            )
+            fill_data = extract_json(raw_fill)
+            new_scenes = fill_data.get("scenes") or []
+            for sc in new_scenes:
+                if sc.get("prompt"):
+                    sc["prompt"] = _sanitize_prompt(sc["prompt"])
+            if new_scenes:
+                script["scenes"] = (script.get("scenes") or []) + new_scenes
+                print(f"[autopilot] after fill: "
+                      f"{len(script['scenes'])} scenes", flush=True)
+        except Exception as fill_ex:
+            print(f"[autopilot] Claude fill failed ({fill_ex}); using split",
+                  flush=True)
+            script = _split_script_scenes(script, expected_scenes)
+
+    # ── Trim if over (shouldn't happen, but be safe) ───────────────────────
+    if len(script.get("scenes") or []) > expected_scenes:
+        script["scenes"] = script["scenes"][:expected_scenes]
+
+    # Normalize alias field names (visual->prompt, scene->n, caption->frame text)
+    # across ALL scenes — including any added by the retry/fill/split paths —
+    # so every frame renders from its real VISUAL description, not the narration.
+    script["scenes"] = _normalize_scenes(script.get("scenes"))
+    script["scene_count"] = len(script.get("scenes") or [])
+    print(f"[autopilot] final scene count: {script['scene_count']}", flush=True)
+
+    # ── Sanitize all prompts ───────────────────────────────────────────────
+    for sc in (script.get("scenes") or []):
+        if sc.get("prompt"):
+            sc["prompt"] = _sanitize_prompt(sc["prompt"])
+    for ch in (script.get("characters") or []):
+        if ch.get("sheet_prompt"):
+            ch["sheet_prompt"] = _sanitize_prompt(ch["sheet_prompt"])
+
+    # ── Character count enforcement ────────────────────────────────────────
+    target_chars = max(0, num_chars)
+    raw_chars = script.get("characters") or []
+    if len(raw_chars) > target_chars:
+        script["characters"] = raw_chars[:target_chars]
 
     st = store.load_state()
     st["script"] = script
@@ -4608,6 +5806,32 @@ def api_autopilot(body: AutopilotIn, request: Request):
     steps.append({"step": "script", "scenes": len(script.get("scenes") or []),
                   "characters": len(script.get("characters") or [])})
     store.log_usage("script", 1, 0.01)
+
+    # ── STEP 2.5: Claude cut planner ──────────────────────────────────────
+    # Claude assigns a hold_seconds to every scene BEFORE image generation so
+    # the video editor knows exactly how long each frame appears on screen.
+    # This is the "planner" step — it uses narration energy, line length, and
+    # story beats to choose cut points rather than equal-time splits.
+    _check_stop(run_id)
+    _ap_prog(run_id, step="plan")
+    _vo_lines = [(sc.get("vo") or "").strip()
+                 for sc in (script.get("scenes") or [])]
+    if _vo_lines and body.smart_edit:
+        try:
+            _planned = claude.edit_holds(_vo_lines, total_dur)
+            if _planned and len(_planned) == len(_vo_lines):
+                for i, sc in enumerate(script["scenes"]):
+                    sc["planned_hold"] = _planned[i]
+                _sf_plan = store.load_state()
+                _sf_plan["script"] = script
+                store.save_state(_sf_plan)
+                print(f"[autopilot] cut plan: "
+                      f"{[round(h,2) for h in _planned]}", flush=True)
+        except Exception as plan_ex:
+            print(f"[autopilot] planner skipped: {plan_ex}", flush=True)
+    steps.append({"step": "plan",
+                  "holds": [sc.get("planned_hold") for sc in
+                             (script.get("scenes") or [])]})
 
     # ---- STEP 3: Generate character sheets ----
     _check_stop(run_id)
@@ -4618,6 +5842,7 @@ def api_autopilot(body: AutopilotIn, request: Request):
              frames_total=_scene_total)
     img_client = get_image_client(request)
     char_created = []
+    char_fatal_err = None
     for c in chars:
         _check_stop(run_id)
         name = (c.get("name") or "").strip()
@@ -4625,13 +5850,42 @@ def api_autopilot(body: AutopilotIn, request: Request):
         if not name:
             continue
 
-        def _make_sheet(name=name, sheet_prompt=sheet_prompt):
-            prompt = pipeline.build_sheet_prompt(st["master_prompt"], name, sheet_prompt)
-            img = img_client.generate(prompt, size=size, quality=quality)
+        _sheet_box = {}
+
+        def _make_sheet(name=name, sheet_prompt=sheet_prompt, _sn=style_notes):
+            _cur = store.load_state()
+            prompt = pipeline.build_sheet_prompt(
+                _cur["master_prompt"], name, sheet_prompt,
+                style_notes=(_cur.get("style_notes") or _sn or ""))
+            # Anchor the character's ART STYLE to the uploaded reference video's
+            # pinned frames (the same ones the scene images use) so characters
+            # match the source look — not just the text description.
+            _style_refs, _labels = [], []
+            for _sf in (_cur.get("style_frames") or [])[:3]:
+                try:
+                    _style_refs.append(store.read_image(_sf["url"]))
+                    _labels.append("STYLE REF — match this art style")
+                except Exception:
+                    pass
+            if _style_refs:
+                _edit_prompt = (prompt + "\n\nReproduce the EXACT art style of the "
+                                "attached reference frame(s) from the source video — "
+                                "same rendering technique, colour palette, line work, "
+                                "shading, texture and proportions. Draw THIS character "
+                                "in that style; do not copy the people in the "
+                                "reference frames.")
+                _multi = bool(request and request.state.settings.get("multi_image_edit"))
+                _send = (_style_refs if _multi
+                         else ([pipeline.contact_sheet(_style_refs, labels=_labels)]
+                               if len(_style_refs) > 1 else _style_refs))
+                img = img_client.edit(_edit_prompt, _send, size=size, quality=quality)
+            else:
+                img = img_client.generate(prompt, size=size, quality=quality)
+            sheet_url = store.write_image("characters", img)
             rec = {
                 "id": store.new_id("char"), "name": name,
                 "description": sheet_prompt,
-                "sheet_url": store.write_image("characters", img),
+                "sheet_url": sheet_url,
                 "prompt": prompt, "source": "generated",
             }
             with _state_write_lock:
@@ -4639,38 +5893,141 @@ def api_autopilot(body: AutopilotIn, request: Request):
                 cur["characters"].append(rec)
                 store.save_state(cur)
             store.log_usage("image", 1, 0.08)
+            _sheet_box["url"] = sheet_url
             return name
         try:
-            # Auto-proceed if a single sheet stalls past the step timeout; it
-            # finishes in the background and just shows up a moment later.
             finished, val = _run_with_deadline(_make_sheet, step_to)
             if finished and val:
                 char_created.append(val)
-        except Exception:
-            pass
-        _ap_prog(run_id, chars_done=len(char_created))
-    steps.append({"step": "characters", "created": len(char_created)})
+        except Exception as ce:
+            cmsg = str(ce)
+            print(f"[autopilot] character sheet '{name}' FAILED: {cmsg}", flush=True)
+            # Account-level image failures (no credits / bad key) will fail every
+            # remaining sheet AND every frame — stop and surface the real cause
+            # instead of silently producing zero sheets.
+            if _is_fatal_image_error(cmsg):
+                char_fatal_err = cmsg
+                print("[autopilot] aborting character sheets — image account is "
+                      "out of credits or the key is invalid", flush=True)
+                break
+        _ap_prog(run_id, chars_done=len(char_created),
+                 last_image_url=_sheet_box.get("url"))
+    if char_fatal_err:
+        char_err_hint = ("character sheets failed — image account problem: "
+                         f"{char_fatal_err[:240]}")
+    elif chars and not char_created:
+        char_err_hint = (f"0 of {len(chars)} character sheets rendered — check the "
+                         "image API key/credits and size in Settings")
+    else:
+        char_err_hint = None
+    steps.append({"step": "characters", "created": len(char_created),
+                  "requested": len(chars), "error": char_err_hint})
 
     # ---- STEP 4: Batch render sequence frames ----
     _check_stop(run_id)
     _ap_prog(run_id, step="frames")
-    scenes = script.get("scenes") or []
+    scenes = list(script.get("scenes") or [])
+
+    # Hard guarantee: if split / retry still left fewer scenes than expected,
+    # extend by repeating the last scene's prompt with progressive moment cues.
+    _final_expected = max(1, round(total_dur / max(0.1, pacing)))
+    while len(scenes) < _final_expected:
+        _last = scenes[-1] if scenes else {}
+        _base_p = (_last.get("prompt") or "").strip()
+        _cue = _MOMENT_CUES[(len(scenes) % (len(_MOMENT_CUES) - 1)) + 1]
+        scenes.append({
+            "n": len(scenes) + 1,
+            "heading": _last.get("heading", "continuation"),
+            "action": "", "vo": "",
+            "prompt": f"{_base_p}, {_cue}" if _base_p else _base_p,
+        })
+    print(f"[autopilot] rendering {len(scenes)} frames "
+          f"(expected={_final_expected}, pacing={pacing}s, dur={total_dur}s)",
+          flush=True)
+
+    # Map character names -> sheet ids so each scene attaches the RIGHT sheets.
+    _cur_chars = store.load_state().get("characters") or []
+
+    def _scene_char_ids(scene, render_prompt):
+        """Which character sheets belong on THIS frame: match names across the
+        scene's prompt/action/vo (broader than the render prompt alone). For a
+        single-protagonist video, keep that one character present even when a
+        scene doesn't name them, so the lead stays consistent frame-to-frame."""
+        if not _cur_chars:
+            return None
+        hay = " ".join([render_prompt or "", scene.get("prompt", ""),
+                        scene.get("action", ""), scene.get("vo", "")])
+        ids = [c["id"] for c in pipeline.match_characters(hay, _cur_chars)]
+        if not ids and len(_cur_chars) == 1:
+            ids = [_cur_chars[0]["id"]]
+        return ids or None
+
+    angle_on = bool(getattr(body, "angle_variety", True))
+
     frames_ok, frames_fail = 0, 0
-    for sc in scenes:
+    fatal_image_err = None
+    _skipped_blank = 0
+    for _scene_i, sc in enumerate(scenes):
         _check_stop(run_id)
         p = (sc.get("prompt") or "").strip()
         if not p:
-            continue
+            # Don't silently drop a scene with no image prompt — that produced
+            # the "0 frames rendered (0 failed)" dead-end. Synthesize a prompt
+            # from whatever the scene does have (action / vo / heading) plus the
+            # project style notes, so every scene still yields a frame.
+            _bits = [b for b in [sc.get("action"), sc.get("vo"),
+                                 sc.get("heading")] if (b or "").strip()]
+            p = _sanitize_prompt(", ".join(_bits).strip())
+            if style_notes:
+                p = (p + ". " + style_notes).strip(" .") if p else style_notes
+            if not p:
+                _skipped_blank += 1
+                print(f"[autopilot] scene={sc.get('n','?')} has no prompt/action/vo "
+                      "— skipped", flush=True)
+                continue
+            print(f"[autopilot] scene={sc.get('n','?')} had no prompt — "
+                  f"synthesized from action/vo: {p[:70]}", flush=True)
+        # Micro-cut angle variety: append a cycling camera cue so consecutive
+        # frames change angle (close-up -> wide -> low -> cutaway -> ...), unless
+        # the prompt already specifies its own framing.
+        if angle_on and not _has_camera_language(p):
+            _cue = _angle_cue_for(_scene_i)
+            if _cue:
+                p = f"{p}, {_cue}"
+        # Resolve which character sheets anchor this exact frame.
+        _scene_ids = _scene_char_ids(sc, p)
         # Each frame self-heals via the image_queue throttle (backoff + cooldown
         # on rate limits) so the run no longer dies on a single 429.
         try:
             rec = _render_one(p, size, quality, True, True,
-                              character_ids=None, request=request)
+                              character_ids=_scene_ids, request=request)
             frames_ok += 1
-        except Exception:
+            _ap_prog(run_id, frames_done=frames_ok + frames_fail,
+                     frames_failed=frames_fail,
+                     last_image_url=rec.get("image_url"))
+        except Exception as ex:
             frames_fail += 1
-        _ap_prog(run_id, frames_done=frames_ok + frames_fail)
-    steps.append({"step": "frames", "rendered": frames_ok, "failed": frames_fail})
+            msg = str(ex)
+            print(f"[autopilot] frame scene={sc.get('n','?')} FAILED: {msg}", flush=True)
+            _ap_prog(run_id, frames_done=frames_ok + frames_fail,
+                     frames_failed=frames_fail)
+            # Account-level failures (no credits / bad key) will fail every
+            # remaining frame too — stop burning attempts and surface the cause.
+            if _is_fatal_image_error(msg):
+                fatal_image_err = msg
+                print("[autopilot] aborting remaining frames — image account "
+                      "is out of credits or the key is invalid", flush=True)
+                break
+    if frames_fail and fatal_image_err:
+        frame_err_hint = (f"{frames_fail} frame(s) failed — image account problem: "
+                          f"{fatal_image_err[:240]}")
+    elif frames_fail:
+        frame_err_hint = (f"{frames_fail}/{frames_fail+frames_ok} frames failed — "
+                          "check image API key/size in Settings")
+    else:
+        frame_err_hint = None
+    steps.append({"step": "frames", "rendered": frames_ok, "failed": frames_fail,
+                  "error": frame_err_hint})
 
     # ---- STEP 5: Voice-over + video assembly (natural flow) ----
     #  ONE continuous narration track + frames timed to it + micro-cuts on long
@@ -4681,8 +6038,35 @@ def api_autopilot(body: AutopilotIn, request: Request):
     seq = st.get("sequence") or []
     video_url = None
     total_seconds = 0
+    video_err = None
     vo_text = _script_voiceover_text(st)
-    if seq and vo_text:
+    min_frames = max(2, int(_final_expected * 0.5)) if _final_expected > 1 else 1
+    if not seq:
+        if frames_ok == 0 and frames_fail == 0:
+            # Nothing was even attempted — the script came back with no usable
+            # scene prompts (often because the LLM/router was unreachable).
+            video_err = (
+                f"No frames were rendered — the script produced no image prompts "
+                f"({_skipped_blank} empty scene(s), 0 attempted). This usually means "
+                "the Claude/router connection failed during script generation. "
+                "Check the Claude connection in Settings (or start your 9Router), "
+                "then re-run.")
+        else:
+            video_err = (f"No frames were rendered ({frames_fail} failed). "
+                         + (f"Cause: {fatal_image_err[:200]}" if fatal_image_err else
+                            "Check your image API key and size in Settings, then re-run."))
+        print(f"[autopilot] video step skipped — no frames in sequence: {video_err}", flush=True)
+    elif len(seq) < min_frames:
+        video_err = (f"Only {len(seq)} of {_final_expected} frames rendered — "
+                     "refusing to build a broken video. "
+                     + (f"Cause: {fatal_image_err[:200]}. " if fatal_image_err else "")
+                     + "Fix the image account in Settings, render the missing "
+                       "frames (Sequence tab), then use 🔁 Build video.")
+        print(f"[autopilot] video step skipped — too few frames: {video_err}", flush=True)
+    elif not vo_text:
+        video_err = "No voice-over text found in script."
+        print(f"[autopilot] video step skipped — {video_err}", flush=True)
+    else:
         # Awaited fully (NOT under a deadline): it's the core deliverable, and a
         # backgrounded build would later save a stale state and clobber the
         # thumbnail/SEO saved after it. Its sub-calls (TTS/ffmpeg) are bounded.
@@ -4692,14 +6076,21 @@ def api_autopilot(body: AutopilotIn, request: Request):
                 transition=body.transition, width=width,
                 height=height, fps=body.fps, max_hold=body.max_hold,
                 motion=body.motion, name_hint="autopilot_vo",
-                sound_design=body.sound_design)
-        except HTTPException:
-            pass
+                sound_design=body.sound_design,
+                smart_edit=body.smart_edit,
+                cut_clicks=body.cut_clicks,
+                cut_click_volume=body.cut_click_volume,
+                cut_click_style=body.cut_click_style)
+        except HTTPException as he:
+            video_err = str(he.detail)
+            print(f"[autopilot] video step FAILED: {he.detail}", flush=True)
         except Exception as ex:
-            print(f"[autopilot] video step skipped: {ex}", flush=True)
+            video_err = str(ex)
+            print(f"[autopilot] video step FAILED: {ex}", flush=True)
 
     steps.append({"step": "video", "url": video_url,
-                  "duration": total_seconds, "scenes_voiced": len(seq)})
+                  "duration": total_seconds, "scenes_voiced": len(seq),
+                  "error": video_err})
 
     # ---- STEP 6: Thumbnail ----
     _check_stop(run_id)
@@ -4708,28 +6099,61 @@ def api_autopilot(body: AutopilotIn, request: Request):
     try:
         thumb_title = title or (script.get("title") or "")
         style_hint = analysis.get("style_summary") or st.get("master_prompt", "")
-        ref_urls = [fr["image_url"] for fr in (st.get("sequence") or [])[:4]]
-        bits = []
-        if thumb_title.strip():
-            bits.append(f'A bold, scroll-stopping YouTube thumbnail (16:9) for: "{thumb_title}".')
-        else:
-            bits.append("A bold, scroll-stopping YouTube thumbnail (16:9).")
-        if style_hint:
-            bits.append(f"Match this visual style: {style_hint[:200]}")
-        bits.append("Single clear focal subject, dramatic cinematic lighting, high "
-                    "contrast, vivid punchy colours, strong sense of depth. Leave clean "
-                    "negative space on one side for a short title overlay. Ultra-crisp and "
-                    "professional. No watermark, no logos, no garbled text.")
-        prompt = "\n".join(bits)
-        refs = []
-        for u in ref_urls:
+        st = store.load_state()
+        # Sample the LOOK from the uploaded reference video: its pinned style
+        # frames are the primary style/composition guide for the thumbnail, so
+        # the thumbnail matches the source video instead of a generic render.
+        style_frame_urls = [sf["url"] for sf in (st.get("style_frames") or [])][:3]
+        seq_urls = [fr["image_url"] for fr in (st.get("sequence") or [])]
+        subject_url = seq_urls[0] if seq_urls else None   # the hook frame = hero
+
+        refs, ref_labels = [], []
+        for u in style_frame_urls:
             try:
                 refs.append(store.read_image(u))
+                ref_labels.append("STYLE REF — match this look")
+            except Exception:
+                pass
+        if subject_url:
+            try:
+                refs.append(store.read_image(subject_url))
+                ref_labels.append("SUBJECT")
             except Exception:
                 pass
 
+        bits = []
+        if thumb_title.strip():
+            bits.append(f'Design a BOLD, scroll-stopping YouTube thumbnail (16:9) for: "{thumb_title}".')
+        else:
+            bits.append("Design a BOLD, scroll-stopping YouTube thumbnail (16:9).")
+        if style_frame_urls:
+            bits.append("Reproduce the EXACT art style of the attached cells labelled "
+                        "\"STYLE REF\" (frames from the source video) — same rendering, "
+                        "palette, line work and texture." + (f" Style notes: {style_hint[:160]}" if style_hint else ""))
+        elif style_hint:
+            bits.append(f"Match this visual style exactly: {style_hint[:200]}")
+        bits.append(
+            "Make it click-worthy like the best YouTube thumbnails: ONE large "
+            "expressive focal subject with exaggerated emotion or dramatic action, "
+            "pushed-up contrast and saturation, punchy complementary colours, "
+            "strong rim/back lighting, clear depth and crisp separation from the "
+            "background, a touch of wide-angle drama. Rule-of-thirds composition; "
+            "keep clean negative space on ONE side for a short bold title overlay. "
+            "Ultra-crisp and professional. No watermark, no logos, no borders, no "
+            "tiny or garbled text.")
+        # Match the source video's flat cartoon look for flat/stick-figure styles.
+        if pipeline._is_flat_style(style_hint, st.get("master_prompt", "")):
+            bits.append(pipeline._FLAT_DIRECTIVE)
+        prompt = "\n".join(bits)
+
         if refs:
-            img = img_client.edit(prompt=prompt, images=refs[:1],
+            # Full-res separate refs when the endpoint supports multi-image,
+            # else composite into ONE labeled grid (single-image edit path).
+            _multi = bool(request.state.settings.get("multi_image_edit"))
+            send = (refs if _multi
+                    else ([pipeline.contact_sheet(refs, labels=ref_labels)]
+                          if len(refs) > 1 else refs))
+            img = img_client.edit(prompt=prompt, images=send,
                                   size="1536x1024", quality=quality)
         else:
             img = img_client.generate(prompt, size="1536x1024", quality=quality)
@@ -4748,8 +6172,8 @@ def api_autopilot(body: AutopilotIn, request: Request):
         store.save_state(st)
         thumb_url = final_url
         store.log_usage("thumbnail", 1, 0.08)
-    except Exception:
-        pass
+    except Exception as _th_ex:
+        print(f"[autopilot] thumbnail step failed: {_th_ex}", flush=True)
 
     steps.append({"step": "thumbnail", "url": thumb_url})
 
@@ -4787,7 +6211,56 @@ def api_autopilot(body: AutopilotIn, request: Request):
         "steps": steps,
         "suggestion": pick,
         "video_url": video_url,
+        "video_error": video_err,
+        "frame_error": frame_err_hint,
         "thumbnail_url": thumb_url,
         "total_duration": total_seconds,
         "seo": seo,
     }
+
+
+# --------------------------------------------------------------------------- #
+#  Build-video: assemble ElevenLabs voice + SFX + frames into MP4 from current
+#  project state — usable standalone or as a retry after autopilot frame fails.
+# --------------------------------------------------------------------------- #
+class BuildVideoIn(BaseModel):
+    voice_id: Optional[str] = None
+    transition: str = "cut"
+    width: int = 1920
+    height: int = 1080
+    fps: int = 30
+    max_hold: float = 2.5
+    motion: bool = False
+    sound_design: bool = True
+    text_override: Optional[str] = None   # use custom VO text instead of script
+    cut_clicks: bool = False
+    cut_click_volume: float = 0.30
+    cut_click_style: str = "click"
+    manual_holds: Optional[List[float]] = None   # per-frame seconds from Review popup
+
+
+@app.post("/api/build-video")
+def api_build_video(body: BuildVideoIn, request: Request):
+    """Assemble ElevenLabs voice-over + SFX + rendered frames into a final MP4.
+    Works on the current project state — call this after rendering frames when
+    the autopilot's video step failed, or to rebuild the video with new settings."""
+    s = request.state.settings
+    if not _has_voice_key(s):
+        raise HTTPException(400, "No voice/TTS key — add ElevenLabs or MiMo in Settings.")
+    st = store.load_state()
+    seq = st.get("sequence") or []
+    if not seq:
+        raise HTTPException(400, "No frames in sequence — render frames first (Sequence tab).")
+    voice_id = body.voice_id or _voice_default_id(s)
+    text = (body.text_override or "").strip() or _script_voiceover_text(st)
+    if not text:
+        raise HTTPException(400, "No voice-over text — generate a script first.")
+    _edit_rec, video_url, total_seconds, scene_map = _build_flow_video(
+        st, request, voice_id=voice_id, text=text,
+        transition=body.transition, width=body.width, height=body.height,
+        fps=body.fps, max_hold=body.max_hold, motion=body.motion,
+        name_hint="build_video", sound_design=body.sound_design,
+        cut_clicks=body.cut_clicks, cut_click_volume=body.cut_click_volume,
+        cut_click_style=body.cut_click_style, manual_holds=body.manual_holds)
+    return {"ok": True, "video_url": video_url, "duration": total_seconds,
+            "frames": len(seq), "scene_map": scene_map}

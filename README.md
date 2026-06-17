@@ -43,7 +43,9 @@ It ties together **Claude (Anthropic)** for reasoning and **DeRouter** for image
 | 🎥 **Video → Prompts** | Upload a reference video; Claude Vision creates matching image prompts |
 | ✂️ **Scene Detection** | FFmpeg-powered cut detection and timestamp extraction |
 | 🗣️ **Voice-Over** | ElevenLabs integration for per-scene or full-script narration |
-| 🎞️ **Auto Edit + Render** | Claude plans the EDL, FFmpeg assembles the final MP4 |
+| 🎞️ **Auto Edit + Render** | Claude plans the EDL **with the narration text** so cuts match what's being said; FFmpeg assembles the final MP4 |
+| 🖱️ **Cut Clicks** | ElevenLabs-generated click/whoosh/pop SFX mixed at **every frame change** (cached, style + volume configurable) |
+| 🎮 **Neon Arena UI** | Premium gaming-style interface: HUD tabs, energy bars, cyber grid, WebAudio UI sounds (toggle with 🔊) |
 | 📦 **Project Export** | One-click ZIP export of assets, scripts, prompts, and renders |
 
 </div>
@@ -131,6 +133,29 @@ CLAUDE_MODEL=claude-sonnet-4-6
 ELEVENLABS_API_KEY=...
 ```
 
+### 🔀 Optional: route Claude through 9Router (token saver)
+
+Continuity Studio can route its **Claude/text calls** (script gen, vision
+prompts, edit planning) through a locally-running
+[**9Router**](https://github.com/decolua/9router) instance for 20–40% token
+savings and free/cheap multi-provider fallback. It's a drop-in alternative
+provider — image generation is unaffected.
+
+```bash
+npm install -g 9router
+9router            # dashboard at http://localhost:20128
+```
+
+Then in **Settings → Claude account → Provider**, pick **9Router**, paste the
+API key from the 9Router dashboard, choose a model (e.g.
+`kr/claude-sonnet-4.5`), and **Connect**. Or set it via `.env`:
+
+```txt
+NINEROUTER_API_KEY=...
+NINEROUTER_BASE_URL=http://localhost:20128
+NINEROUTER_MODEL=kr/claude-sonnet-4.5
+```
+
 ---
 
 ## 📁 Project Map
@@ -171,6 +196,13 @@ ELEVENLABS_API_KEY=...
 | `POST` | `/api/edit-plan` | Claude EDL planning |
 | `POST` | `/api/render-video` | FFmpeg final render |
 | `GET`  | `/api/export/package` | ZIP download |
+
+> All video-building endpoints (`/api/render-video`, `/api/voiceover/scenes`,
+> `/api/voiceover/auto`, `/api/voiceover/auto-synced`, `/api/voiceover/auto-flow`,
+> `/api/build-video`, `/api/autopilot`) accept `cut_clicks: bool`,
+> `cut_click_volume: float` and `cut_click_style: "click"|"camera"|"whoosh"|"pop"|"tick"` —
+> a short ElevenLabs-generated sound is mixed at every frame change
+> (generated once per style, then disk-cached in `data/sfx_cache/`).
 
 ---
 
