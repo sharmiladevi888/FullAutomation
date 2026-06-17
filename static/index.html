@@ -1608,10 +1608,10 @@ Close-up of @Mira fixing a circuit board, sparks reflecting on her goggles
       <div id="scriptActions" style="display:none; margin-top:16px; flex-direction:column; gap:12px">
         <div style="display:flex; gap:8px; flex-wrap:wrap">
           <button class="btn sm claude" id="scEditBtn" onclick="toggleScriptEdit()">✎ Edit script</button>
-          <button class="btn sm outline" onclick="scTranslate()">🌐 Translate</button>
-          <button class="btn sm outline" onclick="scTone()">🎭 Tone</button>
-          <button class="btn sm outline" onclick="scHooks()">🪝 Hooks</button>
-          <button class="btn sm outline" onclick="scOutline()">🧭 Outline</button>
+          <button class="btn sm outline" onclick="scTranslate(this)">🌐 Translate</button>
+          <button class="btn sm outline" onclick="scTone(this)">🎭 Tone</button>
+          <button class="btn sm outline" onclick="scHooks(this)">🪝 Hooks</button>
+          <button class="btn sm outline" onclick="scOutline(this)">🧭 Outline</button>
           <button class="btn sm outline" onclick="scSeo()">🔎 SEO</button>
         </div>
         <div style="display:flex; gap:10px; flex-wrap:wrap">
@@ -2854,12 +2854,18 @@ function _fillAIModelSelects(){
   fillSelect("#scModel", list, dd);
   fillSelect("#ytaModel", list, dd);
 }
-function switchClaudeProvider(p){
+async function switchClaudeProvider(p){
+  const prev=CFG.claude_provider;
   CFG.claude_provider=p;
-  api("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({claude_provider:p})});
   renderClaudeProviderUI();
   const labels={derouter:"derouter proxy",anthropic:"Anthropic direct","9router":"9Router (local)",agentrouter:"AgentRouter"};
-  toast("AI provider → "+(labels[p]||p),"ok");
+  try{
+    await api("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({claude_provider:p})});
+    toast("AI provider → "+(labels[p]||p),"ok");
+  }catch(e){
+    CFG.claude_provider=prev; renderClaudeProviderUI();
+    toast("Couldn't switch provider: "+e.message,"err");
+  }
 }
 function _deactivateOtherClaudeProviders(activeProvider){
   // Mark all non-active provider status dots as "not active" so it's clear
@@ -4068,25 +4074,27 @@ async function regenScene(n, btn){
     STATE.script=d.script; renderScript(); toast("Scene "+pad(n)+" rewritten ✓","ok");
   }catch(e){ toast(e.message,"err"); } finally{ busy(btn,false); }
 }
-async function scTranslate(){
+async function scTranslate(btn){
   if(!_hasVOText()){ toast("Generate a script first","err"); return; }
   const lang=await uiPrompt("Translate script","Target language (e.g. Spanish, Hindi, Japanese)","Spanish");
   if(!lang) return;
-  toast("Translating…");
+  busy(btn,true,"Translating…"); toast("Translating…");
   try{ const d=await api("/api/script/translate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({lang, model:$("#scModel")?.value||null})}); STATE.script=d; renderScript(); toast("Translated to "+lang+" ✓","ok"); }
   catch(e){ toast(e.message,"err"); }
+  finally{ busy(btn,false); }
 }
-async function scTone(){
+async function scTone(btn){
   if(!_hasVOText()){ toast("Generate a script first","err"); return; }
   const tone=await uiPrompt("Rewrite tone","e.g. funnier · darker · for kids · more dramatic","funnier");
   if(!tone) return;
-  toast("Rewriting tone…");
+  busy(btn,true,"Rewriting…"); toast("Rewriting tone…");
   try{ const d=await api("/api/script/rewrite",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({tone, model:$("#scModel")?.value||null})}); STATE.script=d; renderScript(); toast("Rewritten ("+tone+") ✓","ok"); }
   catch(e){ toast(e.message,"err"); }
+  finally{ busy(btn,false); }
 }
-async function scHooks(){
+async function scHooks(btn){
   if(!STATE.script){ toast("Generate a script first","err"); return; }
-  toast("Writing hooks…");
+  busy(btn,true,"Writing…"); toast("Writing hooks…");
   try{
     const d=await api("/api/script/hooks",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({n:6, model:$("#scModel")?.value||null})});
     const hooks=d.hooks||[]; if(!hooks.length){ toast("No hooks returned","err"); return; }
@@ -4102,12 +4110,13 @@ async function scHooks(){
         toast("Hook set as opener ✓","ok"); }
     });
   }catch(e){ toast(e.message,"err"); }
+  finally{ busy(btn,false); }
 }
-async function scOutline(){
+async function scOutline(btn){
   const title=$("#scTitle").value.trim()||(STATE.script&&STATE.script.title)||"";
   const description=$("#scDesc").value.trim()||(STATE.script&&STATE.script.logline)||"";
   if(!title && !description){ toast("Add a title or description first","err"); return; }
-  toast("Building outline…");
+  busy(btn,true,"Outlining…"); toast("Building outline…");
   try{
     const d=await api("/api/script/outline",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({title, description, beats:6, model:$("#scModel")?.value||null})});
     const beats=d.beats||[]; if(!beats.length){ toast("No outline returned","err"); return; }
@@ -4118,6 +4127,7 @@ async function scOutline(){
     $("#uiModalBg").classList.add("show"); $("#uiCancel").onclick=()=>_closeUiModal();
     $("#uiUse").onclick=()=>{ $("#scDesc").value=beats.map((b,i)=>`${i+1}. ${b.title}: ${b.summary}`).join("\n"); _closeUiModal(); toast("Outline → description. Tweak then Generate.","ok"); $("#scDesc").scrollIntoView({behavior:"smooth",block:"center"}); };
   }catch(e){ toast(e.message,"err"); }
+  finally{ busy(btn,false); }
 }
 function copyVO(){
   const t=$("#voText").value||"";
