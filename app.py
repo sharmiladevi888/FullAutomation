@@ -2787,16 +2787,24 @@ def _bookend(out_path, intro, outro, w, h, fps):
 #  ElevenLabs voice-over — synthesize the script's narration into real audio
 # --------------------------------------------------------------------------- #
 def _script_voiceover_text(st) -> str:
-    """The full narration text: prefer the top-level voiceover, else stitch the
-    per-scene `vo` slices in order."""
+    """Full narration text. Unwraps scripts stored as JSON string in
+    sc['content'] (autopilot file-path-backed scripts)."""
     sc = st.get("script") or {}
-    vo = (sc.get("voiceover") or "").strip()
+    _inner = sc
+    _c = sc.get("content")
+    if _c and isinstance(_c, str):
+        try:
+            _inner = json.loads(_c)
+        except Exception:
+            pass
+    vo = (_inner.get("voiceover") or "").strip()
     if vo:
         return vo
-    return "\n\n".join(
-        (s.get("vo") or "").strip() for s in (sc.get("scenes") or [])
-        if (s.get("vo") or "").strip()
-    ).strip()
+    scenes = _inner.get("scenes") or []
+    parts = [(s.get("vo") or s.get("narration") or s.get("voice_over") or "").strip()
+             for s in scenes]
+    return "\n\n".join(p for p in parts if p).strip()
+
 
 
 def _scene_vo_lines(st):
