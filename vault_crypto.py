@@ -13,21 +13,32 @@ distinguish from plaintext during migration.
 import base64
 import json
 import os
+import threading
 
 import config
 
-_SENSITIVE_KEYS = {"api_key", "claude_api_key", "elevenlabs_api_key"}
+_SENSITIVE_KEYS = {"api_key", "claude_api_key", "elevenlabs_api_key", "anthropic_api_key", "openai_api_key", "ninerouter_api_key", "mimo_api_key", "agentrouter_api_key"}
 _ENC_PREFIX = "enc::"
 _SECRET_PATH = os.path.join(config.DATA_DIR, ".secret")
 
 _fernet = None
 _fallback = False
+_INIT_LOCK = threading.Lock()
 
 
 def _init_fernet():
     global _fernet, _fallback
     if _fernet is not None or _fallback:
         return
+    with _INIT_LOCK:
+        # Double-checked: another thread may have initialized while we waited.
+        if _fernet is not None or _fallback:
+            return
+        _init_fernet_locked()
+
+
+def _init_fernet_locked():
+    global _fernet, _fallback
 
     try:
         from cryptography.fernet import Fernet
@@ -58,8 +69,11 @@ def _init_fernet():
             pass
 
     key = Fernet.generate_key()
-    with open(_SECRET_PATH, "wb") as f:
+    # Atomic write so a concurrent reader never sees a half-written key file.
+    tmp = _SECRET_PATH + ".tmp"
+    with open(tmp, "wb") as f:
         f.write(key)
+    os.replace(tmp, _SECRET_PATH)
     _fernet = Fernet(key)
 
 

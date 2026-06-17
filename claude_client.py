@@ -11,6 +11,7 @@ SDK — we just point ``base_url`` at the derouter proxy.
 """
 import base64
 import json
+import math
 import re
 import sys
 from typing import List, Optional
@@ -83,9 +84,24 @@ class ClaudeClient:
         self.api_key = api_key or config.CLAUDE_API_KEY
         self.base_url = (base_url or config.CLAUDE_BASE_URL).rstrip("/")
         self.model = model or config.CLAUDE_MODEL
+        # AgentRouter requires "Authorization: Bearer <key>" rather than "x-api-key".
+        # Send both so the proxy can honour whichever it prefers without breaking
+        # other providers that only read x-api-key.
+        extra_headers: dict = {}
+        if "agentrouter" in self.base_url.lower():
+            extra_headers["Authorization"] = f"Bearer {self.api_key or 'unset'}"
+        # timeout: proxies (9Router's Claude OAuth route especially) sometimes
+        # stall without answering; the SDK default of 600s combined with its
+        # 2 internal retries meant a single call could hang ~30 minutes with
+        # no log output. Fail at 240s, disable SDK-internal retries, and let
+        # _msg's own 502/timeout backoff loop (which logs every attempt) own
+        # the retrying instead.
         self._sdk = anthropic.Anthropic(
             api_key=self.api_key or "unset",
             base_url=self.base_url,
+            timeout=240.0,
+            max_retries=0,
+            **({"default_headers": extra_headers} if extra_headers else {}),
         )
 
     def _require_key(self):
@@ -110,6 +126,21 @@ class ClaudeClient:
             return {"ok": False, "error": "no api key set"}
 
         ids = self._list_models_best_effort()
+
+        if self._is_openai_model():
+            # Non-Claude model (e.g. the user's ChatGPT account via 9Router):
+            # test over the OpenAI protocol, which is what _msg will use.
+            try:
+                # generous cap: gpt-5 reasoning models spend tokens thinking
+                # before emitting text, and an empty reply would read as a fail
+                self._msg_openai([{"type": "text", "text": "ping"}],
+                                 max_tokens=2000)
+                return {"ok": True, "models": ids,
+                        "configured_model": self.model,
+                        "base_url": self.base_url}
+            except Exception as e:
+                return {"ok": False, "error": str(e), "models": ids,
+                        "base_url": self.base_url}
 
         try:
             self._sdk.messages.create(
@@ -167,9 +198,92 @@ class ClaudeClient:
     # ------------------------------------------------------------------ #
     #  Low-level
     # ------------------------------------------------------------------ #
+    def _is_openai_model(self):
+        """True when the configured model is NOT a Claude model (e.g. cx/gpt-5.5
+        — the user's ChatGPT/Codex account via 9Router). Those models reject the
+        Anthropic protocol's max_tokens translation, so we speak the OpenAI chat
+        protocol directly instead."""
+        return bool(self.model) and "claude" not in self.model.lower()
+
+    def _fallback_chat_model(self):
+        """Emergency fallback for flaky local-router Claude routes: a non-Claude
+        model on the same router's OpenAI endpoint (the user's ChatGPT account).
+        Only active for local 9Router-style base URLs, where both accounts share
+        one API key."""
+        if self._is_openai_model():
+            return None
+        base = (self.base_url or "").lower()
+        if "localhost" in base or "127.0.0.1" in base:
+            return getattr(config, "CLAUDE_FALLBACK_MODEL", "") or None
+        return None
+
+    def _msg_openai(self, content_blocks, system: Optional[str] = None,
+                    max_tokens: int = 4096, model: str = None):
+        """OpenAI-protocol twin of _msg for non-Claude models behind an
+        OpenAI-compatible router (9Router /v1). Accepts the same Anthropic-style
+        content blocks (text + base64 images) and returns plain text."""
+        self._require_key()
+        model = model or self.model
+        parts = []
+        for b in content_blocks:
+            t = b.get("type")
+            if t == "text":
+                parts.append({"type": "text", "text": b.get("text", "")})
+            elif t == "image":
+                src = b.get("source") or {}
+                parts.append({"type": "image_url", "image_url": {
+                    "url": f"data:{src.get('media_type', 'image/jpeg')};"
+                           f"base64,{src.get('data', '')}"}})
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": parts})
+        base = self.base_url.rstrip("/")
+        if not base.endswith("/v1"):
+            base += "/v1"
+        _log(f"chat.completions model={model} "
+             f"max_completion_tokens={max_tokens} base={base}")
+        last_err = None
+        for attempt in range(1, CLAUDE_MAX_RETRIES + 2):
+            try:
+                with _CLAUDE_SEM:
+                    r = requests.post(
+                        f"{base}/chat/completions",
+                        headers={"Authorization": f"Bearer {self.api_key}",
+                                 "Content-Type": "application/json"},
+                        json={"model": model,
+                              "max_completion_tokens": max_tokens,
+                              "messages": messages},
+                        timeout=300)
+                if r.status_code == 429 or r.status_code >= 500:
+                    last_err = f"[{r.status_code}] {r.text[:300]}"
+                    _log(f"chat {r.status_code} (attempt {attempt}) — backing off")
+                    time.sleep(min(20, 2 ** attempt))
+                    continue
+                if r.status_code >= 400:
+                    raise RuntimeError(
+                        f"chat API error [{r.status_code}]: {r.text[:400]}")
+                data = r.json()
+                msg = (data.get("choices") or [{}])[0].get("message") or {}
+                text = (msg.get("content") or "").strip()
+                if not text:
+                    raise RuntimeError(
+                        f"chat API returned no text (model={model})")
+                return text
+            except RuntimeError:
+                raise
+            except Exception as e:
+                last_err = str(e)
+                _log(f"chat connection error (attempt {attempt}): {e}")
+                time.sleep(min(20, 2 ** attempt))
+        raise RuntimeError(f"could not reach chat API at {base} — {last_err}")
+
     def _msg(self, content_blocks, system: Optional[str] = None, max_tokens: int = 4096,
              stream: bool = False):
         self._require_key()
+        if self._is_openai_model():
+            return self._msg_openai(content_blocks, system=system,
+                                    max_tokens=max_tokens)
         kwargs = {
             "model": self.model,
             "max_tokens": max_tokens,
@@ -205,6 +319,24 @@ class ClaudeClient:
         # retry 429 / 5xx / connection errors with backoff, honouring the
         # server's retry-after hint. The semaphore is released between attempts
         # so a backoff sleep never holds a slot.
+        #
+        # 9Router's Claude OAuth route is intermittently flaky (silent stalls /
+        # "fetch connect timeout" 502 storms). When it keeps failing, reroute
+        # the SAME call to the user's ChatGPT account on the router's OpenAI
+        # endpoint instead of erroring out — GPT-5 handles the vision + JSON
+        # work well enough to keep the pipeline moving.
+        fb_model = self._fallback_chat_model()
+
+        def _try_fallback(orig_err):
+            _log(f"anthropic route failing — falling back to {fb_model} "
+                 f"via the OpenAI endpoint")
+            try:
+                return self._msg_openai(content_blocks, system=system,
+                                        max_tokens=max_tokens, model=fb_model)
+            except Exception as fe:
+                raise RuntimeError(
+                    f"{orig_err} | fallback {fb_model} also failed: {fe}")
+
         attempt = 0
         while True:
             try:
@@ -213,8 +345,10 @@ class ClaudeClient:
                         try:
                             with self._sdk.messages.stream(**kwargs) as s:
                                 resp = s.get_final_message()
-                        except (AssertionError, AttributeError):
-                            # Proxy gave us a non-standard stream — retry without it.
+                        except Exception:
+                            # Any stream failure (AssertionError, AttributeError,
+                            # APIError, StopIteration from non-standard SSE, etc.)
+                            # — fall back to a plain non-streaming create.
                             _log("stream produced no final message; retrying non-streamed")
                             resp = self._sdk.messages.create(**kwargs)
                     else:
@@ -235,6 +369,11 @@ class ClaudeClient:
                 time.sleep(wait)
             except (APIConnectionError, APITimeoutError) as e:
                 attempt += 1
+                # A timeout already cost up to 240s — don't burn another round
+                # waiting on a stalled route when the GPT fallback is available.
+                if fb_model and attempt >= 1:
+                    return _try_fallback(f"Claude route timed out at "
+                                         f"{self.base_url}")
                 if attempt > CLAUDE_MAX_RETRIES:
                     raise RuntimeError(
                         f"could not reach Claude API at {self.base_url} — "
@@ -247,6 +386,9 @@ class ClaudeClient:
                 status = getattr(e, "status_code", None)
                 if status and 500 <= int(status) < 600:
                     attempt += 1
+                    if fb_model and attempt >= 2:
+                        return _try_fallback(
+                            f"Claude route returning {status} at {self.base_url}")
                     if attempt > CLAUDE_MAX_RETRIES:
                         raise RuntimeError(
                             f"Claude API server error — gave up after "
@@ -260,15 +402,56 @@ class ClaudeClient:
 
         # Collect text from all text blocks.
         out = []
+        tool_inputs = []
+        thinking_out = []
         for block in resp.content:
-            if getattr(block, "type", None) == "text":
+            btype = getattr(block, "type", None)
+            if btype == "text":
                 out.append(block.text)
+            elif btype == "tool_use":
+                # Some proxies (e.g. agentrouter) and "thinking" models return
+                # the structured answer as a TOOL CALL rather than a text block
+                # (stop_reason=tool_use, no text). The tool input IS the JSON we
+                # asked for — capture it so we can serialize it as the response.
+                inp = getattr(block, "input", None)
+                if inp:
+                    tool_inputs.append(inp)
+            elif btype == "thinking":
+                t = getattr(block, "thinking", None)
+                if t:
+                    thinking_out.append(t)
         text = "\n".join(out).strip()
+        stop = getattr(resp, "stop_reason", None)
         # If the model ran out of room, the JSON is truncated → parsing fails
         # downstream with a confusing error. Surface the real cause instead.
-        if getattr(resp, "stop_reason", None) == "max_tokens":
+        if stop == "max_tokens":
             _log(f"WARNING stop_reason=max_tokens (output hit the {max_tokens} "
                  f"cap; response likely truncated)")
+        if not text and tool_inputs:
+            # Serialize the tool-call payload as JSON text; downstream callers
+            # run extract_json() on it, so a JSON object/array parses cleanly.
+            payload = tool_inputs[0] if len(tool_inputs) == 1 else tool_inputs
+            try:
+                text = json.dumps(payload)
+            except (TypeError, ValueError):
+                text = str(payload)
+            _log(f"recovered answer from tool_use block "
+                 f"(stop={stop}, model={self.model})")
+        if not text:
+            block_types = [getattr(b, "type", "?") for b in (resp.content or [])]
+            _log(f"WARNING: empty text — model={self.model} base={self.base_url} "
+                 f"stop={stop} n_blocks={len(resp.content or [])} types={block_types}")
+            # Last resort: a thinking-only response sometimes carries the JSON in
+            # the reasoning text (a fenced block). Hand it to extract_json rather
+            # than failing outright.
+            if thinking_out:
+                _log("no text/tool_use — falling back to thinking-block content")
+                return "\n".join(thinking_out).strip()
+            raise RuntimeError(
+                f"No text returned by the model at {self.base_url} "
+                f"(stop_reason={stop}, blocks={block_types}). "
+                "Check that your API key is valid and the provider supports this request type."
+            )
         return text
 
     @staticmethod
@@ -340,8 +523,25 @@ class ClaudeClient:
         if brief and not description:
             description = brief
 
-        scene_count = max(1, min(120, round((total_duration or 1) /
+        scene_count = max(1, min(400, round((total_duration or 1) /
                                             max(0.1, pacing_seconds or 1))))
+        # Target word count per scene so TTS timing matches the requested pacing.
+        # Natural speech ≈ 2.5 words/second.
+        words_per_scene = max(3, round(pacing_seconds * 2.5))
+
+        # Character-count rule for the system prompt.
+        if num_characters > 0:
+            char_rule = (
+                f"- The 'characters' array MUST have EXACTLY {num_characters} "
+                "entries — no more, no fewer. Count before you output.\n"
+            )
+        elif num_characters == 0:
+            char_rule = (
+                "- This is a pure-narration video. The 'characters' array MUST "
+                "be an empty list [].\n"
+            )
+        else:
+            char_rule = ""
 
         system = (
             "You are a film director, narrator and screenwriter for a "
@@ -352,34 +552,54 @@ class ClaudeClient:
             '  "title": str,\n'
             '  "logline": str,\n'
             '  "voiceover": str,            // the full narration script, plain text\n'
-            '  "pacing_seconds": number,    // seconds each image is on screen\n'
-            '  "total_duration": number,    // seconds (approx VO read length)\n'
-            '  "scene_count": int,\n'
+            f'  "pacing_seconds": {pacing_seconds:g},   // FIXED — do not change\n'
+            f'  "total_duration": {total_duration:.0f},  // FIXED — do not change\n'
+            f'  "scene_count": {scene_count},             // FIXED — do not change\n'
             '  "characters": [ { "name": str, "sheet_prompt": str } ],\n'
             '  "scenes": [ { "n": int, "heading": str, "action": str, "vo": str, "prompt": str } ]\n'
             "}\n"
             "RULES:\n"
-            f"- Produce EXACTLY {scene_count} scenes (one image per scene). The "
-            f"narration must read aloud in about {total_duration:.0f} seconds at a "
-            "natural pace.\n"
+            f"- scenes[] MUST have EXACTLY {scene_count} elements — count them "
+            "before you output. Stop adding scenes once you reach that number.\n"
+            f"- Each scene 'vo' should be approximately {words_per_scene} words "
+            f"({pacing_seconds:g}s of speech at natural pace). "
+            "Exception: the first 3-5 hook scenes may use shorter 4-8 word bursts.\n"
+            f"- The total narration must read aloud in ~{total_duration:.0f} seconds.\n"
+            + char_rule +
             '- Each scene "vo" is the slice of narration spoken while that image is '
             'on screen; concatenated in order they equal the full "voiceover".\n'
-            '- Each scene "prompt" is a self-contained image-generation prompt '
-            "(subject, framing, lighting, mood, palette). Name any recurring "
+            '- Each scene "prompt" is a self-contained image-generation prompt. '
+            "Start EVERY prompt with the STYLE NOTES prefix (if provided) then add "
+            "the scene subject, action, framing, and mood. Name any recurring "
             "character by their exact short name so a reference sheet can be "
             "auto-attached.\n"
             '- Each character "sheet_prompt" is ONE rich paragraph describing that '
             "character's canonical look (face, hair, build, outfit, colors, vibe) — "
             "written so it can be sent straight to a character-sheet generator. Use "
             "the exact same names as in the scene prompts.\n"
-            "- HOOK IS EVERYTHING. The first 3-5 scenes (the first ~30 seconds) MUST "
-            "be a rapid-fire, scroll-stopping opening. Write SHORT, punchy VO lines "
-            "for these scenes (5-10 words each) so images flash fast. Open with a "
-            "shocking question, wild claim, or visceral image — something that makes "
-            "a viewer stop scrolling IMMEDIATELY. Never open with slow setup or "
-            "generic intro. The hook must create curiosity or tension that DEMANDS "
-            "the viewer keeps watching. After the hook, settle into normal pacing."
+            "- HOOK IS EVERYTHING. The first 3-5 scenes MUST be a rapid-fire, "
+            "scroll-stopping opening — shocking question, wild claim, or visceral "
+            "image. Short punchy VO (4-8 words). After the hook, settle into "
+            f"normal ~{words_per_scene}-word VO lines per scene.\n"
+            "- STYLE BAN: NEVER write doodle, hand-drawn, hand-sketched, "
+            "whiteboard, marker-sketch, pencil-sketch, crayon, scribble, or any "
+            "hand-crafted art style in any scene prompt or character sheet_prompt. "
+            "If the STYLE NOTES contain any of these, IGNORE them and use "
+            "stick man / stick figure style (clean line-art humans, round heads, "
+            "minimal detail) instead."
         )
+        if pacing_seconds < 2.0:
+            system += (
+                f"\n\nFAST-CUT MODE ({pacing_seconds:g}s/frame — {scene_count} frames total):\n"
+                f"- This is a rapid-fire montage. You MUST write ALL {scene_count} scenes.\n"
+                "- Each frame is a completely DIFFERENT visual moment — new angle, new action, "
+                "new environment, or new detail. Never repeat the same image description.\n"
+                "- Think: establish → close-up → reaction → cutaway → wide → detail → payoff. "
+                "Cycle through these beats so every consecutive frame feels like a real cut.\n"
+                f"- Before you output, count your scenes[]. If it is not EXACTLY {scene_count}, "
+                "add more unique scenes until it is. Do NOT stop early.\n"
+                f"- ~{words_per_scene} words of VO per scene (3 words is fine for fast cuts).\n"
+            )
         if dynamic:
             system += (
                 "\n\nDYNAMIC / HIGH-RETENTION MODE (avoid a static slideshow):\n"
@@ -414,21 +634,25 @@ class ClaudeClient:
         if description.strip():
             bits.append(f"DESCRIPTION / HOW IT SHOULD BE:\n{description.strip()}")
         bits.append(f"Target total duration: {total_duration:.0f} seconds")
-        bits.append(f"Pacing: {pacing_seconds:g} second(s) per image "
-                    f"=> EXACTLY {scene_count} scenes/images")
-        if num_characters and num_characters > 0:
-            bits.append(f"Number of distinct recurring characters to define: "
-                        f"{num_characters}")
+        bits.append(
+            f"Pacing: {pacing_seconds:g}s per image  =>  EXACTLY {scene_count} scenes  "
+            f"(~{words_per_scene} words per 'vo', body scenes; 4-8 words for hook scenes)"
+        )
+        if num_characters > 0:
+            bits.append(
+                f"Characters: EXACTLY {num_characters} recurring character(s) in the "
+                "'characters' array."
+            )
+        elif num_characters == 0:
+            bits.append("Characters: NONE — 'characters' must be an empty list [].")
         else:
-            bits.append("Define however many recurring characters the story needs.")
+            bits.append("Characters: define as many as the story naturally needs.")
         if style_notes.strip():
             bits.append(f"STYLE NOTES:\n{style_notes.strip()}")
         if master_prompt.strip():
             bits.append(f"WORLD / STYLE BIBLE:\n{master_prompt.strip()}")
-        # The script is the one long generation (up to 16k tokens) that can run
-        # long enough to hit the proxy's edge timeout, so stream it — with an
-        # automatic non-streamed fallback if the proxy's stream is malformed.
-        return self.chat_text("\n\n".join(bits), system=system, max_tokens=16000,
+        tok = min(64000, max(16000, scene_count * 90))
+        return self.chat_text("\n\n".join(bits), system=system, max_tokens=tok,
                               stream=True)
 
     def prompts_from_video_frames(self, frames: List[bytes], count: int = 8,
@@ -498,7 +722,7 @@ class ClaudeClient:
             '     "num_characters": int,          // 0-8 recurring characters\n'
             '     "characters": [ {"name": str, "sheet_prompt": str} ],\n'
             '     "voiceover_style": str,          // how this VO should sound\n'
-            '     "image_prompt_style": str,       // the look every frame shares\n'
+            '     "image_prompt_style": str,       // 40-60 word visual style spec — see rules\n'
             '     "pacing_seconds": number,        // seconds each image is on screen\n'
             '     "total_duration": number,        // seconds\n'
             '     "scene_count": int               // = round(total_duration/pacing)\n'
@@ -506,6 +730,20 @@ class ClaudeClient:
             "}\n"
             f"RULES:\n- Produce EXACTLY {n_suggestions} suggestions, varied but all "
             "true to the reference's style and audience.\n"
+            "- image_prompt_style MUST be a DETAILED 40-60 word visual style specification "
+            "that fully defines the look for an image-generation model. Cover ALL six: "
+            "(1) rendering technique — flat 2D vector / photorealistic 3D CGI / cel-shaded "
+            "animation / stop-motion / etc., "
+            "(2) colour palette — name 4-6 specific colours or ranges (e.g. 'burnt orange, "
+            "deep teal, off-white, dark charcoal'), "
+            "(3) line style — e.g. 'bold 3px black outlines' / 'no outlines' / 'thin grey strokes', "
+            "(4) lighting — e.g. 'soft warm ambient', 'hard dramatic side-light', 'flat even', "
+            "(5) texture/finish — e.g. 'smooth clean', 'film grain', 'painterly', 'cel shading', "
+            "(6) character style — proportions, face style, level of detail. "
+            "This string is prepended to EVERY image prompt so it must define the whole look alone. "
+            "Example: 'flat 2D vector animation, bold black outlines, warm palette of burnt orange "
+            "#E05C00 and cream, minimal shading, simple geometric backgrounds, expressive "
+            "characters with large round heads, smooth finish, soft even lighting'.\n"
             "- Each idea must be a FRESH, DISTINCT concept — same niche/energy as the "
             "source but NOT a copy or re-upload of it. distinct_angle states plainly "
             "what makes it new.\n"
@@ -517,7 +755,11 @@ class ClaudeClient:
             "canonical look, ready for a character-sheet generator. If num_characters "
             "is 0, characters is an empty list.\n"
             "- Keep pacing_seconds, total_duration and scene_count internally "
-            "consistent (scene_count ≈ total_duration / pacing_seconds)."
+            "consistent (scene_count ≈ total_duration / pacing_seconds).\n"
+            "- STYLE BAN: NEVER suggest doodle, hand-drawn, hand-sketched, "
+            "whiteboard, marker-sketch, pencil-sketch, crayon, or scribble in "
+            "image_prompt_style. Use stick man / stick figure style instead if "
+            "the reference uses any hand-crafted art style."
         )
         bits = []
         if source_title:
@@ -582,22 +824,43 @@ class ClaudeClient:
             '  "suggestions": [ {\n'
             '     "title": str,\n'
             '     "logline": str,                 // one punchy sentence\n'
+            '     "hook": str,                    // the first-3-seconds opening line/visual\n'
+            '     "distinct_angle": str,          // how this DIFFERS from the sources (fresh, NOT a re-upload)\n'
             '     "num_characters": int,          // 0-8 recurring characters\n'
             '     "characters": [ {"name": str, "sheet_prompt": str} ],\n'
             '     "voiceover_style": str,          // how this VO should sound\n'
-            '     "image_prompt_style": str,       // the look every frame shares\n'
+            '     "image_prompt_style": str,       // 40-60 word visual style spec — see rules\n'
             '     "pacing_seconds": number,        // seconds each image is on screen\n'
             '     "total_duration": number,        // seconds\n'
-            '     "scene_count": int               // = round(total_duration/pacing)\n'
+            '     "scene_count": int,              // = round(total_duration/pacing)\n'
+            '     "virality_score": int,           // 1-100 predicted virality\n'
+            '     "virality_reason": str           // why it could pop (hook, format, timeliness, emotion)\n'
             "  } ]\n"
             "}\n"
             f"RULES:\n- Produce EXACTLY {n_suggestions} suggestions, varied but all "
             "true to the references' combined style and audience.\n"
+            "- Each idea must be a FRESH, DISTINCT concept — same niche/energy as the "
+            "sources but NOT a copy or re-upload of them. distinct_angle states plainly "
+            "what makes it new, and hook is the scroll-stopping first 3 seconds.\n"
+            "- Score virality_score honestly (1-100): reward a strong hook, a "
+            "proven format, emotional pull and timeliness; punish generic ideas. "
+            f"Return the {n_suggestions} suggestions SORTED by virality_score, most "
+            "viral FIRST.\n"
+            "- image_prompt_style MUST be a DETAILED 40-60 word visual style specification "
+            "covering: (1) rendering technique, (2) 4-6 specific colours, (3) line style, "
+            "(4) lighting, (5) texture/finish, (6) character proportions and face style. "
+            "Example: 'photorealistic 3D CGI, warm golden side-lighting, shallow depth of "
+            "field, cinematic teal-and-orange grade, subtle film grain, realistic human "
+            "proportions with expressive faces, smooth high-detail textures'.\n"
             "- characters[].sheet_prompt is ONE rich paragraph of that character's "
             "canonical look, ready for a character-sheet generator. If num_characters "
             "is 0, characters is an empty list.\n"
             "- Keep pacing_seconds, total_duration and scene_count internally "
-            "consistent (scene_count ≈ total_duration / pacing_seconds)."
+            "consistent (scene_count ≈ total_duration / pacing_seconds).\n"
+            "- STYLE BAN: NEVER suggest doodle, hand-drawn, hand-sketched, "
+            "whiteboard, marker-sketch, pencil-sketch, crayon, or scribble in "
+            "image_prompt_style. Use stick man / stick figure style instead if "
+            "the reference uses any hand-crafted art style."
         )
         bits = [f"You are analysing {len(sources)} reference video(s)."]
         for i, src in enumerate(sources, 1):
@@ -686,6 +949,128 @@ class ClaudeClient:
             f"Character: {name}. Compare every story frame to the canonical sheet and "
             "report drift. JSON only.", system=system, max_tokens=2000)
 
+    # ----- Wave 4b: audio-sync edit planning -----
+    def edit_holds(self, vo_lines: list, total_duration: float) -> list:
+        """Analyse voice-over narration per frame and return optimal hold_seconds
+        so image cuts lock to the natural rhythm of the speech.
+
+        ``vo_lines`` is a list of VO strings, one per frame (empty string if a
+        frame has no matching VO line).  Returns a list of floats the same
+        length as ``vo_lines``; the sum is normalised to ``total_duration``.
+
+        Returns ONLY a JSON array — no prose — so it is cheap and fast.
+        """
+        n = len(vo_lines)
+        if n == 0:
+            return []
+        lines_text = "\n".join(
+            f"{i+1}. {ln.strip() or '(no line)'}"
+            for i, ln in enumerate(vo_lines)
+        )
+        system = (
+            "You are a video editor. Given voice-over narration lines (one per "
+            "image frame) and the total audio duration, calculate the optimal "
+            "hold_seconds for each frame so cuts feel natural and match the "
+            "narration energy.\n"
+            "RULES:\n"
+            "- Hook frames (first 3-4): cap at 0.8s — very fast, scroll-stopping.\n"
+            "- Punchy lines ≤6 words, questions, exclamations: 0.6–1.2s.\n"
+            "- Medium lines 7–12 words: 1.0–2.0s.\n"
+            "- Long detailed lines >12 words: 1.5–3.5s.\n"
+            "- Frames with no VO: 0.7s (micro-cut filler).\n"
+            "- The sum of all values MUST equal the total duration exactly.\n"
+            "Return ONLY a compact JSON array of numbers — no keys, no prose:\n"
+            "  [0.8, 0.7, 1.4, 2.1, ...]"
+        )
+        prompt = (
+            f"Total audio duration: {total_duration:.2f}s\n"
+            f"Number of frames: {n}\n\n"
+            f"VO lines per frame:\n{lines_text}\n\n"
+            f"Return a JSON array of exactly {n} hold_seconds floats. JSON only."
+        )
+        raw = self.chat_text(prompt, system=system, max_tokens=max(512, n * 12))
+        # parse — accept a bare array or {"holds":[...]} wrapper
+        raw = raw.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw).strip()
+        start = raw.find("[")
+        if start >= 0:
+            raw = raw[start:]
+            end = raw.rfind("]")
+            if end >= 0:
+                raw = raw[:end + 1]
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            for k in ("holds", "hold_seconds", "durations"):
+                if k in parsed:
+                    parsed = parsed[k]
+                    break
+        holds = []
+        for v in parsed:
+            try:
+                holds.append(max(0.4, float(v)))
+            except (TypeError, ValueError):
+                holds.append(0.4)  # model returned null/non-numeric; use floor
+        if len(holds) != n:
+            raise ValueError(f"expected {n} holds, got {len(holds)}")
+        # Normalise sum to exactly total_duration.
+        total = sum(holds) or 1.0
+        return [round(h * total_duration / total, 3) for h in holds]
+
+    def generate_missing_scenes(self, existing_scenes: list, needed: int,
+                               voiceover: str = "", style_notes: str = "",
+                               master_prompt: str = "") -> str:
+        """Generate `needed` UNIQUE additional scenes to reach a target count.
+
+        Unlike the mechanical split (which repeats prompts with camera cues),
+        this asks Claude to write truly new visual moments so every frame in a
+        fast-cut video looks different.  Returns raw JSON text:
+          {"scenes": [{n, heading, action, vo, prompt}, ...]}
+        """
+        total = len(existing_scenes) + needed
+        words = voiceover.split() if voiceover else []
+        chunk_sz = max(1, math.ceil(len(words) / total)) if words else 0
+        vo_slots = []
+        for i in range(len(existing_scenes), total):
+            start = i * chunk_sz
+            vo_slots.append((i + 1, " ".join(words[start:start + chunk_sz])))
+
+        style_prefix = f"Start EVERY prompt with: \"{style_notes.strip()}\"\n" \
+                       if style_notes.strip() else ""
+        system = (
+            f"You are extending a video script. {len(existing_scenes)} scenes exist; "
+            f"add EXACTLY {needed} MORE (n={len(existing_scenes)+1}..{total}).\n"
+            "Return STRICT JSON ONLY:\n"
+            '{{"scenes": [{{"n": int, "heading": str, "action": str, '
+            '"vo": str, "prompt": str}}, ...]}}\n'
+            f"RULES:\n"
+            f"- Generate EXACTLY {needed} scene objects — count before output.\n"
+            "- Every 'prompt' is a DIFFERENT visual moment: vary location, character "
+            "pose, camera angle (close-up / wide / low / high / reaction).\n"
+            f"{style_prefix}"
+            "- STYLE BAN: no doodle, hand-drawn, whiteboard, scribble.\n"
+        )
+        bits = []
+        if existing_scenes:
+            snips = "\n".join(
+                f"  {s.get('n',i+1)}. {(s.get('prompt') or '')[:70]}"
+                for i, s in enumerate(existing_scenes[:6])
+            )
+            bits.append(f"Existing scenes (DO NOT repeat these moments):\n{snips}")
+        if voiceover:
+            bits.append(f"Full voiceover:\n{voiceover[:600]}")
+        bits.append(
+            "VO slices for the NEW scenes:\n" +
+            "\n".join(f"  Scene {n}: \"{vo}\"" for n, vo in vo_slots)
+        )
+        if style_notes.strip():
+            bits.append(f"STYLE: {style_notes.strip()}")
+        if master_prompt.strip():
+            bits.append(f"WORLD BIBLE: {master_prompt.strip()[:200]}")
+        bits.append(f"Write exactly {needed} NEW scenes. JSON only.")
+        tok = max(2000, needed * 160)
+        return self.chat_text("\n\n".join(bits), system=system, max_tokens=tok)
+
     # ----- Wave 5: YT growth helpers -----
     def seo(self, title, description, n=5):
         system = ('YouTube SEO assistant. Return STRICT JSON ONLY: '
@@ -731,7 +1116,8 @@ class ClaudeClient:
     _FRAME_BATCH = 18
 
     def plan_edit(self, frames: List[bytes], audio_duration: float,
-                  user_brief: str = "", master_prompt: str = ""):
+                  user_brief: str = "", master_prompt: str = "",
+                  vo_lines: list = None):
         """Look at EVERY frame (chunked) + know the audio length, produce an EDL.
 
         Returns a dict:
@@ -752,11 +1138,19 @@ class ClaudeClient:
         all_shots = []
         transition = None
         rationales = []
+        vo_lines = vo_lines or []
         for offset, batch in batches:
             share = audio_duration * (len(batch) / n) if n else audio_duration
             lo, hi = offset + 1, offset + len(batch)
+            # Give Claude the narration spoken over this batch so the cut can
+            # match imagery to WHAT IS BEING SAID, not just fill the runtime.
+            narration = "\n".join(
+                f'  frame #{offset + j + 1}: "{(vo_lines[offset + j] or "").strip()}"'
+                for j in range(len(batch))
+                if offset + j < len(vo_lines) and (vo_lines[offset + j] or "").strip())
             data = self._plan_edit_batch(
-                batch, share, lo, hi, n, user_brief, master_prompt)
+                batch, share, lo, hi, n, user_brief, master_prompt,
+                narration=narration)
             transition = transition or data.get("transition")
             if data.get("rationale"):
                 rationales.append(str(data["rationale"]))
@@ -794,7 +1188,7 @@ class ClaudeClient:
         }
 
     def _plan_edit_batch(self, frames, share_duration, lo, hi, total,
-                         user_brief, master_prompt):
+                         user_brief, master_prompt, narration=""):
         system = (
             "You are a film editor assembling ONE continuous cut. You receive a "
             "BATCH of generated frames from a longer sequence, plus the slice of "
@@ -814,6 +1208,11 @@ class ClaudeClient:
             f"(use ONLY indices {lo}..{hi}).",
             f"Fill about {share_duration:.2f} seconds of audio with this batch.",
         ]
+        if (narration or "").strip():
+            instr.append(
+                "NARRATION SPOKEN OVER THESE FRAMES (match each image to the "
+                "words being said — hold a frame while its line is spoken, cut "
+                "on sentence beats):\n" + narration.strip())
         if user_brief.strip():
             instr.append(f"USER EDIT DIRECTION:\n{user_brief.strip()}")
         if master_prompt.strip():
@@ -922,30 +1321,292 @@ class ClaudeClient:
 
     @staticmethod
     def _normalise_durations(shots, target_total):
-        """Scale shot durations so they sum to target_total (clamped sensibly)."""
-        cur = sum(max(0.0, s["duration"]) for s in shots)
-        if cur <= 0 or target_total <= 0:
+        """Scale shot durations so they sum to target_total (clamped sensibly).
+
+        Two passes: the 0.2s floor on very short shots can push the total past
+        the target, which would drift the cut out of sync with the audio — the
+        second pass redistributes that overshoot across the unclamped shots.
+        """
+        if target_total <= 0:
             return
-        k = target_total / cur
-        for s in shots:
-            s["duration"] = round(max(0.2, s["duration"] * k), 3)
+        for _ in range(2):
+            cur = sum(max(0.0, s["duration"]) for s in shots)
+            if cur <= 0:
+                return
+            k = target_total / cur
+            for s in shots:
+                s["duration"] = round(max(0.2, s["duration"] * k), 3)
+            if abs(sum(s["duration"] for s in shots) - target_total) < 0.05:
+                break
+        # Absorb any residual rounding drift in the final shot.
+        drift = round(target_total - sum(s["duration"] for s in shots), 3)
+        if shots and abs(drift) >= 0.01:
+            shots[-1]["duration"] = round(max(0.2, shots[-1]["duration"] + drift), 3)
+
+
+class OpenAIClient(ClaudeClient):
+    """Drop-in replacement for ClaudeClient that routes through OpenAI's API.
+    Inherits all high-level methods (generate_script, vision_describe, etc.)."""
+
+    def __init__(self, api_key: str = None, base_url: str = None, model: str = None):
+        self.api_key = api_key or config.OPENAI_API_KEY
+        self.base_url = (base_url or config.OPENAI_BASE_URL).rstrip("/")
+        self.model = model or config.OPENAI_MODEL
+        self._sdk = None
+
+    def _require_key(self):
+        if not self.api_key:
+            raise RuntimeError(
+                "No OpenAI API key set. Paste your key in Settings → OpenAI."
+            )
+
+    def ping(self):
+        if not self.api_key:
+            return {"ok": False, "error": "no api key set"}
+        ids = self._list_models_best_effort()
+        try:
+            r = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {self.api_key}",
+                         "Content-Type": "application/json"},
+                json={"model": self.model, "max_completion_tokens": 100,
+                      "messages": [{"role": "user", "content": "Say ok"}]},
+                timeout=20,
+            )
+            if r.status_code == 401:
+                return {"ok": False, "error": f"auth rejected — {r.text[:300]}",
+                        "models": ids, "base_url": self.base_url}
+            if r.status_code == 400 and "max_tokens" in (r.text or "") and "reached" in (r.text or ""):
+                pass  # model processed request but hit token limit — connection works
+            elif r.status_code >= 400:
+                body = r.text[:400] if r.text else str(r.status_code)
+                return {"ok": False, "error": f"API {r.status_code}: {body}",
+                        "models": ids, "base_url": self.base_url}
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}",
+                    "base_url": self.base_url}
+        return {"ok": True, "models": ids, "configured_model": self.model,
+                "base_url": self.base_url}
+
+    def _list_models_best_effort(self):
+        try:
+            r = requests.get(
+                f"{self.base_url}/models",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=20,
+            )
+            if r.status_code < 400:
+                data = r.json()
+                return [m.get("id") for m in (data.get("data") or [])][:30]
+        except Exception:
+            pass
+        return []
+
+    @staticmethod
+    def _to_openai_blocks(blocks):
+        out = []
+        for b in blocks:
+            if b.get("type") == "text":
+                out.append({"type": "text", "text": b["text"]})
+            elif b.get("type") == "image":
+                src = b.get("source", {})
+                mt = src.get("media_type", "image/png")
+                d = src.get("data", "")
+                out.append({"type": "image_url",
+                            "image_url": {"url": f"data:{mt};base64,{d}"}})
+            else:
+                out.append(b)
+        return out
+
+    def _msg(self, content_blocks, system=None, max_tokens=4096, stream=False):
+        self._require_key()
+        oai_content = self._to_openai_blocks(content_blocks)
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": oai_content})
+        payload = {"model": self.model, "max_completion_tokens": max_tokens,
+                   "messages": messages}
+        _log(f"openai chat/completions model={self.model} max_tokens={max_tokens} "
+             f"blocks={len(content_blocks)} base={self.base_url}")
+
+        def _backoff(attempt):
+            raw = CLAUDE_BACKOFF_BASE_MS * (2 ** (attempt - 1)) + \
+                random.uniform(0, CLAUDE_BACKOFF_BASE_MS)
+            return min(raw, CLAUDE_BACKOFF_MAX_MS) / 1000.0
+
+        attempt = 0
+        while True:
+            try:
+                with _CLAUDE_SEM:
+                    r = requests.post(
+                        f"{self.base_url}/chat/completions",
+                        headers={"Authorization": f"Bearer {self.api_key}",
+                                 "Content-Type": "application/json"},
+                        json=payload, timeout=600,
+                    )
+                if r.status_code == 401:
+                    raise RuntimeError(
+                        f"OpenAI API rejected the key — {r.text[:300]}")
+                if r.status_code == 429:
+                    attempt += 1
+                    if attempt > CLAUDE_MAX_RETRIES:
+                        raise RuntimeError(
+                            f"OpenAI rate limit — gave up after {attempt-1} retries")
+                    ra = r.headers.get("retry-after")
+                    wait = (float(ra) if ra else 5.0) + random.uniform(0, 1.0)
+                    _log(f"429 rate limit (attempt {attempt}) — waiting {wait:.1f}s")
+                    time.sleep(wait)
+                    continue
+                if 500 <= r.status_code < 600:
+                    attempt += 1
+                    if attempt > CLAUDE_MAX_RETRIES:
+                        raise RuntimeError(
+                            f"OpenAI server error {r.status_code} — gave up after "
+                            f"{attempt-1} retries")
+                    wait = _backoff(attempt)
+                    _log(f"server {r.status_code} (attempt {attempt}) — backing off "
+                         f"{wait:.1f}s")
+                    time.sleep(wait)
+                    continue
+                if r.status_code >= 400:
+                    raise RuntimeError(
+                        f"OpenAI API error {r.status_code} — {r.text[:500]}")
+                data = r.json()
+                break
+            except RuntimeError:
+                raise
+            except requests.exceptions.ConnectionError as e:
+                attempt += 1
+                if attempt > CLAUDE_MAX_RETRIES:
+                    raise RuntimeError(f"could not reach OpenAI API — {e}")
+                wait = _backoff(attempt)
+                _log(f"connection error (attempt {attempt}) — backing off {wait:.1f}s")
+                time.sleep(wait)
+            except requests.exceptions.Timeout as e:
+                attempt += 1
+                if attempt > CLAUDE_MAX_RETRIES:
+                    raise RuntimeError(f"OpenAI API timeout — {e}")
+                wait = _backoff(attempt)
+                _log(f"timeout (attempt {attempt}) — backing off {wait:.1f}s")
+                time.sleep(wait)
+
+        text = ((data.get("choices") or [{}])[0].get("message", {}).get(
+            "content") or "").strip()
+        finish = (data.get("choices") or [{}])[0].get("finish_reason", "")
+        if finish == "length":
+            _log(f"WARNING finish_reason=length (output hit the {max_tokens} "
+                 f"cap; response likely truncated)")
+        if not text:
+            raise RuntimeError(
+                "empty response from model (no content; "
+                f"finish_reason={finish or 'unknown'})")
+        return text
+
+
+def _repair_json(t: str):
+    """Try to fix truncated JSON from long generations (e.g. 600s scripts).
+    Works by: closing open strings, removing the last incomplete element,
+    then closing all open brackets/braces."""
+    # Close any open string literal
+    in_str, escaped = False, False
+    for ch in t:
+        if escaped:
+            escaped = False
+            continue
+        if ch == '\\':
+            escaped = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+    if in_str:
+        t += '"'
+
+    # Remove trailing incomplete key-value pairs or array elements.
+    # A truncated entry often looks like: ,"prompt": "some text..."
+    # or { "n": 45, "heading": "Some... (cut off mid-object)
+    # Strategy: find the last complete object/array element by finding
+    # the last }, then trim everything after it except closing brackets.
+    # First strip trailing commas and whitespace
+    t = t.rstrip()
+    t = re.sub(r',\s*$', '', t)
+
+    # Count unclosed brackets
+    depth_brace = 0
+    depth_sq = 0
+    for ch in t:
+        if ch == '{': depth_brace += 1
+        elif ch == '}': depth_brace -= 1
+        elif ch == '[': depth_sq += 1
+        elif ch == ']': depth_sq -= 1
+
+    if depth_brace > 0 or depth_sq > 0:
+        # Find the last successfully closed brace/bracket and trim after it,
+        # then re-close remaining. This drops the incomplete trailing element.
+        last_close = max(t.rfind('}'), t.rfind(']'))
+        if last_close > len(t) // 2:
+            t = t[:last_close + 1]
+            t = re.sub(r',\s*$', '', t.rstrip())
+            # Recount
+            depth_brace = sum(1 for c in t if c == '{') - sum(1 for c in t if c == '}')
+            depth_sq = sum(1 for c in t if c == '[') - sum(1 for c in t if c == ']')
+
+    t += ']' * max(0, depth_sq)
+    t += '}' * max(0, depth_brace)
+    # Final cleanup of trailing commas before closers
+    t = re.sub(r',\s*([}\]])', r'\1', t)
+    return t
 
 
 def extract_json(text: str):
-    """Pull the first JSON object out of a possibly-fenced Claude response."""
+    """Pull the first JSON value out of a possibly-fenced Claude response.
+
+    Handles the common failure modes seen with long generations:
+      • markdown ```json fences and leading prose
+      • a top-level ARRAY ([{...},{...}]) — not just an object
+      • trailing "Extra data" after a complete value (model kept talking)
+      • truncated JSON (closes open strings/brackets via _repair_json)
+    """
     if not text:
         raise ValueError("empty response")
-    # Strip code fences if present.
     t = text.strip()
     t = re.sub(r"^```(?:json)?\s*", "", t)
     t = re.sub(r"\s*```$", "", t)
-    # Try direct parse first.
     try:
         return json.loads(t)
     except Exception:
         pass
-    # Fall back: greedy find of {...}.
-    m = re.search(r"\{[\s\S]*\}", t)
-    if not m:
+
+    # Anchor at the EARLIEST of '{' or '[' — a response may be a bare array,
+    # in which case jumping to the first '{' would land inside it and produce
+    # an "Extra data" error on the following comma.
+    br = t.find('{')
+    sq = t.find('[')
+    cands = [i for i in (br, sq) if i >= 0]
+    if not cands:
         raise ValueError(f"no JSON found in response: {text[:300]}")
-    return json.loads(m.group(0))
+    start = min(cands)
+    raw = t[start:]
+
+    # raw_decode parses ONE complete JSON value and tells us where it ended,
+    # so trailing prose / extra values after it no longer break parsing.
+    try:
+        obj, _end = json.JSONDecoder().raw_decode(raw)
+        return obj
+    except json.JSONDecodeError:
+        pass
+
+    # Last resort: assume truncation and repair (close strings/brackets).
+    repaired = _repair_json(raw)
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        pass
+    # Repaired text may itself still have trailing junk — try raw_decode on it.
+    try:
+        obj, _end = json.JSONDecoder().raw_decode(repaired)
+        return obj
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"JSON repair failed ({e}); first 500 chars: {raw[:500]}"
+        ) from e
