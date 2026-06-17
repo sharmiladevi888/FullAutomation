@@ -12,6 +12,31 @@ import config
 import store
 
 
+# Hard ceiling (seconds) for per-frame ffmpeg extraction so a corrupt/hung
+# input can't block a request forever.
+_EXTRACT_TIMEOUT = 120
+
+
+def _run(cmd, timeout, what):
+    """Run an ffmpeg command with a hard timeout.
+
+    Returns the CompletedProcess. Raises ``RuntimeError`` on timeout or a
+    missing ffmpeg binary so callers get a clear message instead of a raw
+    traceback. Callers still inspect ``returncode``/``stderr`` themselves.
+    """
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"{what} timed out after {timeout}s (command: {cmd[0]})"
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"{what} could not run: '{cmd[0]}' not found. Is ffmpeg installed "
+            f"and on PATH?"
+        )
+
+
 def _probe_duration(video_path: str) -> float:
     """Return video duration in seconds using ffprobe. Returns 0 on failure."""
     try:
@@ -58,7 +83,13 @@ def extract_frames(video_path, fps=None, max_frames=40):
                 "-q:v", "2",
                 out_path,
             ]
-            proc = subprocess.run(cmd, capture_output=True, text=True)
+            try:
+                proc = _run(cmd, timeout=_EXTRACT_TIMEOUT,
+                            what="ffmpeg frame-extract")
+            except RuntimeError:
+                # One slow/failed seek shouldn't kill the whole extraction —
+                # skip this frame and let the rest (or the fps fallback) cover it.
+                continue
             if proc.returncode == 0 and os.path.exists(out_path):
                 rel = os.path.relpath(out_path, store.DATA_DIR).replace(os.sep, "/")
                 urls.append(f"/data/{rel}")
@@ -76,7 +107,7 @@ def extract_frames(video_path, fps=None, max_frames=40):
         "-frames:v", str(int(max_frames)),
         pattern,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = _run(cmd, timeout=_EXTRACT_TIMEOUT, what="ffmpeg frame-extract (fps)")
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {proc.stderr[-800:]}")
 

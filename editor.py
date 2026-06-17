@@ -12,6 +12,33 @@ from typing import List, Dict, Optional
 import store
 
 
+# Default ceilings (seconds) for ffmpeg/ffprobe subprocess calls so a hung
+# encode can never block a request forever. Renders scale with clip count, so
+# the assemble path gets a generous budget; probes are quick.
+_PROBE_TIMEOUT = 30
+_RENDER_TIMEOUT = 600
+
+
+def _run(cmd, timeout, what):
+    """Run an ffmpeg/ffprobe command with a hard timeout.
+
+    Returns the CompletedProcess. Raises ``RuntimeError`` (never lets a
+    ``TimeoutExpired`` or missing-binary error escape raw) so callers surface a
+    clear message. Callers still inspect ``returncode``/``stderr`` themselves.
+    """
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"{what} timed out after {timeout}s (command: {cmd[0]})"
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"{what} could not run: '{cmd[0]}' not found. Is ffmpeg installed "
+            f"and on PATH?"
+        )
+
+
 def split_long_holds(shots: List[Dict], max_hold: float = 6.0,
                      zoom_step: float = 0.05) -> List[Dict]:
     """Keep a single image from sitting on screen too long.
@@ -46,7 +73,7 @@ def probe_duration(path: str) -> float:
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
         "-of", "json", path,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = _run(cmd, timeout=_PROBE_TIMEOUT, what="ffprobe duration")
     if proc.returncode != 0:
         raise RuntimeError(f"ffprobe failed: {proc.stderr[-400:]}")
     data = json.loads(proc.stdout or "{}")
@@ -67,7 +94,7 @@ def trim_silence(input_path: str, output_path: str = None,
     )
     cmd = ["ffmpeg", "-y", "-i", input_path, "-af", af,
            "-c:a", "libmp3lame", "-q:a", "4", out]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = _run(cmd, timeout=_RENDER_TIMEOUT, what="ffmpeg trim-silence")
     if proc.returncode != 0 or not os.path.exists(out):
         return input_path
     if not output_path:
@@ -84,7 +111,7 @@ def detect_scenes(video_path: str, threshold: float = 0.4) -> List[float]:
         f"select='gt(scene,{threshold})',showinfo",
         "-f", "null", "-",
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = _run(cmd, timeout=_RENDER_TIMEOUT, what="ffmpeg scene-detect")
     # showinfo writes to stderr.
     times = []
     for line in proc.stderr.splitlines():
@@ -134,15 +161,15 @@ def bookend_video(main_path, out_path, intro_img=None, outro_img=None,
                "-vf", vf, "-r", str(fps),
                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
                "-crf", "20", "-c:a", "aac", "-b:a", "192k", "-shortest", cp]
-        p = subprocess.run(cmd, capture_output=True, text=True)
+        p = _run(cmd, timeout=_RENDER_TIMEOUT, what="ffmpeg title-card")
         if p.returncode != 0:
             raise RuntimeError(f"card failed: {p.stderr[-300:]}")
         return cp
 
     def _has_audio(path):
-        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a",
-                            "-show_entries", "stream=index", "-of", "csv=p=0", path],
-                           capture_output=True, text=True)
+        r = _run(["ffprobe", "-v", "error", "-select_streams", "a",
+                  "-show_entries", "stream=index", "-of", "csv=p=0", path],
+                 timeout=_PROBE_TIMEOUT, what="ffprobe audio-check")
         return bool(r.stdout.strip())
 
     def _with_audio(path, name):
@@ -154,7 +181,7 @@ def bookend_video(main_path, out_path, intro_img=None, outro_img=None,
                "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
                "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
                "-c:a", "aac", "-b:a", "192k", "-shortest", outp]
-        p = subprocess.run(cmd, capture_output=True, text=True)
+        p = _run(cmd, timeout=_RENDER_TIMEOUT, what="ffmpeg add-silent-audio")
         return outp if p.returncode == 0 else path
 
     parts = []
@@ -173,7 +200,7 @@ def bookend_video(main_path, out_path, intro_img=None, outro_img=None,
            "-map", "[v]", "-map", "[a]",
            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
            "-crf", "20", "-c:a", "aac", "-b:a", "192k", out_path]
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    p = _run(cmd, timeout=_RENDER_TIMEOUT, what="ffmpeg bookend-concat")
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)
     if p.returncode != 0:
@@ -263,7 +290,7 @@ def assemble_video(
                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "20",
                 clip,
             ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = _run(cmd, timeout=_RENDER_TIMEOUT, what="ffmpeg clip-render")
         if proc.returncode != 0:
             raise RuntimeError(f"ffmpeg clip failed [{i}]: {proc.stderr[-500:]}")
         clip_paths.append((clip, dur))
@@ -293,7 +320,7 @@ def assemble_video(
                "-map", f"[{last_label}]",
                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "20",
                silent_video]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = _run(cmd, timeout=_RENDER_TIMEOUT, what="ffmpeg xfade")
         if proc.returncode != 0:
             raise RuntimeError(f"ffmpeg xfade failed: {proc.stderr[-600:]}")
     else:
@@ -305,7 +332,7 @@ def assemble_video(
                 f.write(f"file '{os.path.abspath(cp)}'\n")
         cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
                "-c", "copy", silent_video]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = _run(cmd, timeout=_RENDER_TIMEOUT, what="ffmpeg concat")
         if proc.returncode != 0:
             raise RuntimeError(f"ffmpeg concat failed: {proc.stderr[-600:]}")
 
@@ -339,7 +366,7 @@ def assemble_video(
     else:
         cmd = ["ffmpeg", "-y", "-i", silent_video, "-c", "copy", output_path]
 
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = _run(cmd, timeout=_RENDER_TIMEOUT, what="ffmpeg mux")
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg mux failed: {proc.stderr[-600:]}")
 
@@ -359,9 +386,9 @@ def assemble_video(
 
 
 def _stream_has_audio(path: str) -> bool:
-    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a",
-                        "-show_entries", "stream=index", "-of", "csv=p=0", path],
-                       capture_output=True, text=True)
+    r = _run(["ffprobe", "-v", "error", "-select_streams", "a",
+              "-show_entries", "stream=index", "-of", "csv=p=0", path],
+             timeout=_PROBE_TIMEOUT, what="ffprobe audio-check")
     return bool(r.stdout.strip())
 
 
@@ -404,7 +431,7 @@ def add_cut_clicks(video_path: str, click_path: str, cut_times: List[float],
            "-filter_complex", "".join(parts),
            "-map", "0:v:0", "-map", "[out]",
            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", *extra, out]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = _run(cmd, timeout=_RENDER_TIMEOUT, what="ffmpeg cut-clicks")
     if proc.returncode != 0 or not os.path.exists(out):
         raise RuntimeError(f"cut-click mix failed: {proc.stderr[-500:]}")
     if output_path is None:
@@ -442,7 +469,7 @@ def mix_sfx(video_path: str, sfx_list: List[Dict], output_path: str = None) -> s
            "-map", "0:v:0", "-map", "[out]",
            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
            output_path]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = _run(cmd, timeout=_RENDER_TIMEOUT, what="ffmpeg sfx-mix")
     if proc.returncode != 0:
         raise RuntimeError(f"sfx mix failed: {proc.stderr[-500:]}")
     return output_path

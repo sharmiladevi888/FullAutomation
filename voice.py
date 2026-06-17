@@ -9,10 +9,49 @@ Keys are resolved per-user from the request settings (see app.py); this client
 just takes whatever key/voice/model it is handed.
 """
 import re
+import time
 
 import requests
 
 import config
+
+
+# Status codes worth retrying: transient upstream failures + rate limiting.
+_RETRY_STATUS = {429, 500, 502, 503, 504}
+
+
+def _post_with_retry(url, *, headers, json=None, timeout=180,
+                     max_retries=2, backoff=1.5, what="request"):
+    """POST with clear network errors and automatic retry on transient 5xx/429.
+
+    Raises ``RuntimeError`` with a human-readable message on timeout, connection
+    failure, or after exhausting retries. Returns the ``requests.Response`` on
+    the first non-retryable outcome (the caller still checks ``status_code`` for
+    4xx handling). ``what`` is a short label used in error messages.
+    """
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            r = requests.post(url, headers=headers, json=json, timeout=timeout)
+        except requests.exceptions.Timeout:
+            raise RuntimeError(
+                f"{what} timed out after {timeout}s — the TTS service did not "
+                f"respond. Try a shorter script or raise the timeout."
+            )
+        except requests.exceptions.ConnectionError as e:
+            raise RuntimeError(
+                f"{what} could not reach the TTS service ({e}). Check the base "
+                f"URL and your network connection."
+            )
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"{what} failed: {e}")
+        if r.status_code in _RETRY_STATUS and attempt < max_retries:
+            last_exc = f"[{r.status_code}] {r.text[:200]}"
+            time.sleep(backoff * (2 ** attempt))
+            continue
+        return r
+    # Exhausted retries on a transient status.
+    raise RuntimeError(f"{what} failed after {max_retries + 1} attempts: {last_exc}")
 
 
 class VoiceClient:
@@ -78,12 +117,12 @@ class VoiceClient:
                 "prompt_influence": max(0.0, min(1.0, float(prompt_influence)))}
         if duration_seconds:
             body["duration_seconds"] = max(0.5, min(22.0, float(duration_seconds)))
-        r = requests.post(
+        r = _post_with_retry(
             f"{self.base_url}/sound-generation",
             headers={"xi-api-key": self.api_key,
                      "Content-Type": "application/json",
                      "Accept": "audio/mpeg"},
-            json=body, timeout=self.timeout,
+            json=body, timeout=self.timeout, what="SFX generation",
         )
         if r.status_code >= 400:
             raise RuntimeError(f"SFX gen failed [{r.status_code}]: {r.text[:400]}")
@@ -123,7 +162,7 @@ class VoiceClient:
                 "use_speaker_boost": True,
             },
         }
-        r = requests.post(
+        r = _post_with_retry(
             url,
             headers={
                 "xi-api-key": self.api_key,
@@ -132,6 +171,7 @@ class VoiceClient:
             },
             json=body,
             timeout=self.timeout,
+            what="TTS",
         )
         if r.status_code >= 400:
             raise RuntimeError(f"TTS failed [{r.status_code}]: {r.text[:400]}")
@@ -200,12 +240,13 @@ class VoiceClient:
             },
         }
         import base64
-        r = requests.post(
+        r = _post_with_retry(
             url,
             headers={"xi-api-key": self.api_key,
                      "Content-Type": "application/json"},
             json=body,
             timeout=self.timeout,
+            what="TTS (timestamps)",
         )
         if r.status_code >= 400:
             # Endpoint not available on this plan — degrade gracefully.
@@ -349,10 +390,10 @@ class MimoVoiceClient:
             "audio": {"format": "wav", "voice": self._coerce_voice(voice_id)},
             "stream": False,
         }
-        r = requests.post(
+        r = _post_with_retry(
             f"{self.base_url}/chat/completions",
             headers={"api-key": self.api_key, "Content-Type": "application/json"},
-            json=body, timeout=self.timeout,
+            json=body, timeout=self.timeout, what="MiMo TTS",
         )
         if r.status_code >= 400:
             raise RuntimeError(f"MiMo TTS failed [{r.status_code}]: {r.text[:400]}")
