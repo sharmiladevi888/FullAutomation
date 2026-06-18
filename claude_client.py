@@ -534,7 +534,8 @@ class ClaudeClient:
         # Natural speech ≈ 2.5 words/second.
         words_per_scene = max(3, round(pacing_seconds * 2.5))
 
-        # Character-count rule for the system prompt.
+        # Character-count rule for the system prompt. Negative means AUTO:
+        # let the writer decide how many recurring characters the story needs.
         if num_characters > 0:
             char_rule = (
                 f"- The 'characters' array MUST have EXACTLY {num_characters} "
@@ -546,7 +547,23 @@ class ClaudeClient:
                 "be an empty list [].\n"
             )
         else:
-            char_rule = ""
+            char_rule = (
+                "- AUTO-CAST: decide how many recurring characters this script "
+                "actually needs from the story and requested duration. Use 0 only "
+                "for pure documentary/object-only narration; use 1 relatable lead "
+                "for most explainers; use 2-3 only when interactions or contrast "
+                "matter. Avoid bloated casts. Every recurring person/animal/mascot "
+                "named in scenes MUST appear in characters[] with a rich sheet_prompt.\n"
+            )
+        
+        # Character sheet prompts need to be style-anchored; otherwise generated
+        # sheets drift and scene renders inherit the wrong design.
+        char_sheet_rule = (
+            "- Each character sheet_prompt must be a production-ready character "
+            "design paragraph: exact body shape, face/head shape, clothing, colors, "
+            "silhouette, expressions, and how that design matches the reference "
+            "video art style. Do NOT describe generic realistic people.\n"
+        )
 
         system = (
             "You are a film director, narrator and screenwriter for a "
@@ -581,7 +598,7 @@ class ClaudeClient:
             f"({pacing_seconds:g}s of speech at natural pace). "
             "Exception: the first 3-5 hook scenes may use shorter 4-8 word bursts.\n"
             f"- The total narration must read aloud in ~{total_duration:.0f} seconds.\n"
-            + char_rule +
+            + char_rule + char_sheet_rule +
             '- Each scene "vo" is the slice of narration spoken while that image is '
             'on screen; concatenated in order they equal the full "voiceover".\n'
             '- Each scene "prompt" is a self-contained image-generation prompt. '

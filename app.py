@@ -753,12 +753,37 @@ def api_create_characters_batch(b: CharacterBatchIn, request: Request):
     created, errors = [], []
     for e in entries:
         try:
-            prompt = pipeline.build_sheet_prompt(st["master_prompt"], e["name"], e["description"])
-            img = client.generate(
-                prompt,
-                size=b.size or config.DEFAULT_SIZE,
-                quality=b.quality or config.DEFAULT_QUALITY,
-            )
+            prompt = pipeline.build_sheet_prompt(
+                st["master_prompt"], e["name"], e["description"],
+                style_notes=st.get("style_notes", ""))
+            # If YT/style frames are pinned, use them as STYLE refs for the sheet
+            # so generated characters match the analysed source look.
+            _style_refs, _labels = [], []
+            for _sf in (st.get("style_frames") or [])[:3]:
+                try:
+                    _style_refs.append(store.read_image(_sf["url"]))
+                    _labels.append("STYLE REF — match this art style")
+                except Exception:
+                    pass
+            if _style_refs:
+                _edit_prompt = (prompt + "\n\nUse the attached image(s) ONLY as "
+                                "art-style references from the source video. "
+                                "Copy their line work, palette, texture, face/body "
+                                "simplicity and proportions; draw THIS named "
+                                "character, not the people in the references.")
+                _multi = bool(request and request.state.settings.get("multi_image_edit"))
+                _send = (_style_refs if _multi else
+                         ([pipeline.contact_sheet(_style_refs, labels=_labels)]
+                          if len(_style_refs) > 1 else _style_refs))
+                img = client.edit(_edit_prompt, _send,
+                                  size=b.size or config.DEFAULT_SIZE,
+                                  quality=b.quality or config.DEFAULT_QUALITY)
+            else:
+                img = client.generate(
+                    prompt,
+                    size=b.size or config.DEFAULT_SIZE,
+                    quality=b.quality or config.DEFAULT_QUALITY,
+                )
             rec = {
                 "id": store.new_id("char"),
                 "name": e["name"],
@@ -2271,7 +2296,7 @@ class ScriptIn(BaseModel):
     description: str = ""
     total_duration: float = 60.0
     pacing_seconds: float = 1.0
-    num_characters: int = 0
+    num_characters: int = -1
     style_notes: str = ""
     model: Optional[str] = None
     # Back-compat with the old simple form.
@@ -2362,7 +2387,7 @@ def api_script(s: ScriptIn, request: Request):
             description=s.description,
             total_duration=max(1.0, total_duration or 60.0),
             pacing_seconds=pacing,
-            num_characters=max(0, s.num_characters or 0),
+            num_characters=(s.num_characters if s.num_characters is not None else -1),
             style_notes=s.style_notes,
             master_prompt=st["master_prompt"],
             brief=s.brief,
@@ -5801,7 +5826,10 @@ def api_autopilot(body: AutopilotIn, request: Request):
     # fewer than 1 image per 2 seconds on long videos.
     if body.target_seconds and body.target_seconds > 0:
         pacing = min(pacing, 2.0)
-    num_chars = pick.get("num_characters", 2)
+    # Auto-cast by default: let the script model decide how many recurring
+    # characters the story/duration actually needs. A non-negative override still
+    # forces an exact count for backwards-compatible API callers.
+    num_chars = -1
     if body.num_characters is not None and body.num_characters >= 0:
         num_chars = int(body.num_characters)
     style_notes = _sanitize_prompt(pick.get("image_prompt_style") or "")
@@ -5839,7 +5867,7 @@ def api_autopilot(body: AutopilotIn, request: Request):
             title=title, description=desc,
             total_duration=max(1.0, total_dur),
             pacing_seconds=max(0.1, pacing),
-            num_characters=max(0, num_chars),
+            num_characters=num_chars,
             style_notes=style_notes,
             master_prompt=st["master_prompt"],
             dynamic=body.dynamic,
@@ -5865,7 +5893,7 @@ def api_autopilot(body: AutopilotIn, request: Request):
                 ),
                 total_duration=max(1.0, total_dur),
                 pacing_seconds=max(0.1, pacing),
-                num_characters=max(0, num_chars),
+                num_characters=num_chars,
                 style_notes=style_notes,
                 master_prompt=st["master_prompt"],
                 dynamic=body.dynamic,
