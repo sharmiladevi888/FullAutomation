@@ -635,11 +635,15 @@ async def api_video(
     max_frames: int = Form(40),
 ):
     import video as videomod
+    _fn = os.path.basename((file.filename or "video.mp4").replace("..", ""))
     dest = os.path.join(
-        store.UPLOADS_DIR, store.new_id("upload") + "_" + (file.filename or "video.mp4")
+        store.UPLOADS_DIR, store.new_id("upload") + "_" + _fn
     )
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "Empty file — upload a real video.")
     with open(dest, "wb") as f:
-        f.write(await file.read())
+        f.write(data)
     try:
         urls = videomod.extract_frames(dest, fps=fps, max_frames=max_frames)
     except Exception as e:
@@ -664,8 +668,9 @@ def api_style_frames(s: StyleFramesIn):
 # --------------------------------------------------------------------------- #
 @app.post("/api/scene-detect")
 async def api_scene_detect(file: UploadFile = File(...), threshold: float = Form(0.4)):
+    _fn = os.path.basename((file.filename or "video.mp4").replace("..", ""))
     dest = os.path.join(
-        store.UPLOADS_DIR, store.new_id("scene") + "_" + (file.filename or "video.mp4")
+        store.UPLOADS_DIR, store.new_id("scene") + "_" + _fn
     )
     with open(dest, "wb") as f:
         f.write(await file.read())
@@ -1233,6 +1238,16 @@ def _render_one_for_queue(g_prompt, params, settings, project_id):
     micro_cut = (shot_relation == "continue") and bool(prev)
 
     refs, ref_meta = [], []
+    # Style anchors FIRST so the STYLE REF gets the dominant top cell of the
+    # contact sheet (and is seen first in multi-image mode) — this is the look
+    # every frame must copy. Then character sheets (identity), then the previous
+    # frame (only on a micro-cut).
+    for sf in style_frames[:4]:
+        try:
+            refs.append(store.read_image(sf["url"]))
+            ref_meta.append({"type": "style"})
+        except Exception:
+            pass
     for c in matched:
         try:
             refs.append(store.read_image(c["sheet_url"]))
@@ -1245,12 +1260,6 @@ def _render_one_for_queue(g_prompt, params, settings, project_id):
             ref_meta.append({"type": "previous", "id": prev["id"]})
         except Exception:
             micro_cut = False
-    for sf in style_frames[:4]:
-        try:
-            refs.append(store.read_image(sf["url"]))
-            ref_meta.append({"type": "style"})
-        except Exception:
-            pass
 
     _queue_style_notes = (st.get("style_notes") or "").strip()
     full_prompt = pipeline.build_full_prompt(
@@ -1259,8 +1268,21 @@ def _render_one_for_queue(g_prompt, params, settings, project_id):
         style_notes=_queue_style_notes, micro_cut=micro_cut)
 
     if refs:
+        # Per-ref captions so the model can tell the STYLE anchor from a
+        # character sheet from the previous frame in the composited grid —
+        # without these the refs blend and the art style copies poorly.
+        def _ref_label(m):
+            t = m.get("type")
+            if t == "style":
+                return "STYLE REF — COPY THIS LOOK"
+            if t == "character":
+                return f"CHAR: {(m.get('name') or '').strip()}"[:22]
+            if t == "previous":
+                return "PREV FRAME (continuity)"
+            return ""
+        ref_labels = [_ref_label(m) for m in ref_meta]
         if not multi_image_edit and len(refs) > 1:
-            send = [pipeline.contact_sheet(refs)]
+            send = [pipeline.contact_sheet(refs, labels=ref_labels)]
         else:
             send = refs
         try:
@@ -1268,8 +1290,10 @@ def _render_one_for_queue(g_prompt, params, settings, project_id):
                               retry=False)
         except Exception:
             if len(send) > 1:
-                img = client.edit(full_prompt, [pipeline.contact_sheet(refs)],
-                                  size=size, quality=quality, retry=False)
+                img = client.edit(
+                    full_prompt,
+                    [pipeline.contact_sheet(refs, labels=ref_labels)],
+                    size=size, quality=quality, retry=False)
             else:
                 raise
         mode = "edit"
@@ -1413,23 +1437,34 @@ class IdsIn(BaseModel):
 
 def _shot_image(st, prev, g_prompt, size, quality, request):
     """Generate ONE image for a prompt using the same reference assembly as the
-    main renderer (matched characters + given previous frame + style anchors)."""
+    main renderer (matched characters + given previous frame + style anchors).
+
+    Ref ordering and labelling MUST match _render_one: style frames FIRST (so
+    the STYLE REF gets the dominant top cell of the contact sheet and is seen
+    first in multi-image mode), then character sheets. Every ref carries an
+    explicit label so the model can tell the style anchor from a character sheet
+    instead of blending them — without this the art style copies poorly and
+    shots drift toward a generic look."""
     client = get_image_client(request)
     matched = pipeline.match_characters(g_prompt, st["characters"])
-    refs = []
+    refs, ref_labels = [], []
+    # 1. style anchors FIRST (source-video frames) — the look to reproduce.
+    for sf in st.get("style_frames", [])[:4]:
+        try:
+            refs.append(store.read_image(sf["url"]))
+            ref_labels.append("STYLE REF — COPY THIS LOOK")
+        except Exception:
+            pass
+    # 2. character sheets — identity only.
     for c in matched:
         try:
             refs.append(store.read_image(c["sheet_url"]))
+            ref_labels.append(f"CHAR: {(c.get('name') or '').strip()}"[:22])
         except Exception:
             pass
     # Previous frame intentionally NOT used as an image ref (see _render_one):
     # avoids composition cloning so each shot is free to vary.
     # (prev still drives has_previous text for style/palette carry-over.)
-    for sf in st.get("style_frames", [])[:3]:
-        try:
-            refs.append(store.read_image(sf["url"]))
-        except Exception:
-            pass
     _shot_style_notes = (st.get("style_notes") or "").strip()
     full_prompt = pipeline.build_full_prompt(
         st["master_prompt"], g_prompt, matched,
@@ -1438,13 +1473,16 @@ def _shot_image(st, prev, g_prompt, size, quality, request):
     if refs:
         multi = request.state.settings["multi_image_edit"]
         send = refs if (multi and len(refs) > 1) else (
-            [pipeline.contact_sheet(refs)] if len(refs) > 1 else refs)
+            [pipeline.contact_sheet(refs, labels=ref_labels)]
+            if len(refs) > 1 else refs)
         try:
             img = client.edit(full_prompt, send, size=size, quality=quality)
         except Exception:
             if len(send) > 1:
-                img = client.edit(full_prompt, [pipeline.contact_sheet(refs)],
-                                  size=size, quality=quality)
+                img = client.edit(
+                    full_prompt,
+                    [pipeline.contact_sheet(refs, labels=ref_labels)],
+                    size=size, quality=quality)
             else:
                 img = client.generate(full_prompt, size=size, quality=quality)
     else:
@@ -6427,3 +6465,404 @@ def api_build_video(body: BuildVideoIn, request: Request):
         cut_click_style=body.cut_click_style, manual_holds=body.manual_holds)
     return {"ok": True, "video_url": video_url, "duration": total_seconds,
             "frames": len(seq), "scene_map": scene_map}
+
+
+# =========================================================================== #
+#  AUDIO -> VIDEO  (separate tab — NOT part of the YouTube autopilot workflow)
+#  Upload your own audio + a sample video:
+#    1. sample video  -> art-style analysis (vision) + pinned style frames
+#    2. audio         -> Whisper transcription with word timestamps
+#    3. Claude writes ONE visual scene per transcript segment (vo = your words)
+#    4. character sheets auto-cast + style-anchored to the sample video
+#    5. frames rendered (style-locked, micro-cut continuity)
+#    6. final MP4 = your audio + frames cut to the REAL word timestamps
+# =========================================================================== #
+class AudioToVideoIn(BaseModel):
+    audio_path: str                       # uploaded via /api/audio-to-video/upload
+    sample_video_path: Optional[str] = None
+    sample_frame_urls: Optional[List[str]] = None  # pre-extracted style frames
+    style_notes: Optional[str] = None     # manual override of analysed style
+    orientation: str = "landscape"        # landscape | portrait | square
+    size: Optional[str] = None
+    quality: Optional[str] = None
+    transition: str = "cut"
+    fps: int = 30
+    max_hold: float = 1.6                 # fast micro-cut ceiling for retention
+    motion: bool = True                   # subtle Ken-Burns push for energy
+    dynamic: bool = True                  # high-retention reacting visuals
+    cut_clicks: bool = False
+    cut_click_volume: float = 0.30
+    cut_click_style: str = "click"
+    language: Optional[str] = None        # force language (else auto)
+    transcribe_engine: str = "local"      # local (faster-whisper) | elevenlabs (Scribe)
+
+
+@app.post("/api/audio-to-video/upload")
+async def api_a2v_upload(file: UploadFile = File(...), kind: str = Form("audio")):
+    """Save an uploaded audio or sample-video file for the Audio->Video tab.
+    ``kind`` is 'audio' or 'video'. Returns the server-side path."""
+    raw_name = file.filename or ("audio.mp3" if kind == "audio" else "video.mp4")
+    # Sanitize: strip path separators and traversal to prevent escape from uploads dir.
+    safe = os.path.basename(raw_name).replace("..", "").replace("/", "").replace("\\", "")
+    if not safe:
+        safe = "audio.mp3" if kind == "audio" else "video.mp4"
+    dest = os.path.join(store.UPLOADS_DIR, store.new_id("a2v") + "_" + safe)
+    os.makedirs(store.UPLOADS_DIR, exist_ok=True)
+    _data = await file.read()
+    if not _data:
+        raise HTTPException(400, "Empty file — upload a real audio/video.")
+    with open(dest, "wb") as f:
+        f.write(_data)
+    out = {"ok": True, "path": dest, "kind": kind}
+    # For a sample video, extract style frames right away so the UI can preview.
+    if kind == "video":
+        try:
+            import video as videomod
+            out["frames"] = videomod.extract_frames(dest, fps=0.5, max_frames=12)
+        except Exception as e:
+            out["frames"] = []
+            out["frame_error"] = str(e)
+    return out
+
+
+class A2VSampleLinkIn(BaseModel):
+    url: str
+
+
+@app.post("/api/audio-to-video/sample-link")
+def api_a2v_sample_link(body: A2VSampleLinkIn):
+    """Pull style frames from a pasted sample-video LINK (YouTube etc.) for the
+    Audio->Video tab — same output shape as the upload endpoint, so the front
+    end can use either interchangeably. Returns the extracted style frames +
+    the downloaded video path (usable as sample_video_path)."""
+    import youtube
+    url = (body.url or "").strip()
+    if not url:
+        raise HTTPException(400, "Paste a sample-video link.")
+    if not youtube.is_youtube_url(url):
+        raise HTTPException(400, "That doesn't look like a YouTube link.")
+    try:
+        frames, path = youtube.download_frames(url, max_frames=12)
+    except Exception as e:
+        raise HTTPException(500, f"Couldn't fetch frames from that link: {e}")
+    if not frames:
+        # Fall back to the hi-res thumbnail so the user still gets a style anchor.
+        try:
+            vid = youtube.extract_video_id(url)
+            meta = youtube.fetch_metadata(url, vid)
+            thumb = youtube.thumbnail_bytes(vid, meta.get("thumbnail", ""))
+            if thumb:
+                turl = store.write_image("uploads", thumb)
+                return {"ok": True, "path": path, "kind": "video",
+                        "frames": [turl], "note": "used thumbnail (video frames unavailable)"}
+        except Exception:
+            pass
+        raise HTTPException(502, "Couldn't extract frames or a thumbnail from that "
+                            "link (age-gated / region-locked / throttled). Try another.")
+    return {"ok": True, "path": path, "kind": "video", "frames": frames}
+
+
+def _a2v_analyze_style(claude, frame_urls):
+    """Vision-analyse a few sample-video frames into a concrete art-style brief
+    the image model can reproduce. Returns a style string ('' on failure)."""
+    imgs = []
+    for u in (frame_urls or [])[:6]:
+        try:
+            imgs.append(store.read_image(u))
+        except Exception:
+            pass
+    if not imgs:
+        return ""
+    instr = (
+        "These are frames from a reference video. Describe its ART STYLE so an "
+        "image generator can reproduce it EXACTLY: rendering technique (flat 2D / "
+        "3D / photoreal / anime / cartoon), line weight, colour palette, shading, "
+        "lighting, texture, character proportions and overall mood. Be concrete and "
+        "concise (5-8 lines). Describe ONLY the look, not the content."
+    )
+    try:
+        return (claude.vision_describe(
+            imgs, instr,
+            system="You are an art director who reverse-engineers visual styles.",
+            max_tokens=900) or "").strip()
+    except Exception as e:
+        print(f"[a2v] style analysis failed: {e}", flush=True)
+        return ""
+
+
+@app.post("/api/audio-to-video")
+def api_audio_to_video(body: AudioToVideoIn, request: Request):
+    """One-click Audio->Video. Self-contained: does NOT touch the YouTube
+    autopilot state machine. Builds a fresh project from the uploaded audio +
+    sample video and returns the final MP4."""
+    import transcribe
+    import video as videomod
+
+    s = request.state.settings
+    if not _has_ai_key(s):
+        raise HTTPException(400, "No AI key set — add Claude in Settings.")
+    if not _has_image_key(request):
+        raise HTTPException(400, "No image API key — add it in Settings.")
+    engine = (body.transcribe_engine or "local").lower()
+    if engine in ("elevenlabs", "scribe", "11labs"):
+        if not (s.get("elevenlabs_api_key") or getattr(config, "ELEVENLABS_API_KEY", "")):
+            raise HTTPException(400, "ElevenLabs Scribe selected but no ElevenLabs "
+                                "key set — add it in Settings or switch to Local Whisper.")
+    else:
+        if not transcribe.local_available():
+            raise HTTPException(400, "Local Whisper isn't installed. Run "
+                                "'pip install faster-whisper' once, or switch the "
+                                "transcription engine to ElevenLabs Scribe.")
+    if not os.path.exists(body.audio_path):
+        raise HTTPException(400, "Uploaded audio not found — upload it again.")
+
+    claude = _claude_client_for(None, request)
+
+    # ---- orientation / size ----
+    orient = (body.orientation or "landscape").lower()
+    if orient in ("vertical", "portrait", "9:16", "shorts", "tiktok"):
+        size = body.size or "1024x1536"; width, height = 1080, 1920
+    elif orient in ("square", "1:1"):
+        size = body.size or "1024x1024"; width, height = 1080, 1080
+    else:
+        size = body.size or "1536x1024"; width, height = 1920, 1080
+    quality = body.quality or config.DEFAULT_QUALITY
+
+    # ---- STEP 1: sample-video style frames + style analysis ----
+    frame_urls = list(body.sample_frame_urls or [])
+    if not frame_urls and body.sample_video_path and os.path.exists(body.sample_video_path):
+        try:
+            frame_urls = videomod.extract_frames(
+                body.sample_video_path, fps=0.5, max_frames=12)
+        except Exception as e:
+            print(f"[a2v] frame extraction failed: {e}", flush=True)
+    style_picks = frame_urls[::max(1, len(frame_urls) // 4)][:4] if frame_urls else []
+    style_notes = (body.style_notes or "").strip() or _a2v_analyze_style(claude, frame_urls)
+
+    # ---- STEP 2: transcribe the uploaded audio (word timestamps) ----
+    try:
+        tr = transcribe.transcribe_audio(body.audio_path, settings=s,
+                                         engine=engine, language=body.language)
+    except Exception as e:
+        raise HTTPException(500, f"Transcription failed: {e}")
+    segments = tr.get("segments") or []
+    words = tr.get("words") or []
+    audio_dur = float(tr.get("duration") or 0.0)
+    if not segments and tr.get("text"):
+        segments = [{"text": tr["text"], "start": 0.0, "end": audio_dur or 1.0}]
+    if not segments:
+        raise HTTPException(500, "Transcription produced no speech segments.")
+
+    # ---- fresh project state for this Audio->Video build ----
+    _reset_generated(delete_files=True)
+    with _state_write_lock:
+        st = store.load_state()
+        st["style_notes"] = style_notes
+        st["master_prompt"] = (("VISUAL STYLE — match the sample video exactly: "
+                                + style_notes) if style_notes else st.get("master_prompt", ""))
+        st["style_frames"] = [{"id": store.new_id("sf"), "url": u} for u in style_picks]
+        store.save_state(st)
+
+    # ---- STEP 3: Claude writes one visual scene per transcript segment ----
+    try:
+        raw = claude.scenes_from_transcript(
+            segments, style_notes=style_notes,
+            master_prompt=store.load_state().get("master_prompt", ""),
+            dynamic=body.dynamic)
+        script = extract_json(raw)
+    except Exception as e:
+        raise HTTPException(500, f"Scene generation failed: {e}")
+
+    scenes = _normalize_scenes(script.get("scenes") or [])
+    # Lock VO to the real transcript verbatim + sanitize image prompts.
+    for i, sc in enumerate(scenes):
+        if i < len(segments):
+            sc["vo"] = (segments[i].get("text") or "").strip()
+        if sc.get("prompt"):
+            sc["prompt"] = _sanitize_prompt(sc["prompt"])
+    # Pad/trim so scenes line up 1:1 with segments.
+    while len(scenes) < len(segments):
+        i = len(scenes)
+        seg = segments[i]
+        base = scenes[-1].get("prompt", "") if scenes else (style_notes or "scene")
+        cue = _MOMENT_CUES[(i % (len(_MOMENT_CUES) - 1)) + 1]
+        scenes.append({"n": i + 1, "vo": (seg.get("text") or "").strip(),
+                       "prompt": _sanitize_prompt(f"{base}, {cue}"),
+                       "shot_relation": "cut"})
+    scenes = scenes[:len(segments)]
+
+    with _state_write_lock:
+        st = store.load_state()
+        st["script"] = {"scenes": scenes, "scene_count": len(scenes),
+                        "voiceover": tr.get("text", ""),
+                        "characters": script.get("characters") or []}
+        store.save_state(st)
+
+    # ---- STEP 4: character sheets (auto-cast, style-anchored) ----
+    img_client = get_image_client(request)
+    for c in (script.get("characters") or []):
+        name = (c.get("name") or "").strip()
+        sheet_prompt = (c.get("sheet_prompt") or c.get("description") or "").strip()
+        if not name:
+            continue
+        try:
+            cur = store.load_state()
+            prompt = pipeline.build_sheet_prompt(
+                cur.get("master_prompt", ""), name, sheet_prompt,
+                style_notes=cur.get("style_notes", ""))
+            _refs, _labels = [], []
+            for _sf in (cur.get("style_frames") or [])[:3]:
+                try:
+                    _refs.append(store.read_image(_sf["url"]))
+                    _labels.append("STYLE REF — match this art style")
+                except Exception:
+                    pass
+            if _refs:
+                ep = (prompt + "\n\nReproduce the EXACT art style of the attached "
+                      "reference frame(s); draw THIS character in that style.")
+                _multi = bool(s.get("multi_image_edit"))
+                _send = (_refs if _multi else
+                         ([pipeline.contact_sheet(_refs, labels=_labels)]
+                          if len(_refs) > 1 else _refs))
+                img = img_client.edit(ep, _send, size=size, quality=quality)
+            else:
+                img = img_client.generate(prompt, size=size, quality=quality)
+            rec = {"id": store.new_id("char"), "name": name,
+                   "description": sheet_prompt,
+                   "sheet_url": store.write_image("characters", img),
+                   "prompt": prompt, "source": "generated"}
+            with _state_write_lock:
+                cur = store.load_state()
+                cur["characters"].append(rec)
+                store.save_state(cur)
+            store.log_usage("image", 1, 0.08)
+        except Exception as ce:
+            print(f"[a2v] character '{name}' failed: {ce}", flush=True)
+            if _is_fatal_image_error(str(ce)):
+                raise HTTPException(500, f"Image account problem: {str(ce)[:200]}")
+
+    # ---- STEP 5: render frames (style-locked, micro-cut continuity) ----
+    frames_ok, frames_fail = 0, 0
+    rendered_scene_indices = []  # track which scene index each successful frame came from
+    for i, sc in enumerate(scenes):
+        p = (sc.get("prompt") or "").strip()
+        if not p:
+            p = _sanitize_prompt((sc.get("vo") or "").strip() or (style_notes or "scene"))
+        if not _has_camera_language(p):
+            cue = _angle_cue_for(i)
+            if cue:
+                p = f"{p}, {cue}"
+        try:
+            _render_one(p, size, quality, True, True, request=request,
+                        shot_relation=sc.get("shot_relation", "cut"))
+            rendered_scene_indices.append(i)
+            frames_ok += 1
+        except Exception as ex:
+            frames_fail += 1
+            print(f"[a2v] frame {i+1} failed: {ex}", flush=True)
+            if _is_fatal_image_error(str(ex)):
+                raise HTTPException(500, f"Image account problem: {str(ex)[:200]}")
+    if frames_ok == 0:
+        raise HTTPException(500, f"No frames rendered ({frames_fail} failed).")
+
+    # ---- STEP 6: build the final video — YOUR audio + word-timestamp holds ----
+    st = store.load_state()
+    seq = st.get("sequence") or []
+    n = len(seq)
+    # Map each frame in seq back to the scene it was rendered from, so VO and
+    # hold timing stay correct even when some scene renders failed and were
+    # skipped (seq has no gap — it only contains successful frames).
+    frame_scene_map = rendered_scene_indices[:n]
+
+    # Ensure audio_dur is always a real float (never None) — prevents TypeError
+    # in division inside _holds_from_alignment.
+    if not audio_dur or audio_dur <= 0.0:
+        if words:
+            audio_dur = words[-1]["end"]
+        elif segments:
+            audio_dur = segments[-1]["end"]
+        else:
+            audio_dur = max(1.0, n * 2.0)
+
+    # Real per-scene holds from Whisper word timestamps (frame-accurate sync).
+    holds = None
+    if words:
+        alignment = transcribe.words_to_char_alignment(words)
+        tts_lines = [(scenes[frame_scene_map[i]].get("vo") or "").strip()
+                     if i < len(frame_scene_map) and frame_scene_map[i] < len(scenes)
+                     else "" for i in range(n)]
+        holds = _holds_from_alignment(tts_lines, alignment, audio_dur)
+    if not holds or len(holds) != n:
+        # Fallback: proportional to the mapped segment durations.
+        raw_h = []
+        for i in range(n):
+            si = frame_scene_map[i] if i < len(frame_scene_map) else 0
+            seg = segments[si] if si < len(segments) else {"start": 0, "end": 0}
+            raw_h.append(max(0.3, float(seg.get("end", 0)) - float(seg.get("start", 0))))
+        tot = sum(raw_h) or 1.0
+        scale = audio_dur / tot
+        holds = [round(h * scale, 3) for h in raw_h]
+
+    shots, scene_map = [], []
+    for i in range(n):
+        try:
+            img_path = store.url_to_path(seq[i]["image_url"])
+        except Exception:
+            continue
+        si = frame_scene_map[i] if i < len(frame_scene_map) else 0
+        vo = (scenes[si].get("vo") or "") if si < len(scenes) else ""
+        shots.append({"path": img_path, "duration": holds[i], "note": vo[:60]})
+        scene_map.append({"index": i + 1, "vo": vo, "hold_seconds": holds[i]})
+    if not shots:
+        raise HTTPException(400, "no readable frames to assemble")
+    # Fast micro-cuts: split any frame held longer than max_hold.
+    shots = editor.split_long_holds(shots, max_hold=max(0.8, float(body.max_hold)))
+
+    out_name = f"a2v_{int(time.time())}.mp4"
+    out_path = os.path.join(store.VIDEOS_DIR, out_name)
+    try:
+        editor.assemble_video(shots, body.audio_path, out_path,
+                              transition=(body.transition or "cut").lower(),
+                              width=width, height=height, fps=body.fps,
+                              motion=body.motion)
+    except Exception as ex:
+        raise HTTPException(500, f"video assembly failed: {ex}")
+
+    if body.cut_clicks:
+        try:
+            _apply_cut_clicks(request, out_path, [sc["hold_seconds"] for sc in scene_map],
+                              volume=body.cut_click_volume, style=body.cut_click_style)
+        except Exception as ex:
+            print(f"[a2v] cut clicks skipped: {ex}", flush=True)
+
+    rel = os.path.relpath(out_path, store.DATA_DIR).replace(os.sep, "/")
+    video_url = f"/data/{rel}"
+    total = round(audio_dur or sum(holds), 2)
+    # Copy the uploaded audio into the data dir so it gets a stable /data/ URL
+    # (otherwise the UI can't play it back and downstream features break).
+    _audio_url = None
+    try:
+        with open(body.audio_path, "rb") as _af:
+            _audio_url, _ = store.write_binary(
+                "audio", _af.read(),
+                ext=os.path.splitext(body.audio_path)[1].lstrip(".") or "mp3",
+                name_hint="a2v_audio")
+    except Exception:
+        pass
+    with _state_write_lock:
+        st = store.load_state()
+        st["audio"] = {"id": store.new_id("audio"), "url": _audio_url,
+                       "name": os.path.basename(body.audio_path), "duration": total}
+        edit_rec = {"id": store.new_id("edit"), "url": video_url,
+                    "plan": {"mode": "audio_to_video", "total_duration": total,
+                             "frames": n, "shots": scene_map},
+                    "created": store.now()}
+        st.setdefault("edits", []).append(edit_rec)
+        store.save_state(st)
+    store.log_usage("video", 1, 0.0)
+
+    return {"ok": True, "video_url": video_url, "duration": total,
+            "frames": frames_ok, "frames_failed": frames_fail,
+            "scenes": scene_map, "style_notes": style_notes,
+            "transcript": tr.get("text", ""),
+            "characters": len(st.get("characters") or [])}

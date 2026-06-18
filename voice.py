@@ -198,6 +198,50 @@ class VoiceClient:
             parts.append(mp3)
         return b"".join(parts)
 
+    def _synthesize_one_with_timestamps(self, text, voice_id, model,
+                                         stability, similarity_boost, style):
+        """Synthesize ONE chunk (must be under the char limit) via the
+        with-timestamps endpoint. Returns (mp3_bytes, alignment_dict) or
+        (mp3_bytes, None) if the endpoint/plan can't return timing."""
+        import base64
+        url = f"{self.base_url}/text-to-speech/{voice_id}/with-timestamps"
+        body = {
+            "text": text,
+            "model_id": model,
+            "voice_settings": {
+                "stability": stability,
+                "similarity_boost": similarity_boost,
+                "style": style,
+                "use_speaker_boost": True,
+            },
+        }
+        r = _post_with_retry(
+            url,
+            headers={"xi-api-key": self.api_key,
+                     "Content-Type": "application/json"},
+            json=body,
+            timeout=self.timeout,
+            what="TTS (timestamps)",
+        )
+        if r.status_code >= 400:
+            mp3 = self._synthesize_one(
+                text, voice_id, model, stability, similarity_boost, style)
+            return mp3, None
+        try:
+            data = r.json()
+            audio_b64 = data.get("audio_base64") or ""
+            mp3 = base64.b64decode(audio_b64) if audio_b64 else b""
+            if not mp3:
+                mp3 = self._synthesize_one(
+                    text, voice_id, model, stability, similarity_boost, style)
+                return mp3, None
+            alignment = data.get("normalized_alignment") or data.get("alignment")
+            return mp3, alignment
+        except Exception:
+            mp3 = self._synthesize_one(
+                text, voice_id, model, stability, similarity_boost, style)
+            return mp3, None
+
     def synthesize_with_timestamps(self, text, voice_id=None, model=None,
                                     stability=0.5, similarity_boost=0.75,
                                     style=0.0):
@@ -209,64 +253,67 @@ class VoiceClient:
           character_start_times_seconds list[float]
           character_end_times_seconds   list[float]
 
-        Falls back to ``(synthesize(text), None)`` if the endpoint is
-        unavailable (older API plans) or returns a non-JSON response.
-        Only works for texts under ~4 500 chars (one request); for longer
-        texts the caller should fall back to plain ``synthesize()``.
+        LONG TEXT (> ~4500 chars) is split at sentence boundaries, each chunk is
+        synthesized with timestamps, and the per-chunk alignments are STITCHED
+        with a cumulative time offset so the whole narration keeps exact
+        character-level timing — long videos get the same frame-accurate A/V
+        sync as short ones.  Degrades to ``(synthesize(text), None)`` only when
+        the endpoint/plan can't return timing at all.
         """
         self._require_key()
         voice_id = voice_id or self.voice_id
         model = model or self.model
         speak = (text or "").strip() or " "
 
-        if len(speak) > 4500:
-            # timestamp endpoint doesn't support chunking; synthesize the FULL
-            # text via the chunking path (no content dropped) and signal the
-            # caller (alignment=None) to fall back to word-count holds.
-            return self.synthesize(
-                speak, voice_id, model, stability, similarity_boost, style
-            ), None
+        chunks = self._chunk_text(speak, limit=4500)
 
-        url = f"{self.base_url}/text-to-speech/{voice_id}/with-timestamps"
-        body = {
-            "text": speak,
-            "model_id": model,
-            "voice_settings": {
-                "stability": stability,
-                "similarity_boost": similarity_boost,
-                "style": style,
-                "use_speaker_boost": True,
-            },
+        # Single chunk: direct call (fast path).
+        if len(chunks) == 1:
+            return self._synthesize_one_with_timestamps(
+                chunks[0], voice_id, model, stability, similarity_boost, style)
+
+        # Multi-chunk: synth each, concat audio, stitch alignments with a
+        # running time offset = end of the previous chunk's audio.
+        mp3_parts = []
+        merged = {
+            "characters": [],
+            "character_start_times_seconds": [],
+            "character_end_times_seconds": [],
         }
-        import base64
-        r = _post_with_retry(
-            url,
-            headers={"xi-api-key": self.api_key,
-                     "Content-Type": "application/json"},
-            json=body,
-            timeout=self.timeout,
-            what="TTS (timestamps)",
-        )
-        if r.status_code >= 400:
-            # Endpoint not available on this plan — degrade gracefully.
-            mp3 = self._synthesize_one(
-                speak, voice_id, model, stability, similarity_boost, style)
-            return mp3, None
-        try:
-            data = r.json()
-            audio_b64 = data.get("audio_base64") or ""
-            mp3 = base64.b64decode(audio_b64) if audio_b64 else b""
-            if not mp3:
-                mp3 = self._synthesize_one(
-                    speak, voice_id, model, stability, similarity_boost, style)
-                return mp3, None
-            # Prefer normalized_alignment (numbers/symbols expanded as spoken).
-            alignment = data.get("normalized_alignment") or data.get("alignment")
-            return mp3, alignment
-        except Exception:
-            mp3 = self._synthesize_one(
-                speak, voice_id, model, stability, similarity_boost, style)
-            return mp3, None
+        time_offset = 0.0
+        any_alignment = False
+
+        for chunk in chunks:
+            mp3, align = self._synthesize_one_with_timestamps(
+                chunk, voice_id, model, stability, similarity_boost, style)
+            mp3_parts.append(mp3)
+            if align and align.get("characters"):
+                any_alignment = True
+                chars = align.get("characters", [])
+                starts = align.get("character_start_times_seconds", [])
+                ends = align.get("character_end_times_seconds", [])
+                if len(starts) == len(chars) and len(ends) == len(chars):
+                    merged["characters"].extend(chars)
+                    merged["character_start_times_seconds"].extend(
+                        s + time_offset for s in starts)
+                    merged["character_end_times_seconds"].extend(
+                        e + time_offset for e in ends)
+                    # next chunk's audio begins where this one ended
+                    time_offset += (ends[-1] if ends else 0.0)
+                    # whitespace join between chunks (sentence boundary) — keep
+                    # the alignment text aligned with the concatenated speech
+                    merged["characters"].append(" ")
+                    merged["character_start_times_seconds"].append(time_offset)
+                    merged["character_end_times_seconds"].append(time_offset)
+                    continue
+            # Chunk returned no usable alignment — advance the offset by a
+            # rough estimate so later chunks don't collapse onto t=0.
+            time_offset += max(1.0, len(chunk) / 14.0)  # ~14 chars/sec speech
+
+        full_mp3 = b"".join(p for p in mp3_parts if p)
+        if not any_alignment:
+            return full_mp3, None
+        return full_mp3, merged
 
 
 def _concat_wav(wav_list):
