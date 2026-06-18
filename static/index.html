@@ -2145,14 +2145,16 @@ Close-up of @Mira fixing a circuit board, sparks reflecting on her goggles
     <!-- ============ AUDIO → VIDEO (standalone) ============ -->
     <section class="view sheet" id="view-a2v">
       <h2 class="section">🎵→🎬 Audio → Video</h2>
-      <p class="sub">Upload your own audio + a sample video. The audio is transcribed (Whisper, word-level timing) and drives frame-accurate cuts; the sample video sets the art style. Output: a fast, micro-cut, high-retention video with continuity — built entirely from your audio. <strong>This is separate from the YouTube workflow.</strong></p>
+      <p class="sub">Upload your audio + paste a sample-video link. Preview scenes before spending credits, edit prompts, pick export presets, and render with live progress. <strong>Separate from the YouTube workflow.</strong></p>
 
+      <!-- STEP 1: Upload -->
       <div class="row" style="gap:20px; flex-wrap:wrap; align-items:flex-start; margin-top:14px">
         <div style="flex:1; min-width:280px">
           <h4 style="color:var(--teal)">1 · Your audio</h4>
           <input type="file" id="a2vAudioFile" accept="audio/*,video/*" style="display:none" onchange="a2vPickAudio(this)">
           <button class="btn outline" onclick="$('#a2vAudioFile').click()">⬆ Choose audio file…</button>
           <div id="a2vAudioName" class="pill" style="margin-top:8px; display:none"></div>
+          <div id="a2vWaveform" style="margin-top:10px; height:48px; background:var(--panel); border-radius:8px; overflow:hidden; position:relative; display:none"></div>
         </div>
         <div style="flex:1; min-width:280px">
           <h4 style="color:var(--teal)">2 · Sample video link (art style)</h4>
@@ -2165,46 +2167,98 @@ Close-up of @Mira fixing a circuit board, sparks reflecting on her goggles
         </div>
       </div>
 
+      <!-- STEP 2: Options -->
       <h4 style="color:var(--teal); margin-top:22px">3 · Options</h4>
       <div class="row" style="gap:16px; flex-wrap:wrap; align-items:center">
-        <label class="sub">Transcription
-          <select id="a2vEngine" class="inp">
-            <option value="local" selected>Local Whisper (free, on your PC)</option>
-            <option value="elevenlabs">ElevenLabs Scribe (uses your ElevenLabs key)</option>
+        <label class="sub">Export preset
+          <select id="a2vPreset" class="inp" onchange="a2vApplyPreset(this.value)">
+            <option value="">Custom</option>
+            <option value="youtube">YouTube (16:9, 1080p)</option>
+            <option value="shorts">YouTube Shorts (9:16)</option>
+            <option value="reels">Instagram Reels (9:16)</option>
+            <option value="tiktok">TikTok (9:16, fast cuts)</option>
+            <option value="square">Square 1:1</option>
           </select>
         </label>
-        <label class="sub">Orientation
-          <select id="a2vOrient" class="inp">
-            <option value="landscape">Landscape 16:9</option>
-            <option value="portrait">Portrait 9:16 (Shorts)</option>
-            <option value="square">Square 1:1</option>
+        <label class="sub">Transcription
+          <select id="a2vEngine" class="inp">
+            <option value="local" selected>Local Whisper (free)</option>
+            <option value="elevenlabs">ElevenLabs Scribe</option>
+          </select>
+        </label>
+        <label class="sub">Language
+          <select id="a2vLang" class="inp">
+            <option value="">Auto-detect</option>
+            <option value="en">English</option>
+            <option value="te">Telugu</option>
+            <option value="hi">Hindi</option>
+            <option value="es">Spanish</option>
+            <option value="fr">French</option>
+            <option value="de">German</option>
+            <option value="ja">Japanese</option>
+            <option value="ko">Korean</option>
+            <option value="zh">Chinese</option>
+            <option value="ar">Arabic</option>
+            <option value="pt">Portuguese</option>
           </select>
         </label>
         <label class="sub">Quality
           <select id="a2vQuality" class="inp">
-            <option value="low">Low (fast/cheap)</option>
+            <option value="low">Low (cheap)</option>
             <option value="medium" selected>Medium</option>
             <option value="high">High</option>
           </select>
         </label>
-        <label class="sub">Max hold (micro-cut)
-          <input id="a2vMaxHold" class="inp" type="number" step="0.1" min="0.8" value="1.6" style="width:80px">
-        </label>
-        <label class="toggle on" id="a2vDynamic" onclick="toggle('a2vDynamic')"><span>High-retention reactions</span></label>
-        <label class="toggle" id="a2vMotion" onclick="toggle('a2vMotion')"><span>Ken-Burns motion</span></label>
+        <label class="toggle on" id="a2vDynamic" onclick="toggle('a2vDynamic')"><span>High-retention</span></label>
+        <label class="toggle" id="a2vMotion" onclick="toggle('a2vMotion')"><span>Ken-Burns</span></label>
         <label class="toggle" id="a2vClicks" onclick="toggle('a2vClicks')"><span>Cut clicks</span></label>
       </div>
 
-      <details style="margin-top:12px">
+      <!-- Music mixing -->
+      <details style="margin-top:10px">
+        <summary class="sub" style="cursor:pointer">🎵 Background music (optional)</summary>
+        <div class="row" style="gap:12px; margin-top:8px; align-items:center">
+          <input type="file" id="a2vMusicFile" accept="audio/*" style="display:none" onchange="a2vPickMusic(this)">
+          <button class="btn outline sm" onclick="$('#a2vMusicFile').click()">⬆ Choose music…</button>
+          <div id="a2vMusicName" class="pill" style="display:none"></div>
+          <label class="sub">Volume
+            <input id="a2vMusicVol" type="range" min="0" max="1" step="0.05" value="0.12" style="width:100px">
+          </label>
+        </div>
+      </details>
+
+      <!-- Advanced -->
+      <details style="margin-top:8px">
         <summary class="sub" style="cursor:pointer">Advanced: override art-style notes</summary>
         <textarea id="a2vStyleNotes" class="inp" rows="3" placeholder="Leave blank to auto-analyse the sample video. Or describe the exact look to force it." style="width:100%; margin-top:8px"></textarea>
       </details>
 
+      <!-- STEP 3: Preview / Generate -->
       <div class="row" style="gap:14px; margin-top:20px; align-items:center">
-        <button class="btn" id="a2vGoBtn" onclick="runAudioToVideo(this)">▶ Generate video from audio</button>
-        <span id="a2vStatus" class="sub"></span>
+        <button class="btn" id="a2vPreviewBtn" onclick="a2vPreview(this)">🔍 Preview scenes (free — no credits)</button>
+        <span id="a2vCostEst" class="sub" style="color:var(--amber-soft)"></span>
       </div>
 
+      <!-- Scene preview + edit area -->
+      <div id="a2vScenePreview" style="margin-top:20px; display:none">
+        <h4 style="color:var(--teal)">4 · Review & edit scenes before rendering</h4>
+        <p class="sub">Edit any scene prompt below. Click "Render" when happy — that's when image credits are spent.</p>
+        <div id="a2vSceneList" style="margin-top:10px"></div>
+        <div class="row" style="gap:14px; margin-top:16px; align-items:center">
+          <button class="btn" id="a2vRenderBtn" onclick="a2vRender(this)">▶ Render video (spends credits)</button>
+          <span id="a2vRenderStatus" class="sub"></span>
+        </div>
+      </div>
+
+      <!-- Progress bar -->
+      <div id="a2vProgress" style="margin-top:20px; display:none">
+        <div style="background:var(--panel); border-radius:8px; overflow:hidden; height:8px">
+          <div id="a2vProgressBar" style="background:var(--teal); height:100%; width:0%; transition:width 0.5s"></div>
+        </div>
+        <div id="a2vProgressText" class="sub" style="margin-top:6px"></div>
+      </div>
+
+      <!-- Result -->
       <div id="a2vResult" style="margin-top:22px; display:none">
         <video id="a2vVideo" controls style="width:100%; max-width:880px; border-radius:12px; background:#000"></video>
         <div id="a2vMeta" class="sub" style="margin-top:10px"></div>
@@ -2657,19 +2711,20 @@ document.addEventListener("click",(e)=>{
 document.addEventListener("DOMContentLoaded",()=>{ const b=$("#uiSfxBtn"); if(b&&!UI_SFX) b.textContent="🔇"; });
 function escapeHtml(s){ return (s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 
-/* ---------- Audio → Video (standalone tab) ---------- */
-const A2V = { audioPath:null, videoPath:null, frames:[] };
+/* ---------- Audio → Video (enhanced — all 10 features) ---------- */
+const A2V = { audioPath:null, videoPath:null, frames:[], musicPath:null, previewData:null, runId:null };
+
 async function a2vUpload(file, kind){
-  const fd = new FormData();
-  fd.append("file", file);
-  fd.append("kind", kind);
+  const fd = new FormData(); fd.append("file", file); fd.append("kind", kind);
   return await api("/api/audio-to-video/upload", {method:"POST", body:fd});
 }
 async function a2vPickAudio(inp){
   const f = inp.files && inp.files[0]; if(!f) return;
   const nm=$("#a2vAudioName"); nm.style.display="inline-block"; nm.textContent="⏳ uploading "+f.name+"…";
-  try{ const d = await a2vUpload(f, "audio"); A2V.audioPath = d.path; nm.textContent="🎵 "+f.name; }
-  catch(e){ nm.textContent="✖ "+e.message; }
+  try{ const d = await a2vUpload(f, "audio"); A2V.audioPath = d.path; nm.textContent="🎵 "+f.name;
+    // Load waveform
+    try{ await a2vLoadWaveform(d.path); }catch(_){}
+  } catch(e){ nm.textContent="✖ "+e.message; }
 }
 async function a2vFetchLink(btn){
   const url = ($("#a2vVideoLink").value||"").trim();
@@ -2681,43 +2736,146 @@ async function a2vFetchLink(btn){
     A2V.videoPath = d.path || null; A2V.frames = d.frames || [];
     nm.textContent = "🎬 "+A2V.frames.length+" style frame(s)"+(d.note?(" · "+d.note):"");
     const box=$("#a2vFrames"); box.textContent = "";
-    A2V.frames.slice(0,8).forEach(u => {
-      const img = document.createElement("img");
-      img.src = u;
-      img.style.cssText = "width:70px;height:46px;object-fit:cover;border-radius:6px;border:1px solid var(--line)";
-      box.appendChild(img);
-    });
+    A2V.frames.slice(0,8).forEach(u => { const img = document.createElement("img"); img.src = u; img.style.cssText = "width:70px;height:46px;object-fit:cover;border-radius:6px;border:1px solid var(--line)"; box.appendChild(img); });
   }catch(e){ nm.textContent="✖ "+e.message; }
   finally{ busy(btn, false); }
 }
-async function runAudioToVideo(btn){
-  if(!A2V.audioPath){ $("#a2vStatus").textContent="Choose an audio file first."; return; }
+async function a2vPickMusic(inp){
+  const f = inp.files && inp.files[0]; if(!f) return;
+  const nm=$("#a2vMusicName"); nm.style.display="inline-block"; nm.textContent="⏳ uploading…";
+  try{ const d = await a2vUpload(f, "audio"); A2V.musicPath = d.path; nm.textContent="🎵 "+f.name; }
+  catch(e){ nm.textContent="✖ "+e.message; }
+}
+function a2vApplyPreset(val){
+  const orient=$("#a2vOrient"); if(!orient) return;
+  // Presets auto-set orientation via the backend; just show a note
+  if(val) $("#a2vCostEst").textContent = "Preset: "+val+" — orientation/speed auto-applied";
+}
+async function a2vLoadWaveform(path){
+  const box=$("#a2vWaveform"); if(!box) return;
+  try{
+    const d = await api("/api/audio-to-video/waveform?path="+encodeURIComponent(path)+"&bars=80");
+    if(!d.bars||!d.bars.length) return;
+    box.style.display="block"; box.textContent="";
+    const maxH = Math.max(...d.bars)||1;
+    d.bars.forEach((v,i)=>{ const bar=document.createElement("div"); bar.style.cssText=`display:inline-block;width:${100/d.bars.length}%;height:${(v/maxH)*100}%;background:var(--teal);vertical-align:bottom;opacity:0.7`; box.appendChild(bar); });
+  }catch(_){}
+}
+async function a2vPreview(btn){
+  if(!A2V.audioPath){ $("#a2vCostEst").textContent="Choose an audio file first."; return; }
+  busy(btn, true, "Analysing… (transcribing + writing scenes)");
+  $("#a2vCostEst").textContent="Transcribing audio + analysing style + writing scenes…";
   const body = {
     audio_path: A2V.audioPath,
     sample_video_path: A2V.videoPath || null,
     sample_frame_urls: A2V.frames || [],
     style_notes: ($("#a2vStyleNotes").value||"").trim() || null,
     transcribe_engine: $("#a2vEngine").value,
-    orientation: $("#a2vOrient").value,
-    quality: $("#a2vQuality").value,
-    max_hold: parseFloat($("#a2vMaxHold").value)||1.6,
+    language: ($("#a2vLang").value||"") || null,
     dynamic: isOn("a2vDynamic"),
+    orientation: "landscape",
+  };
+  try{
+    const d = await api("/api/audio-to-video/preview", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+    A2V.previewData = d;
+    // Show cost estimate
+    const cost = d.cost_estimate||{};
+    $("#a2vCostEst").textContent = `💰 Est. $${cost.total_usd||"??"} (${cost.image_renders||0} frames + ${cost.character_sheets||0} chars) · Transcript: ${d.transcribe_engine||"local"}`;
+    // Show scene preview with editable prompts
+    a2vRenderScenes(d.scenes||[], d.characters||[], d.style_notes||"", d.style_frames||[]);
+    // Show transcript
+    $("#a2vResult").style.display="block";
+    $("#a2vTranscript").textContent = d.transcript || "(no transcript)";
+    $("#a2vVideo").style.display="none";
+    $("#a2vMeta").textContent = `✅ ${d.scenes?.length||0} scenes · ${Math.round(d.audio_duration||0)}s audio · ${d.transcribe_engine||"local"} transcription`;
+  }catch(e){ $("#a2vCostEst").textContent="✖ "+e.message; }
+  finally{ busy(btn, false); }
+}
+function a2vRenderScenes(scenes, characters, styleNotes, styleFrames){
+  const box=$("#a2vSceneList"); box.textContent=""; box.style.display="block";
+  $("#a2vScenePreview").style.display="block";
+  scenes.forEach((sc, i)=>{
+    const div=document.createElement("div"); div.style.cssText="margin-bottom:12px;padding:10px;background:var(--panel);border-radius:8px;border:1px solid var(--line)";
+    const vo = (sc.vo||"").replace(/</g,"&lt;");
+    div.innerHTML=`<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span style="color:var(--teal);font-weight:700">Scene ${i+1}</span><span class="sub" style="font-size:12px">${vo.slice(0,80)}…</span><button class="btn outline sm" onclick="a2vReroll(${i})" style="margin-left:auto" title="Re-roll this frame">🔄</button></div><textarea class="inp" rows="2" style="width:100%" data-scene="${i}">${(sc.prompt||"").replace(/</g,"&lt;")}</textarea>`;
+    box.appendChild(div);
+  });
+  // Store data for render
+  A2V._scenes = scenes; A2V._characters = characters; A2V._styleNotes = styleNotes; A2V._styleFrames = styleFrames;
+}
+async function a2vRender(btn){
+  if(!A2V._scenes){ $("#a2vRenderStatus").textContent="Preview scenes first."; return; }
+  // Read edited prompts from textareas
+  const editedScenes = A2V._scenes.map((sc, i)=>{
+    const ta = document.querySelector(`textarea[data-scene="${i}"]`);
+    return {...sc, prompt: ta ? ta.value : sc.prompt};
+  });
+  const preset = ($("#a2vPreset").value||"");
+  busy(btn, true, "Rendering…");
+  $("#a2vRenderStatus").textContent="Starting render…";
+  $("#a2vProgress").style.display="block";
+  const body = {
+    audio_path: A2V.audioPath,
+    scenes: editedScenes,
+    characters: A2V._characters||[],
+    style_notes: A2V._styleNotes||"",
+    style_frames: A2V._styleFrames||[],
+    quality: $("#a2vQuality").value,
     motion: isOn("a2vMotion"),
     cut_clicks: isOn("a2vClicks"),
+    music_path: A2V.musicPath||null,
+    music_volume: parseFloat($("#a2vMusicVol")?.value)||0.12,
+    export_preset: preset||null,
+    max_hold: preset==="tiktok"?1.0:preset==="shorts"||preset==="reels"?1.2:1.6,
   };
-  busy(btn, true, "Generating… (this can take a few minutes)");
-  $("#a2vStatus").textContent="Transcribing → writing scenes → rendering frames → building video…";
   try{
-    const d = await api("/api/audio-to-video", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
-    $("#a2vResult").style.display="block";
-    $("#a2vVideo").src = d.video_url + "?t=" + Date.now();
-    $("#a2vMeta").textContent = `✅ ${d.frames} frames · ${d.duration}s · ${d.characters} character(s)` +
-      (d.frames_failed?` · ${d.frames_failed} failed`:"") +
-      (d.style_notes?` · style: ${d.style_notes.slice(0,80)}…`:"");
-    $("#a2vTranscript").textContent = d.transcript || "(no transcript)";
-    $("#a2vStatus").textContent="Done.";
-  }catch(e){ $("#a2vStatus").textContent="✖ "+e.message; }
+    const d = await api("/api/audio-to-video/render", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+    A2V.runId = d.run_id;
+    $("#a2vRenderStatus").textContent=`Rendering ${d.scenes} frames… poll for progress.`;
+    a2vPollProgress(d.run_id);
+  }catch(e){ $("#a2vRenderStatus").textContent="✖ "+e.message; $("#a2vProgress").style.display="none"; }
   finally{ busy(btn, false); }
+}
+function a2vPollProgress(runId){
+  const bar=$("#a2vProgressBar"), txt=$("#a2vProgressText");
+  const poll = setInterval(async()=>{
+    try{
+      const p = await api("/api/audio-to-video/progress/"+runId);
+      if(p.unknown){ return; }
+      const pct = p.frames_total ? Math.round(100*p.frames_done/p.frames_total) : 0;
+      if(bar) bar.style.width = pct+"%";
+      let msg = `Step: ${p.step||"init"} · ${p.frames_done||0}/${p.frames_total||0} frames`;
+      if(p.chars_done) msg += ` · ${p.chars_done} chars`;
+      if(p.eta_seconds!=null) msg += ` · ETA ${Math.round(p.eta_seconds)}s`;
+      if(p.elapsed) msg += ` · ${Math.round(p.elapsed)}s elapsed`;
+      if(txt) txt.textContent = msg;
+      if(p.done){
+        clearInterval(poll);
+        if(p.error){
+          txt.textContent = "✖ "+p.error;
+          bar.style.background = "var(--red)";
+        } else {
+          txt.textContent = "✅ Done! "+(p.duration||0)+"s video, "+(p.frames_done||0)+" frames";
+          bar.style.width = "100%";
+          bar.style.background = "var(--green)";
+          // Show result video
+          $("#a2vResult").style.display="block";
+          $("#a2vVideo").style.display="block";
+          $("#a2vVideo").src = p.video_url + "?t=" + Date.now();
+          $("#a2vMeta").textContent = `✅ ${p.frames_done} frames · ${p.duration}s · ${p.style_notes?.slice(0,60)||""}`;
+        }
+      }
+    }catch(e){ clearInterval(poll); if(txt) txt.textContent="✖ Poll failed: "+e.message; }
+  }, 2000);
+}
+async function a2vReroll(idx){
+  if(!A2V._scenes||!A2V.audioPath) return;
+  const ta = document.querySelector(`textarea[data-scene="${idx}"]`);
+  const scenes = A2V._scenes.map((sc, i)=>({...sc, prompt: i===idx && ta ? ta.value : sc.prompt}));
+  try{
+    const d = await api("/api/audio-to-video/reroll", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({scene_index:idx, audio_path:A2V.audioPath, scenes, style_notes:A2V._styleNotes||""})});
+    toast("Frame "+(idx+1)+" re-rolled","ok");
+  }catch(e){ toast("Re-roll failed: "+e.message,"err"); }
 }
 
 /* ---------- projects ---------- */

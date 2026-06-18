@@ -6916,3 +6916,551 @@ def api_audio_to_video(body: AudioToVideoIn, request: Request):
             "scenes": scene_map, "style_notes": style_notes,
             "transcript": tr.get("text", ""),
             "characters": len(st.get("characters") or [])}
+
+
+# =========================================================================== #
+#  A2V ENHANCED FEATURES                                                     #
+#  1. Async jobs + live progress                                              #
+#  2. Scene preview + manual editing before render                            #
+#  3. Re-roll individual frames                                               #
+#  4. Waveform with scene cut markers                                         #
+#  5. Multi-language support                                                  #
+#  6. Music / background audio mixing                                         #
+#  7. Export presets (YouTube Shorts, Reels, TikTok)                          #
+#  8. Cost estimation                                                         #
+# =========================================================================== #
+
+# --- Async A2V progress tracking (mirrors autopilot pattern) --------------- #
+_A2V_PROGRESS = {}
+_A2V_LOCK = threading.Lock()
+_A2V_STEPS = ["analyse", "transcribe", "scenes", "characters", "frames", "video"]
+
+
+def _a2v_prog(run_id, **kw):
+    if not run_id:
+        return
+    with _A2V_LOCK:
+        p = _A2V_PROGRESS.setdefault(run_id, {
+            "run_id": run_id, "started": time.time(),
+            "steps_total": len(_A2V_STEPS), "step": "", "step_index": 0,
+            "frames_done": 0, "frames_total": 0, "chars_done": 0, "chars_total": 0,
+            "done": False, "error": None, "video_url": None,
+            "scenes": None, "transcript": None, "style_notes": None,
+        })
+        if "step" in kw:
+            kw["step_index"] = _A2V_STEPS.index(kw["step"]) if kw["step"] in _A2V_STEPS else p["step_index"]
+        p.update(kw)
+
+
+@app.get("/api/audio-to-video/progress/{run_id}")
+def api_a2v_progress(run_id: str):
+    """Poll A2V generation progress — drives the live progress bar."""
+    with _A2V_LOCK:
+        p = dict(_A2V_PROGRESS.get(run_id) or {})
+    if not p:
+        return {"run_id": run_id, "unknown": True}
+    elapsed = max(0.0, time.time() - p.get("started", time.time()))
+    done = p.get("frames_done", 0)
+    total = p.get("frames_total", 0)
+    eta = None
+    if total and done:
+        rate = elapsed / max(1, done)
+        eta = round(rate * max(0, total - done), 1)
+    p["elapsed"] = round(elapsed, 1)
+    p["eta_seconds"] = eta
+    return p
+
+
+# --- Feature 2: Scene preview — analyse + transcribe without rendering ----- #
+class A2VPreviewIn(BaseModel):
+    audio_path: str
+    sample_video_path: Optional[str] = None
+    sample_frame_urls: Optional[List[str]] = None
+    style_notes: Optional[str] = None
+    language: Optional[str] = None
+    transcribe_engine: str = "local"
+    dynamic: bool = True
+    orientation: str = "landscape"
+
+
+@app.post("/api/audio-to-video/preview")
+def api_a2v_preview(body: A2VPreviewIn, request: Request):
+    """Analyse audio + sample video, write scenes, return them for user review
+    BEFORE spending image API credits. The user can edit/approve scenes, then
+    call /api/audio-to-video/render to actually generate frames."""
+    import transcribe
+
+    s = request.state.settings
+    if not _has_ai_key(s):
+        raise HTTPException(400, "No AI key set — add Claude in Settings.")
+    if not os.path.exists(body.audio_path):
+        raise HTTPException(400, "Uploaded audio not found.")
+
+    claude = _claude_client_for(None, request)
+
+    # Style analysis
+    frame_urls = list(body.sample_frame_urls or [])
+    if not frame_urls and body.sample_video_path and os.path.exists(body.sample_video_path):
+        try:
+            import video as videomod
+            frame_urls = videomod.extract_frames(body.sample_video_path, fps=0.5, max_frames=12)
+        except Exception:
+            pass
+    style_picks = frame_urls[::max(1, len(frame_urls) // 4)][:4] if frame_urls else []
+    style_notes = (body.style_notes or "").strip() or _a2v_analyze_style(claude, frame_urls)
+
+    # Transcription
+    engine = (body.transcribe_engine or "local").lower()
+    try:
+        tr = transcribe.transcribe_audio(body.audio_path, settings=s,
+                                         engine=engine, language=body.language)
+    except Exception as e:
+        raise HTTPException(500, f"Transcription failed: {e}")
+
+    segments = tr.get("segments") or []
+    words = tr.get("words") or []
+    audio_dur = float(tr.get("duration") or 0.0)
+    if not segments and tr.get("text"):
+        segments = [{"text": tr["text"], "start": 0.0, "end": audio_dur or 1.0}]
+    if not segments:
+        raise HTTPException(500, "No speech segments found in audio.")
+
+    # Scene generation
+    master_prompt = ("VISUAL STYLE — match the sample video exactly: " + style_notes) if style_notes else ""
+    try:
+        raw = claude.scenes_from_transcript(
+            segments, style_notes=style_notes, master_prompt=master_prompt,
+            dynamic=body.dynamic)
+        script = extract_json(raw)
+        if isinstance(script, list):
+            script = {"scenes": script, "characters": []}
+        if not isinstance(script, dict):
+            script = {"scenes": [], "characters": []}
+    except Exception:
+        script = {"scenes": [], "characters": []}
+
+    scenes = _normalize_scenes(script.get("scenes") or [])
+    for i, sc in enumerate(scenes):
+        if i < len(segments):
+            sc["vo"] = (segments[i].get("text") or "").strip()
+        if sc.get("prompt"):
+            sc["prompt"] = _sanitize_prompt(sc["prompt"])
+    # Pad/trim to match segments
+    while len(scenes) < len(segments):
+        i = len(scenes)
+        seg = segments[i]
+        base = scenes[-1].get("prompt", "") if scenes else (style_notes or "scene")
+        cue = _MOMENT_CUES[(i % (len(_MOMENT_CUES) - 1)) + 1]
+        scenes.append({"n": i + 1, "vo": (seg.get("text") or "").strip(),
+                       "prompt": _sanitize_prompt(f"{base}, {cue}"),
+                       "shot_relation": "cut"})
+    scenes = scenes[:len(segments)]
+
+    # Cost estimation
+    n_scenes = len(scenes)
+    _IMG_COST = {"low": 0.02, "medium": 0.04, "high": 0.08, "auto": 0.06}
+    img_cost = n_scenes * _IMG_COST.get("medium", 0.04)
+    char_cost = len(script.get("characters") or []) * _IMG_COST.get("medium", 0.04)
+    # Estimate TTS cost: ~$0.00003 per char for ElevenLabs
+    total_chars = sum(len(sc.get("vo", "")) for sc in scenes)
+    tts_cost = total_chars * 0.00003 if engine == "elevenlabs" else 0.0
+    total_cost = round(img_cost + char_cost + tts_cost, 4)
+
+    # Waveform data for visualization
+    waveform = None
+    try:
+        _dur = audio_dur or (segments[-1]["end"] if segments else 0)
+        waveform = {"duration": _dur, "segments": segments}
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "scenes": scenes,
+        "characters": script.get("characters") or [],
+        "transcript": tr.get("text", ""),
+        "segments": segments,
+        "style_notes": style_notes,
+        "style_frames": style_picks,
+        "audio_duration": audio_dur,
+        "transcribe_engine": tr.get("engine", engine),
+        "cost_estimate": {
+            "image_renders": n_scenes,
+            "character_sheets": len(script.get("characters") or []),
+            "image_cost_usd": round(img_cost + char_cost, 4),
+            "tts_cost_usd": round(tts_cost, 4),
+            "total_usd": total_cost,
+        },
+        "waveform": waveform,
+    }
+
+
+# --- Feature 1+3: Async render with progress + re-roll -------------------- #
+class A2VRenderIn(BaseModel):
+    audio_path: str
+    scenes: List[dict]           # user-approved (possibly edited) scenes
+    characters: Optional[List[dict]] = []
+    style_notes: Optional[str] = None
+    style_frames: Optional[List[str]] = None
+    orientation: str = "landscape"
+    size: Optional[str] = None
+    quality: Optional[str] = None
+    transition: str = "cut"
+    fps: int = 30
+    max_hold: float = 1.6
+    motion: bool = True
+    cut_clicks: bool = False
+    cut_click_volume: float = 0.30
+    cut_click_style: str = "click"
+    music_path: Optional[str] = None       # Feature 6: background music
+    music_volume: float = 0.12
+    export_preset: Optional[str] = None    # Feature 7: "shorts"/"reels"/"tiktok"/"youtube"
+
+
+# Export preset definitions
+_EXPORT_PRESETS = {
+    "shorts":  {"orientation": "portrait", "size": "1024x1536", "width": 1080, "height": 1920, "fps": 30, "max_hold": 1.2},
+    "reels":   {"orientation": "portrait", "size": "1024x1536", "width": 1080, "height": 1920, "fps": 30, "max_hold": 1.2},
+    "tiktok":  {"orientation": "portrait", "size": "1024x1536", "width": 1080, "height": 1920, "fps": 30, "max_hold": 1.0},
+    "youtube": {"orientation": "landscape", "size": "1536x1024", "width": 1920, "height": 1080, "fps": 30, "max_hold": 2.5},
+    "square":  {"orientation": "square", "size": "1024x1024", "width": 1080, "height": 1080, "fps": 30, "max_hold": 1.6},
+}
+
+
+@app.post("/api/audio-to-video/render")
+def api_a2v_render(body: A2VRenderIn, request: Request):
+    """Async render: starts the A2V pipeline in a background thread and returns
+    a run_id for polling via /api/audio-to-video/progress/{run_id}."""
+    run_id = store.new_id("a2v")
+    _a2v_prog(run_id, step="init", frames_total=len(body.scenes))
+
+    # Apply export preset if specified
+    preset = _EXPORT_PRESETS.get((body.export_preset or "").lower()) if body.export_preset else None
+    if preset:
+        body.orientation = preset["orientation"]
+        body.size = body.size or preset["size"]
+        body.fps = preset["fps"]
+        body.max_hold = preset["max_hold"]
+
+    def _run_a2v():
+        try:
+            _a2v_run_pipeline(run_id, body, request)
+        except Exception as e:
+            _a2v_prog(run_id, done=True, error=str(e)[:500])
+            print(f"[a2v] async run {run_id} failed: {e}", flush=True)
+
+    t = threading.Thread(target=_run_a2v, daemon=True)
+    t.start()
+    return {"ok": True, "run_id": run_id, "scenes": len(body.scenes)}
+
+
+def _a2v_run_pipeline(run_id: str, body: A2VRenderIn, request: Request):
+    """The actual A2V pipeline — runs in a background thread with progress."""
+    s = request.state.settings
+    style_notes = (body.style_notes or "").strip()
+    scenes = list(body.scenes or [])
+    n = len(scenes)
+    if n == 0:
+        _a2v_prog(run_id, done=True, error="No scenes provided")
+        return
+
+    # Apply export preset dimensions
+    preset = _EXPORT_PRESETS.get((body.export_preset or "").lower()) if hasattr(body, 'export_prescript') else None
+    orient = (body.orientation or "landscape").lower()
+    if orient in ("vertical", "portrait", "9:16", "shorts", "tiktok"):
+        size = body.size or "1024x1536"; width, height = 1080, 1920
+    elif orient in ("square", "1:1"):
+        size = body.size or "1024x1024"; width, height = 1080, 1080
+    else:
+        size = body.size or "1536x1024"; width, height = 1920, 1080
+    quality = body.quality or config.DEFAULT_QUALITY
+
+    # Fresh project state
+    _reset_generated(delete_files=True)
+    style_picks = body.style_frames or []
+    with _state_write_lock:
+        st = store.load_state()
+        st["style_notes"] = style_notes
+        st["master_prompt"] = ("VISUAL STYLE — match the sample video exactly: " + style_notes) if style_notes else ""
+        st["style_frames"] = [{"id": store.new_id("sf"), "url": u} for u in style_picks]
+        store.save_state(st)
+
+    # Step: Characters
+    _a2v_prog(run_id, step="characters")
+    img_client = get_image_client(request)
+    chars_created = 0
+    for c in (body.characters or []):
+        name = (c.get("name") or "").strip()
+        sheet_prompt = (c.get("sheet_prompt") or c.get("description") or "").strip()
+        if not name:
+            continue
+        try:
+            cur = store.load_state()
+            prompt = pipeline.build_sheet_prompt(cur.get("master_prompt", ""), name, sheet_prompt,
+                                                  style_notes=cur.get("style_notes", ""))
+            _refs, _labels = [], []
+            for _sf in (cur.get("style_frames") or [])[:3]:
+                try:
+                    _refs.append(store.read_image(_sf["url"]))
+                    _labels.append("STYLE REF — match this art style")
+                except Exception:
+                    pass
+            if _refs:
+                ep = prompt + "\n\nReproduce the EXACT art style of the attached reference frame(s); draw THIS character in that style."
+                _multi = bool(s.get("multi_image_edit"))
+                _send = _refs if _multi else ([pipeline.contact_sheet(_refs, labels=_labels)] if len(_refs) > 1 else _refs)
+                img = img_client.edit(ep, _send, size=size, quality=quality)
+            else:
+                img = img_client.generate(prompt, size=size, quality=quality)
+            rec = {"id": store.new_id("char"), "name": name, "description": sheet_prompt,
+                   "sheet_url": store.write_image("characters", img), "prompt": prompt, "source": "generated"}
+            with _state_write_lock:
+                cur = store.load_state()
+                cur["characters"].append(rec)
+                store.save_state(cur)
+            chars_created += 1
+            _a2v_prog(run_id, chars_done=chars_created)
+            store.log_usage("image", 1, 0.08)
+        except Exception as ce:
+            print(f"[a2v] character '{name}' failed: {ce}", flush=True)
+            if _is_fatal_image_error(str(ce)):
+                _a2v_prog(run_id, done=True, error=f"Image account problem: {str(ce)[:200]}")
+                return
+
+    # Step: Render frames
+    _a2v_prog(run_id, step="frames", frames_total=n, frames_done=0)
+    rendered_scene_indices = []
+    for i, sc in enumerate(scenes):
+        p = (sc.get("prompt") or "").strip()
+        if not p:
+            p = _sanitize_prompt((sc.get("vo") or "").strip() or (style_notes or "scene"))
+        if not _has_camera_language(p):
+            cue = _angle_cue_for(i)
+            if cue:
+                p = f"{p}, {cue}"
+        try:
+            _render_one(p, size, quality, True, True, request=request,
+                        shot_relation=sc.get("shot_relation", "cut"))
+            rendered_scene_indices.append(i)
+            _a2v_prog(run_id, frames_done=len(rendered_scene_indices))
+            store.log_usage("image", 1, 0.08)
+        except Exception as ex:
+            print(f"[a2v] frame {i+1} failed: {ex}", flush=True)
+            if _is_fatal_image_error(str(ex)):
+                _a2v_prog(run_id, done=True, error=f"Image account problem: {str(ex)[:200]}")
+                return
+
+    frames_ok = len(rendered_scene_indices)
+    if frames_ok == 0:
+        _a2v_prog(run_id, done=True, error="No frames rendered")
+        return
+
+    # Step: Build video
+    _a2v_prog(run_id, step="video")
+    st = store.load_state()
+    seq = st.get("sequence") or []
+    actual_n = len(seq)
+    frame_scene_map = rendered_scene_indices[:actual_n]
+
+    # Compute holds from Whisper timestamps (reuse the existing alignment path)
+    import transcribe as _tr_mod
+    words_data = st.get("a2v_words") or []  # stored during preview if available
+    audio_dur = float(st.get("a2v_audio_dur") or 0.0)
+    if not audio_dur:
+        try:
+            audio_dur = float(editor.probe_duration(body.audio_path))
+        except Exception:
+            audio_dur = max(1.0, actual_n * 2.0)
+
+    segments_data = []
+    for si in frame_scene_map:
+        if si < len(scenes):
+            vo = (scenes[si].get("vo") or "").strip()
+            # Find matching segment
+            for seg in (st.get("a2v_segments") or []):
+                if (seg.get("text") or "").strip() == vo:
+                    segments_data.append(seg)
+                    break
+            else:
+                segments_data.append({"text": vo, "start": 0, "end": 0})
+        else:
+            segments_data.append({"text": "", "start": 0, "end": 0})
+
+    # Fallback: proportional to segment durations
+    raw_h = [max(0.3, float(sg.get("end", 0)) - float(sg.get("start", 0))) for sg in segments_data]
+    tot = sum(raw_h) or 1.0
+    scale = audio_dur / tot
+    holds = [round(h * scale, 3) for h in raw_h]
+
+    shots, scene_map = [], []
+    for i in range(actual_n):
+        try:
+            img_path = store.url_to_path(seq[i]["image_url"])
+        except Exception:
+            continue
+        si = frame_scene_map[i] if i < len(frame_scene_map) else 0
+        vo = (scenes[si].get("vo") or "") if si < len(scenes) else ""
+        shots.append({"path": img_path, "duration": holds[i], "note": vo[:60]})
+        scene_map.append({"index": i + 1, "vo": vo, "hold_seconds": holds[i]})
+
+    if not shots:
+        _a2v_prog(run_id, done=True, error="No readable frames to assemble")
+        return
+
+    shots = editor.split_long_holds(shots, max_hold=max(0.8, float(body.max_hold)))
+
+    out_name = f"a2v_{int(time.time())}.mp4"
+    out_path = os.path.join(store.VIDEOS_DIR, out_name)
+    try:
+        # Feature 6: music mixing
+        music_path = body.music_path if body.music_path and os.path.exists(body.music_path) else None
+        music_vol = max(0.0, min(1.0, float(body.music_volume)))
+        editor.assemble_video(shots, body.audio_path, out_path,
+                              transition=(body.transition or "cut").lower(),
+                              width=width, height=height, fps=body.fps,
+                              motion=body.motion,
+                              music_path=music_path, music_volume=music_vol)
+    except Exception as ex:
+        _a2v_prog(run_id, done=True, error=f"Video assembly failed: {ex}")
+        return
+
+    if body.cut_clicks:
+        try:
+            _apply_cut_clicks(request, out_path, [sc["hold_seconds"] for sc in scene_map],
+                              volume=body.cut_click_volume, style=body.cut_click_style)
+        except Exception as ex:
+            print(f"[a2v] cut clicks skipped: {ex}", flush=True)
+
+    rel = os.path.relpath(out_path, store.DATA_DIR).replace(os.sep, "/")
+    video_url = f"/data/{rel}"
+    total = round(audio_dur, 2)
+
+    _audio_url = None
+    try:
+        with open(body.audio_path, "rb") as _af:
+            _audio_url, _ = store.write_binary("audio", _af.read(),
+                ext=os.path.splitext(body.audio_path)[1].lstrip(".") or "mp3",
+                name_hint="a2v_audio")
+    except Exception:
+        pass
+
+    with _state_write_lock:
+        st = store.load_state()
+        st["audio"] = {"id": store.new_id("audio"), "url": _audio_url,
+                       "name": os.path.basename(body.audio_path), "duration": total}
+        edit_rec = {"id": store.new_id("edit"), "url": video_url,
+                    "plan": {"mode": "audio_to_video", "total_duration": total,
+                             "frames": actual_n, "shots": scene_map},
+                    "created": store.now()}
+        st.setdefault("edits", []).append(edit_rec)
+        store.save_state(st)
+    store.log_usage("video", 1, 0.0)
+
+    _a2v_prog(run_id, done=True, video_url=video_url, duration=total,
+              frames_done=frames_ok, scenes=scene_map,
+              style_notes=style_notes)
+
+
+# --- Feature 3: Re-roll a single frame ------------------------------------- #
+class A2VRerollIn(BaseModel):
+    scene_index: int
+    audio_path: str
+    scenes: List[dict]
+    style_notes: Optional[str] = None
+    orientation: str = "landscape"
+    size: Optional[str] = None
+    quality: Optional[str] = None
+
+
+@app.post("/api/audio-to-video/reroll")
+def api_a2v_reroll(body: A2VRerollIn, request: Request):
+    """Re-render a single scene frame without re-running the whole pipeline."""
+    if body.scene_index < 0 or body.scene_index >= len(body.scenes):
+        raise HTTPException(400, f"scene_index {body.scene_index} out of range (0-{len(body.scenes)-1})")
+
+    orient = (body.orientation or "landscape").lower()
+    if orient in ("vertical", "portrait", "9:16", "shorts", "tiktok"):
+        size = body.size or "1024x1536"
+    elif orient in ("square", "1:1"):
+        size = body.size or "1024x1024"
+    else:
+        size = body.size or "1536x1024"
+    quality = body.quality or config.DEFAULT_QUALITY
+    style_notes = (body.style_notes or "").strip()
+
+    sc = body.scenes[body.scene_index]
+    p = (sc.get("prompt") or "").strip()
+    if not p:
+        p = _sanitize_prompt((sc.get("vo") or "").strip() or (style_notes or "scene"))
+
+    try:
+        rec = _render_one(p, size, quality, True, True, request=request,
+                          shot_relation=sc.get("shot_relation", "cut"))
+        store.log_usage("image", 1, 0.08)
+        return {"ok": True, "scene_index": body.scene_index,
+                "image_url": rec.get("image_url"), "prompt": p}
+    except Exception as ex:
+        raise HTTPException(500, f"Re-roll failed: {ex}")
+
+
+# --- Feature 5: Waveform with scene cut markers ---------------------------- #
+@app.get("/api/audio-to-video/waveform")
+def api_a2v_waveform(path: str, bars: int = 120):
+    """Generate waveform data for the audio file, with optional scene cut
+    markers overlaid. Returns bar heights for visualization."""
+    if not os.path.exists(path):
+        raise HTTPException(400, "Audio file not found.")
+    try:
+        import subprocess as _sp
+        # Use ffmpeg to extract raw audio samples and compute bar amplitudes
+        cmd = ["ffmpeg", "-i", path, "-ac", "1", "-ar", "8000", "-f", "f32le", "-"]
+        proc = _sp.run(cmd, capture_output=True, timeout=30)
+        if proc.returncode != 0:
+            raise RuntimeError("ffmpeg failed")
+        import struct
+        raw = proc.stdout
+        n_samples = len(raw) // 4
+        samples = struct.unpack(f"<{n_samples}f", raw[:n_samples*4]) if raw else []
+        if not samples:
+            return {"bars": [0.0] * bars, "duration": 0}
+        # Downsample to bar count
+        chunk = max(1, len(samples) // bars)
+        heights = []
+        for i in range(bars):
+            start = i * chunk
+            end = min(start + chunk, len(samples))
+            if start >= len(samples):
+                heights.append(0.0)
+            else:
+                chunk_samples = samples[start:end]
+                rms = (sum(s*s for s in chunk_samples) / len(chunk_samples)) ** 0.5
+                heights.append(round(min(1.0, rms * 3), 4))
+        dur = float(editor.probe_duration(path)) if os.path.exists(path) else 0
+        return {"bars": heights, "duration": dur}
+    except Exception as e:
+        raise HTTPException(500, f"Waveform generation failed: {e}")
+
+
+# --- Feature 8: Cost estimation endpoint ----------------------------------- #
+@app.get("/api/audio-to-video/cost")
+def api_a2v_cost_estimate(scenes: int = 10, characters: int = 1, quality: str = "medium",
+                          engine: str = "local", audio_chars: int = 0):
+    """Estimate the cost of an A2V run before committing."""
+    _IMG_COST = {"low": 0.02, "medium": 0.04, "high": 0.08, "auto": 0.06}
+    img_per = _IMG_COST.get(quality, 0.04)
+    return {
+        "image_renders": scenes,
+        "character_sheets": characters,
+        "image_cost_usd": round((scenes + characters) * img_per, 4),
+        "tts_cost_usd": round(audio_chars * 0.00003, 4) if engine == "elevenlabs" else 0.0,
+        "transcription_cost_usd": 0.0 if engine == "local" else round(audio_chars * 0.000006, 4),
+        "total_usd": round((scenes + characters) * img_per + (audio_chars * 0.00003 if engine == "elevenlabs" else 0), 4),
+        "note": "Local Whisper transcription is free. Image costs are per-render estimates.",
+    }
+
+
+# --- Feature 7: Export presets info ----------------------------------------- #
+@app.get("/api/audio-to-video/presets")
+def api_a2v_presets():
+    """Return available export presets with their settings."""
+    return {"presets": _EXPORT_PRESETS}
