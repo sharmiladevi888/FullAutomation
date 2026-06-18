@@ -334,7 +334,7 @@ def assemble_video(
         with open(list_path, "w") as f:
             for cp, _ in clip_paths:
                 # ffmpeg concat needs forward slashes / escaped quotes
-                f.write(f"file '{os.path.abspath(cp)}'\n")
+                f.write(f"file '{os.path.abspath(cp).replace(os.sep, '/')}'\n")
         cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
                "-c", "copy", silent_video]
         proc = _run(cmd, timeout=_RENDER_TIMEOUT, what="ffmpeg concat")

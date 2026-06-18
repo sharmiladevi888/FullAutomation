@@ -2910,6 +2910,7 @@ async function load(){
   // a project switch rebuilds everything — drop the workflow canvas so it
   // re-renders for the newly active project.
   if(typeof wf!=="undefined" && wf.built){ const stg=$("#wfStage"); if(stg) stg.querySelectorAll(".wf-node").forEach(n=>n.remove()); wf.built=false; }
+  TL_CLIPS=[];  // clear stale timeline clips from previous project
   const data = await api("/api/state");
   STATE = data.state; CFG = data.config;
   $("#modelPill").textContent = CFG.model;
@@ -3449,7 +3450,8 @@ async function disconnectAnthropic(){
   }catch(e){ toast(e.message,"err"); }
 }
 function fillSelect(sel, items, def){
-  const el = $(sel); el.innerHTML = "";
+  const el = $(sel); if(!el) return;
+  el.innerHTML = "";
   items.forEach(v=>{ const o=document.createElement("option"); o.value=v; o.textContent=v; if(v===def)o.selected=true; el.appendChild(o); });
 }
 
@@ -5660,7 +5662,7 @@ function autoDownloadZip(){
 async function apBuildVideo(){
   // Re-run just the video assembly step (ElevenLabs TTS + SFX + ffmpeg) on
   // whatever frames are already in the sequence — no need to re-render images.
-  const btn=event&&event.target;
+  const btn=(typeof event!=='undefined'&&event&&event.target)||this||null;
   if(btn) btn.disabled=true;
   toast("Building video with ElevenLabs voice + sound effects…","");
   try{
