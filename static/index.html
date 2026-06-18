@@ -2234,7 +2234,8 @@ Close-up of @Mira fixing a circuit board, sparks reflecting on her goggles
       <div class="claude-pane">
         <h4 style="display:flex; align-items:center; gap:8px; color:var(--claude-soft)">
           <svg class="spark" width="16" height="16" viewBox="0 0 24 24"><path d="M12 1.5c.62 5.2 2.3 6.88 7.5 7.5-5.2.62-6.88 2.3-7.5 7.5-.62-5.2-2.3-6.88-7.5-7.5 5.2-.62 6.88-2.3 7.5-7.5z"/></svg>
-          Claude account
+          <span id="clSectionTitle">AI / Script provider</span>
+          <span id="clProvLabel" style="font-size:12px; font-weight:normal; color:var(--muted)"></span>
         </h4>
         <p class="sub" style="margin:4px 0 0; font-size:12.5px">Powers the script generator, the YT Analyser and the edit AI.</p>
 
@@ -2285,7 +2286,7 @@ Close-up of @Mira fixing a circuit board, sparks reflecting on her goggles
           </p>
           <div class="fld"><label class="label">9Router API key</label><input type="password" id="set9rKey" placeholder="key from the 9Router dashboard…" onkeydown="if(event.key==='Enter')connect9router()" /></div>
           <div class="fld"><label class="label">9Router endpoint</label><input type="text" id="set9rBase" placeholder="http://localhost:20128" /></div>
-          <div class="fld"><label class="label">Model <span style="color:var(--faint);text-transform:none;letter-spacing:0">(Claude models only — cc/ = your Claude account; the app needs Claude's vision + JSON behavior)</span></label>
+          <div class="fld"><label class="label">Model <span style="color:var(--faint);text-transform:none;letter-spacing:0">(all models — cc/ = Claude, cx/ = ChatGPT/Codex; the app handles both protocols)</span></label>
             <div style="display:flex; gap:8px; align-items:center">
               <select id="set9rModel" style="flex:1"></select>
               <button class="btn outline sm" onclick="refresh9routerModels()" title="Fetch the live model list from your running 9Router — only models whose provider is connected will work">↻ Load models</button>
@@ -2987,8 +2988,13 @@ async function disconnect9routerImage(){
   }catch(e){ toast(e.message,"err"); }
 }
 function setClaude(ok, model){
+  const provNames={derouter:"claude",anthropic:"claude","9router":"AI",agentrouter:"AI",gemini:"gemini"};
+  const label=provNames[CFG.claude_provider]||"AI";
   $("#clDot").classList.toggle("ok", ok);
-  $("#clTxt").textContent = ok ? ("claude: "+ (model || "ready")) : "claude: no key";
+  $("#clTxt").textContent = ok ? (label+": "+ (model || "ready")) : (label+": no key");
+  // Update the section title to reflect the active provider
+  const titleMap={derouter:"Claude account",anthropic:"Claude account","9router":"AI provider (9Router)",agentrouter:"AI provider (AgentRouter)",gemini:"AI provider (Gemini)"};
+  const tt=$("#clSectionTitle"); if(tt) tt.textContent=titleMap[CFG.claude_provider]||"AI / Script provider";
   renderClaudeAccount();
 }
 function renderClaudeAccount(){
@@ -3044,11 +3050,17 @@ function _fillAIModelSelects(){
   const m=CFG.claude_models||["claude-sonnet-4-6"];
   const d=CFG.claude_model||"claude-sonnet-4-6";
   fillSelect("#setClModel", m, d);
-  // Script / analyser pickers: through 9Router the user can also write with
-  // their ChatGPT account (cx/ = Codex). The backend auto-switches to the
-  // OpenAI protocol for non-Claude models.
+  // Script / analyser pickers adapt to the active provider:
+  //   - gemini: show Gemini models from config
+  //   - 9router: show the LIVE model list from the running 9Router (all models,
+  //     not just Claude — the OpenAI compat path handles non-Claude models too)
+  //   - default (derouter/anthropic/agentrouter): show Claude models
   let list=m.slice(), dd=d;
-  if(CFG.claude_provider==="9router" && CFG.has_ninerouter_key){
+  if(CFG.claude_provider==="gemini"){
+    list=CFG.gemini_models||["gemini-2.5-flash"];
+    dd=CFG.gemini_model||list[0];
+    if(!list.includes(dd)) list.unshift(dd);
+  } else if(CFG.claude_provider==="9router" && CFG.has_ninerouter_key){
     list=["cc/claude-sonnet-4-6","cc/claude-opus-4-8","cc/claude-opus-4-7",
           "cc/claude-haiku-4-5-20251001",
           "cx/gpt-5.5","cx/gpt-5.4","cx/gpt-5.3-codex"];
@@ -3223,15 +3235,12 @@ async function refresh9routerModels(silent){
   try{
     const d=await api("/api/9router/models",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
     let live=d.models||[];
-    // This app speaks the Anthropic protocol and its vision/JSON pipeline is
-    // tuned for Claude — non-Claude models (gpt-5 etc.) break through 9Router's
-    // translation layer. Only offer Claude-family models.
-    const claudeOnly=live.filter(x=>x.toLowerCase().includes("claude"));
-    if(claudeOnly.length) live=claudeOnly;
+    // Show ALL available models — the app's OpenAI compat path handles
+    // non-Claude models (GPT, Gemini, etc.) through 9Router's translation.
     if(live.length){
       const cur=sel.value||CFG.ninerouter_model;
       fillSelect("#set9rModel", live, live.includes(cur)?cur:(live.find(x=>x.startsWith("cc/"))||live[0]));
-      if(!silent) toast(`Loaded ${live.length} Claude models from 9Router`,"ok");
+      if(!silent) toast(`Loaded ${live.length} models from 9Router`,"ok");
     } else if(!silent){ toast("9Router returned no models — connect a provider in its dashboard","err"); }
   }catch(e){ if(!silent) toast(e.message,"err"); }
 }
