@@ -163,10 +163,12 @@ def build_full_prompt(master_prompt, shot_prompt, matched, has_previous,
 
     if has_previous:
         parts.append(
-            "CONTINUITY: one attached image is the PREVIOUS frame in this series. "
-            "Carry over its art style, palette, grain, line quality and world "
-            "details so this frame reads like the same production — but compose "
-            "the NEW scene described below rather than copying it."
+            "CONTINUITY: this frame is part of an ongoing series. Keep the SAME "
+            "art style, palette, grain, line quality and world details as the "
+            "rest of the series so it reads like one continuous production — but "
+            "this is a NEW moment in the story: give it its OWN composition, "
+            "camera angle, staging and action. Do NOT reuse the previous shot's "
+            "framing or pose. Advance the scene; never repeat it."
         )
 
     if style_locked:
@@ -177,9 +179,8 @@ def build_full_prompt(master_prompt, shot_prompt, matched, has_previous,
             "colour palette, shading, lighting, texture and proportions to "
             "reproduce. Copy that look faithfully — do NOT drift toward a generic "
             "or more detailed/realistic style. Any character-sheet image defines "
-            "character identity ONLY; the previous-frame image is for continuity "
-            "ONLY. If the reference look and your defaults disagree, the source "
-            "video frames win."
+            "character identity ONLY. If the reference look and your defaults "
+            "disagree, the source video frames win."
         )
 
     # Prepend the style notes directly onto the shot prompt as well so it

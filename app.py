@@ -1005,12 +1005,13 @@ def _render_one(g_prompt, size, quality, continue_prev, style_lock,
             ref_meta.append({"type": "character", "name": c["name"]})
         except Exception:
             pass
-    if prev:
-        try:
-            refs.append(store.read_image(prev["image_url"]))
-            ref_meta.append({"type": "previous", "id": prev["id"]})
-        except Exception:
-            pass
+    # NOTE: the previous frame is deliberately NOT fed as an image reference.
+    # An image-edit model anchors to an input frame's COMPOSITION (camera angle,
+    # pose, room layout), which made every scene collapse into the same shot.
+    # Style/palette continuity is carried by the STYLE anchors + the continuity
+    # text instead, leaving each scene free to compose a new shot. We keep `prev`
+    # only to drive has_previous text — it is NOT added to refs/ref_meta so the
+    # ref_labels stay aligned 1:1 with the images actually sent.
 
     full_prompt = pipeline.build_full_prompt(
         st["master_prompt"], g_prompt, matched,
@@ -1172,12 +1173,8 @@ def _render_one_for_queue(g_prompt, params, settings, project_id):
             ref_meta.append({"type": "character", "name": c["name"]})
         except Exception:
             pass
-    if prev:
-        try:
-            refs.append(store.read_image(prev["image_url"]))
-            ref_meta.append({"type": "previous", "id": prev["id"]})
-        except Exception:
-            pass
+    # Previous frame intentionally NOT used as an image ref (see _render_one):
+    # it forces composition cloning. Not added to refs/ref_meta either.
     for sf in style_frames[:4]:
         try:
             refs.append(store.read_image(sf["url"]))
@@ -1355,11 +1352,9 @@ def _shot_image(st, prev, g_prompt, size, quality, request):
             refs.append(store.read_image(c["sheet_url"]))
         except Exception:
             pass
-    if prev:
-        try:
-            refs.append(store.read_image(prev["image_url"]))
-        except Exception:
-            pass
+    # Previous frame intentionally NOT used as an image ref (see _render_one):
+    # avoids composition cloning so each shot is free to vary.
+    # (prev still drives has_previous text for style/palette carry-over.)
     for sf in st.get("style_frames", [])[:3]:
         try:
             refs.append(store.read_image(sf["url"]))
