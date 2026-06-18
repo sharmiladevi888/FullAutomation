@@ -25,14 +25,15 @@ def match_characters(prompt, characters):
     seen = set()
     for c in characters:
         name = (c.get("name") or "").strip()
-        if not name or c["id"] in seen:
+        cid = c.get("id") or ""
+        if not name or cid in seen:
             continue
-        # @-tag form
+        # Exact @mention match (case-insensitive).
         if re.search(r"@" + re.escape(name.lower()) + r"\b", low):
-            matched.append(c); seen.add(c["id"]); continue
+            matched.append(c); seen.add(cid); continue
         # bare-word form
         if re.search(r"(?<!\w)" + re.escape(name.lower()) + r"(?!\w)", low):
-            matched.append(c); seen.add(c["id"])
+            matched.append(c); seen.add(cid); continue
     return matched
 
 

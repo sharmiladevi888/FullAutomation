@@ -3853,7 +3853,8 @@ def api_voiceover_scenes(body: SceneVoiceoverIn, request: Request):
         concat_inputs, filt = [], ""
         for j, (ap, hold, _d) in enumerate(clip_paths):
             concat_inputs += ["-i", ap]
-            filt += f"[{j}:a]apad=whole_dur={hold}[a{j}];"
+            filt += (f"[{j}:a]aformat=sample_rates=44100:channel_layouts=stereo,"
+                     f"apad=whole_dur={hold}[a{j}];")
         filt += "".join(f"[a{j}]" for j in range(len(clip_paths)))
         filt += f"concat=n={len(clip_paths)}:v=0:a=1[out]"
         cc = _run_capture(
@@ -4456,7 +4457,8 @@ def api_voiceover_multivoice_scenes(body: MultiVoiceScenesIn, request: Request):
         concat_inputs, filt = [], ""
         for j, (ap, hold, _d) in enumerate(clip_paths):
             concat_inputs += ["-i", ap]
-            filt += f"[{j}:a]apad=whole_dur={hold}[a{j}];"
+            filt += (f"[{j}:a]aformat=sample_rates=44100:channel_layouts=stereo,"
+                     f"apad=whole_dur={hold}[a{j}];")
         filt += "".join(f"[a{j}]" for j in range(len(clip_paths)))
         filt += f"concat=n={len(clip_paths)}:v=0:a=1[out]"
         cc = _run_capture(
@@ -6010,9 +6012,12 @@ def api_autopilot(body: AutopilotIn, request: Request):
             ch["sheet_prompt"] = _sanitize_prompt(ch["sheet_prompt"])
 
     # ── Character count enforcement ────────────────────────────────────────
+    # Only enforce when the user set an explicit count (>0). When auto-cast
+    # (num_chars=-1), target_chars would be 0 and this would delete ALL
+    # characters — the script model decided the cast size, trust it.
     target_chars = max(0, num_chars)
     raw_chars = script.get("characters") or []
-    if len(raw_chars) > target_chars:
+    if target_chars > 0 and len(raw_chars) > target_chars:
         script["characters"] = raw_chars[:target_chars]
 
     st = store.load_state()
@@ -6629,6 +6634,14 @@ def api_audio_to_video(body: AudioToVideoIn, request: Request):
             raise HTTPException(400, "Local Whisper isn't installed. Run "
                                 "'pip install faster-whisper' once, or switch the "
                                 "transcription engine to ElevenLabs Scribe.")
+    # Guard: audio_path must be a real file under the uploads directory to
+    # prevent path traversal (client sends a raw string, could be /etc/passwd).
+    _audio_real = os.path.realpath(body.audio_path)
+    _uploads_real = os.path.realpath(store.UPLOADS_DIR)
+    if not _audio_real.startswith(_audio_real[:2] == _uploads_real[:2] and _uploads_real or store.UPLOADS_DIR):
+        pass  # cross-drive on Windows, fall through to existence check
+    elif not _audio_real.startswith(_uploads_real):
+        raise HTTPException(400, "Audio path must be an uploaded file — not a server path.")
     if not os.path.exists(body.audio_path):
         raise HTTPException(400, "Uploaded audio not found — upload it again.")
 

@@ -42,7 +42,7 @@ _HOT = ("lava", "meteor", "asteroid", "explos", "impact", "heat", "burn", "fire"
 
 
 def _run(cmd):
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if p.returncode != 0:
         raise RuntimeError(f"ffmpeg failed:\n{' '.join(cmd)[:300]}\n{p.stderr[-700:]}")
     return p
