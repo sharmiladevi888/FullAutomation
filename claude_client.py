@@ -556,11 +556,22 @@ class ClaudeClient:
             f'  "total_duration": {total_duration:.0f},  // FIXED — do not change\n'
             f'  "scene_count": {scene_count},             // FIXED — do not change\n'
             '  "characters": [ { "name": str, "sheet_prompt": str } ],\n'
-            '  "scenes": [ { "n": int, "heading": str, "action": str, "vo": str, "prompt": str } ]\n'
+            '  "scenes": [ { "n": int, "heading": str, "action": str, "vo": str, "prompt": str, "shot_relation": "cut"|"continue" } ]\n'
             "}\n"
             "RULES:\n"
             f"- scenes[] MUST have EXACTLY {scene_count} elements — count them "
             "before you output. Stop adding scenes once you reach that number.\n"
+            '- Each scene "shot_relation" tells the renderer how this shot relates '
+            "to the PREVIOUS one:\n"
+            '    "continue" = SAME continuous moment as the previous scene — a '
+            "micro-cut: push-in/pull-out, reverse angle, a tighter close-up, or a "
+            "small reaction on the SAME subject in the SAME place/instant. The "
+            "renderer will reuse the previous frame so the look stays locked.\n"
+            '    "cut" = a NEW beat — different location, time jump, different '
+            "subject/action, or any fresh scene. The renderer composes it freshly.\n"
+            '  Default to "cut". Only use "continue" when this scene is genuinely '
+            "the same moment as the one right before it. The FIRST scene is always "
+            '"cut".\n'
             f"- Each scene 'vo' should be approximately {words_per_scene} words "
             f"({pacing_seconds:g}s of speech at natural pace). "
             "Exception: the first 3-5 hook scenes may use shorter 4-8 word bursts.\n"
