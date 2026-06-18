@@ -180,7 +180,14 @@ async def auth_middleware(request: Request, call_next):
         "gemini_model": user_data.get("gemini_model", getattr(config, "GEMINI_MODEL", "gemini-2.5-flash")),
         "gemini_base_url": user_data.get("gemini_base_url", getattr(config, "GEMINI_BASE_URL", "")),
     }
-    return await call_next(request)
+    response = await call_next(request)
+    # Security headers
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    return response
 
 
 # --- Auth endpoints ---
@@ -441,7 +448,10 @@ def api_projects():
 
 @app.post("/api/projects")
 def api_create_project(p: ProjectIn):
-    pid = store.create_project(p.name, p.master_prompt)
+    # Sanitize project name to prevent stored XSS (rendered in innerHTML).
+    import html
+    safe_name = html.escape((p.name or "").strip()[:80]) or "Untitled project"
+    pid = store.create_project(safe_name, p.master_prompt)
     out = store.list_projects()
     out["id"] = pid
     return out
@@ -6940,6 +6950,12 @@ def _a2v_prog(run_id, **kw):
     if not run_id:
         return
     with _A2V_LOCK:
+        # Cleanup stale entries older than 1 hour to prevent memory leak.
+        _now = time.time()
+        _stale = [k for k, v in _A2V_PROGRESS.items()
+                  if _now - v.get("started", _now) > 3600 and v.get("done")]
+        for k in _stale:
+            del _A2V_PROGRESS[k]
         p = _A2V_PROGRESS.setdefault(run_id, {
             "run_id": run_id, "started": time.time(),
             "steps_total": len(_A2V_STEPS), "step": "", "step_index": 0,
@@ -7018,12 +7034,18 @@ def api_a2v_preview(body: A2VPreviewIn, request: Request):
         raise HTTPException(500, f"Transcription failed: {e}")
 
     segments = tr.get("segments") or []
-    words = tr.get("words") or []
     audio_dur = float(tr.get("duration") or 0.0)
     if not segments and tr.get("text"):
         segments = [{"text": tr["text"], "start": 0.0, "end": audio_dur or 1.0}]
     if not segments:
         raise HTTPException(500, "No speech segments found in audio.")
+
+    # Store segments in state so the render pipeline can match them later.
+    with _state_write_lock:
+        _seg_st = store.load_state()
+        _seg_st["a2v_segments"] = segments
+        _seg_st["a2v_audio_dur"] = audio_dur
+        store.save_state(_seg_st)
 
     # Scene generation
     master_prompt = ("VISUAL STYLE — match the sample video exactly: " + style_notes) if style_notes else ""
@@ -7142,9 +7164,19 @@ def api_a2v_render(body: A2VRenderIn, request: Request):
         body.fps = preset["fps"]
         body.max_hold = preset["max_hold"]
 
+    # Snapshot settings + image client config BEFORE spawning the background
+    # thread -- the request object may be garbage-collected after the response
+    # is sent, so we must capture everything the thread needs now.
+    _snap_settings = dict(request.state.settings)
+    _snap_img_cfg = {
+        "api_key": _snap_settings.get("api_key", ""),
+        "base_url": _snap_settings.get("base_url", config.BASE_URL),
+        "model": _snap_settings.get("model", config.MODEL),
+    }
+
     def _run_a2v():
         try:
-            _a2v_run_pipeline(run_id, body, request)
+            _a2v_run_pipeline(run_id, body, _snap_settings, _snap_img_cfg)
         except Exception as e:
             _a2v_prog(run_id, done=True, error=str(e)[:500])
             print(f"[a2v] async run {run_id} failed: {e}", flush=True)
@@ -7154,18 +7186,20 @@ def api_a2v_render(body: A2VRenderIn, request: Request):
     return {"ok": True, "run_id": run_id, "scenes": len(body.scenes)}
 
 
-def _a2v_run_pipeline(run_id: str, body: A2VRenderIn, request: Request):
-    """The actual A2V pipeline — runs in a background thread with progress."""
-    s = request.state.settings
+def _a2v_run_pipeline(run_id: str, body: A2VRenderIn, s: dict, img_cfg: dict):
+    """The actual A2V pipeline -- runs in a background thread with progress.
+    Uses snapshotted settings + image config (not the request object)."""
+    # s is already the settings dict (snapshotted before thread start)
     style_notes = (body.style_notes or "").strip()
+    # Use the snapshotted image config instead of request-dependent get_image_client
+    _img_client = ImageClient(api_key=img_cfg["api_key"], base_url=img_cfg["base_url"], model=img_cfg["model"])
     scenes = list(body.scenes or [])
     n = len(scenes)
     if n == 0:
         _a2v_prog(run_id, done=True, error="No scenes provided")
         return
 
-    # Apply export preset dimensions
-    preset = _EXPORT_PRESETS.get((body.export_preset or "").lower()) if hasattr(body, 'export_prescript') else None
+    # Apply orientation from body (preset already applied in api_a2v_render)
     orient = (body.orientation or "landscape").lower()
     if orient in ("vertical", "portrait", "9:16", "shorts", "tiktok"):
         size = body.size or "1024x1536"; width, height = 1080, 1920
@@ -7263,8 +7297,6 @@ def _a2v_run_pipeline(run_id: str, body: A2VRenderIn, request: Request):
     frame_scene_map = rendered_scene_indices[:actual_n]
 
     # Compute holds from Whisper timestamps (reuse the existing alignment path)
-    import transcribe as _tr_mod
-    words_data = st.get("a2v_words") or []  # stored during preview if available
     audio_dur = float(st.get("a2v_audio_dur") or 0.0)
     if not audio_dur:
         try:
@@ -7406,9 +7438,15 @@ def api_a2v_reroll(body: A2VRerollIn, request: Request):
 # --- Feature 5: Waveform with scene cut markers ---------------------------- #
 @app.get("/api/audio-to-video/waveform")
 def api_a2v_waveform(path: str, bars: int = 120):
-    """Generate waveform data for the audio file, with optional scene cut
-    markers overlaid. Returns bar heights for visualization."""
-    if not os.path.exists(path):
+    """Generate waveform data for the audio file.
+    Returns bar heights for visualization. Path must be under DATA_DIR."""
+    # Security: validate path is under the managed data directory to prevent
+    # arbitrary filesystem reads via the waveform endpoint.
+    real_path = os.path.realpath(path)
+    real_data = os.path.realpath(config.DATA_DIR)
+    if not real_path.startswith(real_data):
+        raise HTTPException(400, "Path must be under the data directory.")
+    if not os.path.exists(real_path):
         raise HTTPException(400, "Audio file not found.")
     try:
         import subprocess as _sp
