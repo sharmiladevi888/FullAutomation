@@ -131,7 +131,7 @@ def _is_flat_style(*texts):
 
 
 def build_full_prompt(master_prompt, shot_prompt, matched, has_previous,
-                      style_locked, style_notes=""):
+                      style_locked, style_notes="", micro_cut=False):
     parts = [_MASTER_HINT]
     _flat = _is_flat_style(style_notes, master_prompt)
 
@@ -161,7 +161,18 @@ def build_full_prompt(master_prompt, shot_prompt, matched, has_previous,
             "they appear in this frame."
         )
 
-    if has_previous:
+    if micro_cut:
+        # Same continuous moment as the attached PREV FRAME — a micro-cut.
+        parts.append(
+            "MICRO-CUT CONTINUITY: one attached image is the PREVIOUS frame and "
+            "this shot is the SAME continuous moment — a tighter angle, push-in, "
+            "reverse or small reaction on the SAME subject in the SAME place. "
+            "Keep the exact same characters, wardrobe, setting, lighting and "
+            "props as that frame; only change the camera framing/angle as the "
+            "new prompt describes. It must feel like the very next instant, not a "
+            "new scene."
+        )
+    elif has_previous:
         parts.append(
             "CONTINUITY: this frame is part of an ongoing series. Keep the SAME "
             "art style, palette, grain, line quality and world details as the "

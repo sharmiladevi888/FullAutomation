@@ -345,11 +345,12 @@ TERMINAL = ("completed", "failed", "cancelled")
 
 
 class Job:
-    def __init__(self, batch_id, index, prompt):
+    def __init__(self, batch_id, index, prompt, meta=None):
         self.id = f"job_{batch_id[-6:]}_{index:04d}"
         self.batch_id = batch_id
         self.index = index
         self.prompt = prompt
+        self.meta = meta or {}            # per-prompt extras (e.g. shot_relation)
         self.status = "pending"          # pending|running|retrying|rate_limited|completed|failed|cancelled
         self.attempts = 0
         self.retry_count = 0
@@ -368,6 +369,7 @@ class Job:
             "next_retry_in": round(self.next_retry_in, 1),
             "message": self.message, "error": self.error[:300],
             "result": self.result,
+            "meta": self.meta,
         }
 
 
@@ -433,14 +435,15 @@ class _BatchQueue:
 
     # -- public API ------------------------------------------------------- #
     def submit(self, prompts: List[str], params: dict, settings: dict,
-               project_id: str) -> Batch:
+               project_id: str, metas: Optional[List[dict]] = None) -> Batch:
         bid = f"batch_{int(time.time())}_{random.randint(1000, 9999)}"
         batch = Batch(bid, project_id, params, len(prompts))
         with self._lock:
             self._batches[bid] = batch
             self._settings[bid] = settings
             for i, p in enumerate(prompts):
-                job = Job(bid, i, p)
+                m = metas[i] if (metas and i < len(metas)) else None
+                job = Job(bid, i, p, meta=m)
                 batch.jobs.append(job)
                 self._jobs[job.id] = job
                 self._pending.append(job.id)
@@ -553,8 +556,9 @@ class _BatchQueue:
         should_stop = lambda: bool(b.cancelled)
         try:
             result = run_with_retry(
-                lambda: self._render_fn(job.prompt, b.params, settings,
-                                        b.project_id),
+                lambda: self._render_fn(job.prompt,
+                                        {**b.params, **(job.meta or {})},
+                                        settings, b.project_id),
                 index=job.index, model=settings.get("model", config.MODEL),
                 label="batch", on_event=on_event, should_stop=should_stop)
             job.result = result
@@ -614,7 +618,8 @@ class _BatchQueue:
             b.created = d.get("created", time.time())
             b.cancelled = d.get("cancelled", False)
             for jd in d.get("jobs", []):
-                j = Job(b.id, jd.get("index", 0), jd.get("prompt", ""))
+                j = Job(b.id, jd.get("index", 0), jd.get("prompt", ""),
+                        meta=jd.get("meta"))
                 j.id = jd.get("id", j.id)
                 j.status = jd.get("status", "pending")
                 j.attempts = jd.get("attempts", 0)

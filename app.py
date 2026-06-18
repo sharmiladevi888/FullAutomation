@@ -967,8 +967,14 @@ class GenerateIn(BaseModel):
 
 
 def _render_one(g_prompt, size, quality, continue_prev, style_lock,
-                character_ids=None, request: Request = None):
-    """Shared engine for /api/generate and /api/generate-batch."""
+                character_ids=None, request: Request = None,
+                shot_relation="cut"):
+    """Shared engine for /api/generate and /api/generate-batch.
+
+    shot_relation: "continue" = micro-cut of the SAME moment as the previous
+    frame -> feed that frame as an image ref so the look stays locked. "cut"
+    (default) = a new beat -> previous frame is NOT fed, so the model composes a
+    fresh shot (prevents every scene collapsing into one repeated composition)."""
     g_prompt = _sanitize_prompt(g_prompt or "")
     st = store.load_state()
     client = get_image_client(request)
@@ -1005,18 +1011,24 @@ def _render_one(g_prompt, size, quality, continue_prev, style_lock,
             ref_meta.append({"type": "character", "name": c["name"]})
         except Exception:
             pass
-    # NOTE: the previous frame is deliberately NOT fed as an image reference.
-    # An image-edit model anchors to an input frame's COMPOSITION (camera angle,
-    # pose, room layout), which made every scene collapse into the same shot.
-    # Style/palette continuity is carried by the STYLE anchors + the continuity
-    # text instead, leaving each scene free to compose a new shot. We keep `prev`
-    # only to drive has_previous text — it is NOT added to refs/ref_meta so the
-    # ref_labels stay aligned 1:1 with the images actually sent.
+    # Smart continuity: feed the previous frame as an IMAGE ref ONLY when this
+    # shot is a micro-cut of the SAME moment (shot_relation == "continue"). For a
+    # real cut/new beat, the previous frame is kept OUT so the model is free to
+    # compose a fresh shot — feeding it back makes an edit model clone the prior
+    # composition and every scene collapses into the same frame.
+    micro_cut = (str(shot_relation or "cut").strip().lower() == "continue"
+                 and bool(prev))
+    if micro_cut:
+        try:
+            refs.append(store.read_image(prev["image_url"]))
+            ref_meta.append({"type": "previous", "id": prev["id"]})
+        except Exception:
+            micro_cut = False
 
     full_prompt = pipeline.build_full_prompt(
         st["master_prompt"], g_prompt, matched,
         has_previous=bool(prev), style_locked=bool(style_frames),
-        style_notes=style_notes,
+        style_notes=style_notes, micro_cut=micro_cut,
     )
 
     if refs:
@@ -1166,6 +1178,12 @@ def _render_one_for_queue(g_prompt, params, settings, project_id):
     prev = st["sequence"][-1] if (continue_prev and st["sequence"]) else None
     style_frames = st["style_frames"] if style_lock else []
 
+    # Smart continuity: only feed the previous frame as an IMAGE when this shot
+    # is a micro-cut of the same moment (shot_relation == "continue"). For a real
+    # cut/new beat we keep it out so the model is free to compose a fresh shot.
+    shot_relation = str(params.get("shot_relation") or "cut").strip().lower()
+    micro_cut = (shot_relation == "continue") and bool(prev)
+
     refs, ref_meta = [], []
     for c in matched:
         try:
@@ -1173,8 +1191,12 @@ def _render_one_for_queue(g_prompt, params, settings, project_id):
             ref_meta.append({"type": "character", "name": c["name"]})
         except Exception:
             pass
-    # Previous frame intentionally NOT used as an image ref (see _render_one):
-    # it forces composition cloning. Not added to refs/ref_meta either.
+    if micro_cut:
+        try:
+            refs.append(store.read_image(prev["image_url"]))
+            ref_meta.append({"type": "previous", "id": prev["id"]})
+        except Exception:
+            micro_cut = False
     for sf in style_frames[:4]:
         try:
             refs.append(store.read_image(sf["url"]))
@@ -1186,7 +1208,7 @@ def _render_one_for_queue(g_prompt, params, settings, project_id):
     full_prompt = pipeline.build_full_prompt(
         st["master_prompt"], g_prompt, matched,
         has_previous=bool(prev), style_locked=bool(style_frames),
-        style_notes=_queue_style_notes)
+        style_notes=_queue_style_notes, micro_cut=micro_cut)
 
     if refs:
         if not multi_image_edit and len(refs) > 1:
@@ -1720,6 +1742,8 @@ _SCENE_ALIASES = {
     "prompt": ["prompt", "visual", "image_prompt", "image", "visual_description",
                "visual_desc", "scene_visual", "imagery", "image_desc", "art",
                "art_direction", "visuals", "picture"],
+    "shot_relation": ["shot_relation", "relation", "cut_type", "shot_type",
+                      "continuity", "transition"],
 }
 
 
@@ -1752,6 +1776,16 @@ def _normalize_scenes(scenes):
         p = (n.get("prompt") or "").strip()
         if cap and p and cap.lower() not in p.lower() and len(cap) <= 60:
             n["prompt"] = p.rstrip(". ") + f'. Big bold on-screen caption text reading "{cap}".'
+        # Normalize shot_relation: only "continue" or "cut". Default "cut".
+        # The first scene can never "continue" (there is nothing before it).
+        _rel = str(n.get("shot_relation") or "").strip().lower()
+        if _rel.startswith("cont"):      # continue / continuation / continuous
+            _rel = "continue"
+        else:
+            _rel = "cut"
+        if i == 1:
+            _rel = "cut"
+        n["shot_relation"] = _rel
         out.append(n)
     return out
 
@@ -6077,7 +6111,8 @@ def api_autopilot(body: AutopilotIn, request: Request):
         # on rate limits) so the run no longer dies on a single 429.
         try:
             rec = _render_one(p, size, quality, True, True,
-                              character_ids=_scene_ids, request=request)
+                              character_ids=_scene_ids, request=request,
+                              shot_relation=sc.get("shot_relation", "cut"))
             frames_ok += 1
             _ap_prog(run_id, frames_done=frames_ok + frames_fail,
                      frames_failed=frames_fail,
