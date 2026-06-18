@@ -1319,6 +1319,7 @@
     <button class="tab" data-view="characters"><span class="n">04</span>Characters</button>
     <button class="tab" data-view="sequence"><span class="n">05</span>Sequence</button>
     <button class="tab" data-view="edit"><span class="n">06</span>Edit (Audio + Video)</button>
+    <button class="tab" data-view="a2v" style="color:var(--teal)">🎵→🎬 Audio→Video</button>
     <button class="tab tab-yt" data-view="thumb">🖼 Thumbnail</button>
     <button class="tab" data-view="timeline"><span class="n">07</span>Timeline</button>
     <button class="tab" data-view="usage" style="color:var(--teal)">$ Usage</button>
@@ -2141,6 +2142,78 @@ Close-up of @Mira fixing a circuit board, sparks reflecting on her goggles
       <div id="usageProjects" style="margin-top:24px"></div>
     </section>
 
+    <!-- ============ AUDIO → VIDEO (standalone) ============ -->
+    <section class="view sheet" id="view-a2v">
+      <h2 class="section">🎵→🎬 Audio → Video</h2>
+      <p class="sub">Upload your own audio + a sample video. The audio is transcribed (Whisper, word-level timing) and drives frame-accurate cuts; the sample video sets the art style. Output: a fast, micro-cut, high-retention video with continuity — built entirely from your audio. <strong>This is separate from the YouTube workflow.</strong></p>
+
+      <div class="row" style="gap:20px; flex-wrap:wrap; align-items:flex-start; margin-top:14px">
+        <div style="flex:1; min-width:280px">
+          <h4 style="color:var(--teal)">1 · Your audio</h4>
+          <input type="file" id="a2vAudioFile" accept="audio/*,video/*" style="display:none" onchange="a2vPickAudio(this)">
+          <button class="btn outline" onclick="$('#a2vAudioFile').click()">⬆ Choose audio file…</button>
+          <div id="a2vAudioName" class="pill" style="margin-top:8px; display:none"></div>
+        </div>
+        <div style="flex:1; min-width:280px">
+          <h4 style="color:var(--teal)">2 · Sample video link (art style)</h4>
+          <div class="row" style="gap:8px; flex-wrap:nowrap">
+            <input type="text" id="a2vVideoLink" class="inp" placeholder="Paste a YouTube link whose look you want…" style="flex:1">
+            <button class="btn outline" id="a2vLinkBtn" onclick="a2vFetchLink(this)">Fetch style</button>
+          </div>
+          <div id="a2vVideoName" class="pill" style="margin-top:8px; display:none"></div>
+          <div id="a2vFrames" class="row" style="gap:6px; flex-wrap:wrap; margin-top:10px"></div>
+        </div>
+      </div>
+
+      <h4 style="color:var(--teal); margin-top:22px">3 · Options</h4>
+      <div class="row" style="gap:16px; flex-wrap:wrap; align-items:center">
+        <label class="sub">Transcription
+          <select id="a2vEngine" class="inp">
+            <option value="local" selected>Local Whisper (free, on your PC)</option>
+            <option value="elevenlabs">ElevenLabs Scribe (uses your ElevenLabs key)</option>
+          </select>
+        </label>
+        <label class="sub">Orientation
+          <select id="a2vOrient" class="inp">
+            <option value="landscape">Landscape 16:9</option>
+            <option value="portrait">Portrait 9:16 (Shorts)</option>
+            <option value="square">Square 1:1</option>
+          </select>
+        </label>
+        <label class="sub">Quality
+          <select id="a2vQuality" class="inp">
+            <option value="low">Low (fast/cheap)</option>
+            <option value="medium" selected>Medium</option>
+            <option value="high">High</option>
+          </select>
+        </label>
+        <label class="sub">Max hold (micro-cut)
+          <input id="a2vMaxHold" class="inp" type="number" step="0.1" min="0.8" value="1.6" style="width:80px">
+        </label>
+        <label class="toggle on" id="a2vDynamic" onclick="toggle('a2vDynamic')"><span>High-retention reactions</span></label>
+        <label class="toggle" id="a2vMotion" onclick="toggle('a2vMotion')"><span>Ken-Burns motion</span></label>
+        <label class="toggle" id="a2vClicks" onclick="toggle('a2vClicks')"><span>Cut clicks</span></label>
+      </div>
+
+      <details style="margin-top:12px">
+        <summary class="sub" style="cursor:pointer">Advanced: override art-style notes</summary>
+        <textarea id="a2vStyleNotes" class="inp" rows="3" placeholder="Leave blank to auto-analyse the sample video. Or describe the exact look to force it." style="width:100%; margin-top:8px"></textarea>
+      </details>
+
+      <div class="row" style="gap:14px; margin-top:20px; align-items:center">
+        <button class="btn" id="a2vGoBtn" onclick="runAudioToVideo(this)">▶ Generate video from audio</button>
+        <span id="a2vStatus" class="sub"></span>
+      </div>
+
+      <div id="a2vResult" style="margin-top:22px; display:none">
+        <video id="a2vVideo" controls style="width:100%; max-width:880px; border-radius:12px; background:#000"></video>
+        <div id="a2vMeta" class="sub" style="margin-top:10px"></div>
+        <details style="margin-top:8px"><summary class="sub" style="cursor:pointer">Transcript</summary>
+          <div id="a2vTranscript" class="sub" style="margin-top:8px; white-space:pre-wrap"></div>
+        </details>
+      </div>
+    </section>
+
   </main>
 
   <!-- settings modal -->
@@ -2583,6 +2656,69 @@ document.addEventListener("click",(e)=>{
 },true);
 document.addEventListener("DOMContentLoaded",()=>{ const b=$("#uiSfxBtn"); if(b&&!UI_SFX) b.textContent="🔇"; });
 function escapeHtml(s){ return (s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+/* ---------- Audio → Video (standalone tab) ---------- */
+const A2V = { audioPath:null, videoPath:null, frames:[] };
+async function a2vUpload(file, kind){
+  const fd = new FormData();
+  fd.append("file", file);
+  fd.append("kind", kind);
+  return await api("/api/audio-to-video/upload", {method:"POST", body:fd});
+}
+async function a2vPickAudio(inp){
+  const f = inp.files && inp.files[0]; if(!f) return;
+  const nm=$("#a2vAudioName"); nm.style.display="inline-block"; nm.textContent="⏳ uploading "+f.name+"…";
+  try{ const d = await a2vUpload(f, "audio"); A2V.audioPath = d.path; nm.textContent="🎵 "+f.name; }
+  catch(e){ nm.textContent="✖ "+e.message; }
+}
+async function a2vFetchLink(btn){
+  const url = ($("#a2vVideoLink").value||"").trim();
+  if(!url){ $("#a2vVideoName").style.display="inline-block"; $("#a2vVideoName").textContent="Paste a link first."; return; }
+  const nm=$("#a2vVideoName"); nm.style.display="inline-block"; nm.textContent="⏳ fetching style frames…";
+  busy(btn, true, "Fetching…");
+  try{
+    const d = await api("/api/audio-to-video/sample-link", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({url})});
+    A2V.videoPath = d.path || null; A2V.frames = d.frames || [];
+    nm.textContent = "🎬 "+A2V.frames.length+" style frame(s)"+(d.note?(" · "+d.note):"");
+    const box=$("#a2vFrames"); box.textContent = "";
+    A2V.frames.slice(0,8).forEach(u => {
+      const img = document.createElement("img");
+      img.src = u;
+      img.style.cssText = "width:70px;height:46px;object-fit:cover;border-radius:6px;border:1px solid var(--line)";
+      box.appendChild(img);
+    });
+  }catch(e){ nm.textContent="✖ "+e.message; }
+  finally{ busy(btn, false); }
+}
+async function runAudioToVideo(btn){
+  if(!A2V.audioPath){ $("#a2vStatus").textContent="Choose an audio file first."; return; }
+  const body = {
+    audio_path: A2V.audioPath,
+    sample_video_path: A2V.videoPath || null,
+    sample_frame_urls: A2V.frames || [],
+    style_notes: ($("#a2vStyleNotes").value||"").trim() || null,
+    transcribe_engine: $("#a2vEngine").value,
+    orientation: $("#a2vOrient").value,
+    quality: $("#a2vQuality").value,
+    max_hold: parseFloat($("#a2vMaxHold").value)||1.6,
+    dynamic: isOn("a2vDynamic"),
+    motion: isOn("a2vMotion"),
+    cut_clicks: isOn("a2vClicks"),
+  };
+  busy(btn, true, "Generating… (this can take a few minutes)");
+  $("#a2vStatus").textContent="Transcribing → writing scenes → rendering frames → building video…";
+  try{
+    const d = await api("/api/audio-to-video", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+    $("#a2vResult").style.display="block";
+    $("#a2vVideo").src = d.video_url + "?t=" + Date.now();
+    $("#a2vMeta").textContent = `✅ ${d.frames} frames · ${d.duration}s · ${d.characters} character(s)` +
+      (d.frames_failed?` · ${d.frames_failed} failed`:"") +
+      (d.style_notes?` · style: ${d.style_notes.slice(0,80)}…`:"");
+    $("#a2vTranscript").textContent = d.transcript || "(no transcript)";
+    $("#a2vStatus").textContent="Done.";
+  }catch(e){ $("#a2vStatus").textContent="✖ "+e.message; }
+  finally{ busy(btn, false); }
+}
 
 /* ---------- projects ---------- */
 let PROJECTS = {current:null, projects:[]};
@@ -3324,7 +3460,9 @@ document.querySelectorAll(".tab").forEach(t=>{
     document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
     document.querySelectorAll(".view").forEach(x=>x.classList.remove("active"));
     t.classList.add("active");
-    $("#view-"+t.dataset.view).classList.add("active");
+    const viewEl = $("#view-"+t.dataset.view);
+    if (!viewEl) return;
+    viewEl.classList.add("active");
     window.scrollTo({top:0, behavior:"smooth"});
     // refresh the frames strip + lazily load voices when the Edit tab opens
     if(t.dataset.view==="edit"){
@@ -4832,7 +4970,8 @@ async function genMultiVoiceScenes(){
 
 /* ---------- settings ---------- */
 function openSettings(){
-  $("#setKey").value=""; $("#setBase").value=CFG.base_url; $("#setModel").value=CFG.model||"gpt-image-2";
+  if(!CFG){ toast("Settings still loading…","err"); return; }
+  $("#setKey").value=""; $("#setBase").value=CFG.base_url;
   $("#setClKey").value=""; $("#setClBase").value=CFG.claude_base_url; $("#setClModel").value=CFG.claude_model;
   if($("#set9rKey")) $("#set9rKey").value="";
   if($("#set9rBase")) $("#set9rBase").value=CFG.ninerouter_base_url||"http://localhost:20128";

@@ -237,8 +237,8 @@ def assemble_video(
 
     workdir = os.path.dirname(output_path) or "."
     os.makedirs(workdir, exist_ok=True)
-    tmp_dir = os.path.join(workdir, "_assemble_tmp")
-    os.makedirs(tmp_dir, exist_ok=True)
+    import tempfile
+    tmp_dir = tempfile.mkdtemp(prefix="_assemble_", dir=workdir)
 
     # 1. Build per-shot video clips, all normalised to the same size+fps.
     clip_paths = []
@@ -301,7 +301,13 @@ def assemble_video(
         inputs = []
         for cp, _ in clip_paths:
             inputs += ["-i", cp]
-        xfade_d = 0.4
+        xfade_d_default = 0.4
+        # Clamp xfade duration so it never exceeds the shortest adjacent clip —
+        # prevents ffmpeg failures on fast micro-cut holds (can be as low as 0.3s).
+        min_clip_dur = min(d for _, d in clip_paths)
+        xfade_d = min(xfade_d_default, min_clip_dur / 2.0)
+        if xfade_d < 0.05:
+            xfade_d = 0  # too short for a visible transition — degrade to cut
         filtergraph = ""
         last_label = "0:v"
         cum = clip_paths[0][1]
@@ -369,15 +375,10 @@ def assemble_video(
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg mux failed: {proc.stderr[-600:]}")
 
-    # cleanup
+    # cleanup: unique temp dir — remove it entirely
     try:
-        for cp, _ in clip_paths:
-            os.remove(cp)
-        if os.path.exists(silent_video):
-            os.remove(silent_video)
-        if os.path.exists(os.path.join(tmp_dir, "list.txt")):
-            os.remove(os.path.join(tmp_dir, "list.txt"))
-        os.rmdir(tmp_dir)
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
     except Exception:
         pass
 

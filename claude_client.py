@@ -1105,6 +1105,71 @@ class ClaudeClient:
         return self.chat_text("\n\n".join(bits), system=system, max_tokens=tok)
 
     # ----- Wave 5: YT growth helpers -----
+    def scenes_from_transcript(self, segments: list, style_notes: str = "",
+                                master_prompt: str = "", dynamic: bool = True) -> str:
+        """Audio->Video: write ONE visual scene per transcript segment.
+
+        ``segments`` is a list of ``{"text": str, "start": float, "end": float}``
+        taken straight from the user's transcribed audio. The narration is FIXED
+        (it is the user's own audio) — Claude must NOT rewrite the words; it only
+        invents the matching VISUAL for each segment so the images illustrate
+        exactly what is being said at that moment. Fast micro-cut, high-retention
+        pacing with continuity across shots.
+
+        Returns STRICT JSON text:
+          {"characters":[{name, sheet_prompt}],
+           "scenes":[{n, vo, prompt, shot_relation}]}
+        The vo of scene i is segments[i]["text"] verbatim; prompt is the image.
+        """
+        n = len(segments)
+        seg_lines = "\n".join(
+            f'{i+1}. [{s.get("start",0):.1f}-{s.get("end",0):.1f}s] "{(s.get("text") or "").strip()}"'
+            for i, s in enumerate(segments)
+        )
+        style_prefix = (f'Start EVERY scene prompt with this style: "{style_notes.strip()}"\n'
+                        if style_notes.strip() else "")
+        dyn = ("- HIGH-RETENTION: every frame shows the subject ACTIVELY doing/"
+               "reacting to that exact line — motion, emotion, a fresh angle. "
+               "Never a static talking-head repeat.\n") if dynamic else ""
+        system = (
+            "You are a music-video / explainer director. You are given the EXACT "
+            "transcript of a piece of audio, split into timed segments. Write ONE "
+            "image scene per segment that VISUALLY illustrates that line. Return "
+            "STRICT JSON ONLY (no prose, no fences) shaped EXACTLY as:\n"
+            '{\n'
+            '  "characters": [ { "name": str, "sheet_prompt": str } ],\n'
+            '  "scenes": [ { "n": int, "vo": str, "prompt": str, "shot_relation": "cut"|"continue" } ]\n'
+            "}\n"
+            "RULES:\n"
+            f"- scenes[] MUST have EXACTLY {n} elements (n=1..{n}), one per segment, "
+            "IN ORDER. Count before you output.\n"
+            "- Each scene 'vo' MUST be the segment's transcript text VERBATIM — do "
+            "NOT paraphrase, shorten or rewrite the words. The audio is fixed.\n"
+            "- Each scene 'prompt' is a self-contained image-generation prompt that "
+            "illustrates that line: subject, action, framing, mood. Make consecutive "
+            "frames DIFFERENT visual moments (close-up -> wide -> reaction -> cutaway "
+            "-> detail) so it reads like a fast, snappy cut — never repeat a shot.\n"
+            '- "shot_relation": "continue" only when this line is the SAME continuous '
+            'moment as the previous (a micro-cut: push-in / reverse / reaction); '
+            'otherwise "cut". The first scene is always "cut".\n'
+            f"{style_prefix}"
+            f"{dyn}"
+            "- AUTO-CAST: add to characters[] only the recurring people/mascots the "
+            "visuals actually need (0 for pure object/scenery audio, 1 lead for most, "
+            "2-3 max). Every named recurring character MUST have a rich sheet_prompt "
+            "describing their canonical look in the target art style. Name them in the "
+            "scene prompts so their sheet can be auto-attached.\n"
+            "- STYLE BAN: never write doodle, whiteboard, scribble, pencil-sketch.\n"
+        )
+        bits = [f"Transcript segments ({n} total) — write one visual scene each:\n{seg_lines}"]
+        if style_notes.strip():
+            bits.append(f"ART STYLE to match (from the sample video): {style_notes.strip()}")
+        if master_prompt.strip():
+            bits.append(f"WORLD BIBLE: {master_prompt.strip()[:300]}")
+        bits.append(f"Write exactly {n} scenes, vo verbatim from each segment. JSON only.")
+        tok = max(3000, n * 170)
+        return self.chat_text("\n\n".join(bits), system=system, max_tokens=tok)
+
     def seo(self, title, description, n=5):
         system = ('YouTube SEO assistant. Return STRICT JSON ONLY: '
                   '{"titles":[str,...],"description":str,"tags":[str,...]}. '

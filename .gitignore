@@ -26,3 +26,9 @@ _run.log
 _live_server.log
 __pycache__/
 *.pyc
+
+# User vault — contains per-user API keys, NEVER commit
+vault.json
+vault.json.bak*
+users.json
+codes.json

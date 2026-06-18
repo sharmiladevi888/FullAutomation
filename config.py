@@ -177,15 +177,9 @@ CLAUDE_MODELS = [
 
 # --- OpenAI direct (alternative AI provider) ---------------------------------
 OPENAI_API_KEY = _get("OPENAI_API_KEY", "")
-OPENAI_BASE_URL = "https://api.openai.com/v1"
-OPENAI_MODEL = _get("OPENAI_MODEL", "gpt-5.4-mini")
-OPENAI_MODELS = [
-    "gpt-5.4-mini",
-    "gpt-4.1-mini",
-    "gpt-4.1-nano",
-]
+OPENAI_BASE_URL = _get("OPENAI_BASE_URL", "https://api.openai.com/v1")
 
-# --- Google Gemini (AI Studio) — cheap/free TEXT + VISION for scripting,
+# --- Google Gemini (AI Studio)
 #     YouTube analysis and prompting. Uses Google's OpenAI-COMPATIBLE endpoint
 #     so it rides the existing OpenAI chat path in claude_client (_msg_openai).
 #     NOTE: free tier covers text+vision; image-gen (Nano Banana / Imagen) and
@@ -202,6 +196,12 @@ GEMINI_MODELS = [
     "gemini-flash-latest",
     "gemini-pro-latest",
 ]
+
+# OpenAI key — used ONLY by the Audio→Video tab for Whisper transcription
+# (word-level timestamps). Independent of the image/text providers above.
+OPENAI_API_KEY = _get("OPENAI_API_KEY", "")
+OPENAI_BASE_URL = _get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+WHISPER_MODEL = _get("WHISPER_MODEL", "whisper-1")
 
 # --- OpenRouter (alternative image generation via chat completions) ---------
 OPENROUTER_API_KEY = _get("OPENROUTER_API_KEY", "")
