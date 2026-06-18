@@ -1369,10 +1369,6 @@
               <label class="label" style="margin:0 0 4px">Pacing (s/img)</label>
               <input type="number" id="apPacing" value="1" min="0.5" max="10" step="0.5" style="width:100px" title="Seconds each image is on screen. 1 = 1 image per second. Determines number of frames = length ÷ pacing."/>
             </div>
-            <div style="min-width:110px">
-              <label class="label" style="margin:0 0 4px">Characters</label>
-              <input type="number" id="apNumChars" value="" min="0" max="8" step="1" placeholder="auto" style="width:80px" title="Number of recurring cast characters — blank = AI auto"/>
-            </div>
             <div style="min-width:220px">
               <label class="label" style="margin:0 0 4px">Voice</label>
               <select id="apVoice" style="width:100%"><option value="">Default voice</option></select>
@@ -1768,10 +1764,6 @@ Close-up of @Mira fixing a circuit board, sparks reflecting on her goggles
         <div class="opt">
           <label class="label">Target duration (s)</label>
           <input type="number" id="scDuration" value="30" min="2" max="600" step="1" oninput="updateSceneCount()" />
-        </div>
-        <div class="opt">
-          <label class="label"># Characters</label>
-          <input type="number" id="scChars" value="2" min="0" max="12" />
         </div>
         <div class="opt">
           <label class="label">Style notes (optional)</label>
@@ -3927,7 +3919,6 @@ async function applySuggestion(s, autoGenerate=false){
   // duration and # characters all auto-load into the script generator.
   $("#scTitle").value = s.title||"";
   $("#scDesc").value  = [s.logline, s.image_prompt_style?("Visual style: "+s.image_prompt_style):"", s.voiceover_style?("Voice-over: "+s.voiceover_style):""].filter(Boolean).join("\n\n");
-  $("#scChars").value = s.num_characters!=null ? s.num_characters : 2;
   if(s.pacing_seconds) $("#scPacing").value = s.pacing_seconds;
   if(s.total_duration) $("#scDuration").value = s.total_duration;
   if(s.image_prompt_style) $("#scStyle").value = (s.image_prompt_style||"");
@@ -4251,7 +4242,7 @@ async function genScript(){
       title, description,
       total_duration: parseFloat($("#scDuration").value||"30"),
       pacing_seconds: parseFloat($("#scPacing").value||"1"),
-      num_characters: parseInt($("#scChars").value||"0",10),
+      num_characters: -1,
       style_notes: $("#scStyle").value,
       model: $("#scModel").value,
       dialogue: !!($("#scDialogue")&&$("#scDialogue").checked),
@@ -4259,8 +4250,28 @@ async function genScript(){
     STATE.script = d;
     renderScript();
     toast("Script ready — "+((d.scenes||[]).length)+" scenes","ok");
+    await autoGenerateScriptCharacters(d);
     setTimeout(()=>$("#voWrap").scrollIntoView({behavior:"smooth",block:"start"}),100);
   }catch(e){ toast(e.message,"err"); } finally{ busy(b,false); }
+}
+async function autoGenerateScriptCharacters(script){
+  const chars=(script&&script.characters)||[];
+  if(!chars.length) return;
+  if(!hasImageKey()){
+    toast(`${chars.length} character prompt(s) ready — connect image API to auto-generate sheets`,"err");
+    return;
+  }
+  const existing=new Set((STATE.characters||[]).map(c=>(c.name||"").trim().toLowerCase()).filter(Boolean));
+  const missing=chars.filter(c=>!existing.has((c.name||"").trim().toLowerCase()));
+  if(!missing.length) return;
+  const text=missing.map(c=>`${(c.name||"").trim()}\n${(c.sheet_prompt||c.description||"").trim()}`.trim()).join("\n\n");
+  toast(`Auto-generating ${missing.length} character sheet(s)…`);
+  try{
+    const r=await api("/api/characters/batch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text})});
+    if(r.created&&r.created.length){ STATE.characters.push(...r.created); renderCharacters(); renderCast(); }
+    if(r.errors&&r.errors.length){ toast(`${r.created.length} sheet(s) created, ${r.errors.length} failed`, r.created.length?"ok":"err"); }
+    else if(r.created&&r.created.length){ toast(`${r.created.length} character sheet(s) generated ✓`,"ok"); }
+  }catch(e){ toast("Character sheet auto-gen failed: "+e.message,"err"); }
 }
 function renderScript(){
   const root=$("#scriptOut"); root.innerHTML="";
@@ -5354,7 +5365,7 @@ async function findTopics(){
   const target_seconds=parseFloat(($("#apLength")||{}).value);
   if(!target_seconds||target_seconds<=0){ toast("Enter a video length (sec) first","err"); $("#apLength")?.focus(); return; }
   const _p=parseFloat(($("#apPacing")||{}).value); const pacing_seconds=(_p>0)?_p:null;
-  const _c=parseInt(($("#apNumChars")||{}).value,10); const num_characters=(isNaN(_c)||_c<0)?null:_c;
+  const num_characters=null; // auto-cast: script model decides recurring cast
   const orientation=($("#apOrient")||{}).value||"landscape";
   const b=$("#apBtn"); busy(b,true,"Analysing & ranking topics…");
   const many=urls.length>1;
@@ -5383,8 +5394,7 @@ async function runAutopilot(idx=0, fromCache=false){
   const sound_design=!($("#apSfx")&&!$("#apSfx").checked);
   const _apPacing=parseFloat(($("#apPacing")||{}).value);
   const pacing_seconds=isNaN(_apPacing)||_apPacing<=0 ? null : _apPacing;
-  const _apChars=parseInt(($("#apNumChars")||{}).value,10);
-  const num_characters=isNaN(_apChars)||_apChars<0 ? null : _apChars;
+  const num_characters=null; // auto-cast: script model decides recurring cast
   const smart_edit=!($("#apSmartEdit")&&!$("#apSmartEdit").checked);
   AP_STEP_LIMIT=step_timeout;
   AP_RUN_ID="run_"+Date.now()+"_"+Math.random().toString(36).slice(2,7);
@@ -5803,7 +5813,7 @@ function wfWireNode(el,n){
         if(box) box.innerHTML='<div class="wf-topic-load">Watching the video & deconstructing style…</div>';
         await analyzeYTMulti(); wfRenderTopics(el);
       }
-      else if(act==="script"){ $("#scTitle").value=wfv("wf-sc-title"); $("#scDesc").value=wfv("wf-sc-desc"); $("#scPacing").value=wfv("wf-sc-pacing"); $("#scDuration").value=wfv("wf-sc-dur"); $("#scChars").value=wfv("wf-sc-chars"); updateSceneCount(); await genScript(); }
+      else if(act==="script"){ $("#scTitle").value=wfv("wf-sc-title"); $("#scDesc").value=wfv("wf-sc-desc"); $("#scPacing").value=wfv("wf-sc-pacing"); $("#scDuration").value=wfv("wf-sc-dur"); updateSceneCount(); await genScript(); }
       else if(act==="char"){ $("#charName").value=wfv("wf-ch-name"); $("#charDesc").value=wfv("wf-ch-desc"); await genCharacter(); const a=el.querySelector("#wf-ch-name"), d=el.querySelector("#wf-ch-desc"); if(a)a.value=""; if(d)d.value=""; }
       else if(act==="seq"){ $("#shotPrompt").value=wfv("wf-seq-prompt"); await genShot(); const p=el.querySelector("#wf-seq-prompt"); if(p)p.value=""; }
       else if(act==="edit"){ await genVoiceoverScenes(); wfRenderLatestEdit(el);
@@ -5864,7 +5874,6 @@ function applySuggestionFields(s){
   if(!s) return;
   const desc=[s.logline, s.image_prompt_style?("Visual style: "+s.image_prompt_style):"", s.voiceover_style?("Voice-over: "+s.voiceover_style):""].filter(Boolean).join("\n\n");
   $("#scTitle").value=s.title||""; $("#scDesc").value=desc;
-  $("#scChars").value=s.num_characters!=null?s.num_characters:2;
   if(s.pacing_seconds)$("#scPacing").value=s.pacing_seconds;
   if(s.total_duration)$("#scDuration").value=s.total_duration;
   if(s.image_prompt_style)$("#scStyle").value=(s.image_prompt_style||"");

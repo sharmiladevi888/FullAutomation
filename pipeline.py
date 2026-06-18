@@ -214,7 +214,9 @@ def build_sheet_prompt(master_prompt, name, description, style_notes=""):
         "Layout: one clean reference sheet containing a full-body turnaround "
         "(front, 3/4, side, back), a large headshot, and a row of facial "
         "expressions. Keep proportions and design identical across every view. "
-        "Neutral flat background, soft even lighting."
+        "Neutral flat background, soft even lighting. Do NOT make a generic "
+        "character sheet: the line weight, proportions, face simplicity, palette, "
+        "texture and rendering must match the source-video style exactly."
     )
     parts.append(
         f'Print the name "{name}" clearly as a label at the top of the sheet so '
