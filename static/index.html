@@ -4172,13 +4172,14 @@ async function analyzeYouTube(){
     const sm=$("#ytSummary");
     sm.style.display="block";
     sm.innerHTML =
+      (d.warning?`<div class="yt-note err" style="background:rgba(255,170,0,.12);border:1px solid var(--amber-soft);color:var(--amber-soft);padding:10px 12px;border-radius:8px;margin-bottom:10px;font-weight:600">${_esc(d.warning)}</div>`:"")+
       (d.title?`<div class="yt-src">▶ <strong>${_esc(d.title)}</strong>${d.channel?` · ${_esc(d.channel)}`:""}</div>`:"")+
       (d.notes?`<div class="yt-note">${_esc(d.notes)}</div>`:"")+
       `<div class="yt-meta"><span><b>Topic</b> ${_esc(d.topic||"—")}</span><span><b>Look</b> ${_esc(d.style_summary||"—")}</span><span><b>Voice</b> ${_esc(d.speech_style||"—")}</span></div>`+
       `<div style="margin-top:8px"><button class="btn outline sm" onclick="surpriseSuggestion()">🔀 Surprise me</button></div>`;
     renderSuggestions();
-    toast(`${YT_SUGG.length} ideas ready — pick one`,"ok");
-    confettiBurst();
+    if(d.warning){ toast(d.warning.slice(0,80),"err"); }
+    else { toast(`${YT_SUGG.length} ideas ready — pick one`,"ok"); confettiBurst(); }
   }catch(e){ grid.innerHTML=""; toast(e.message,"err"); $("#ytSummary").style.display="block"; $("#ytSummary").innerHTML=`<div class="yt-note err">${_esc(e.message)}</div>`; }
   finally{ busy(b,false); }
 }

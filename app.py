@@ -1983,8 +1983,22 @@ def _deep_analyze_urls(urls, nudge, model, request, n_suggestions=10):
         raise
     except Exception as e:
         # Don't hard-500 — degrade to a minimal valid response with a warning so
-        # the UI still renders something actionable.
-        analysis_warning = f"analysis degraded: {e}"
+        # the UI still renders something actionable. Detect rate-limit / quota
+        # errors specifically so the user knows to switch model or wait.
+        _emsg = str(e)
+        _low = _emsg.lower()
+        if "429" in _emsg or "rate limit" in _low or "usage limit" in _low or "quota" in _low:
+            import re as _re
+            _reset = _re.search(r"reset after ([\dhms\s]+)", _emsg)
+            _model_m = _re.search(r"\[([\w/.\-]+)\]", _emsg)
+            _mdl = _model_m.group(1) if _model_m else "the selected model"
+            analysis_warning = (
+                f"⚠️ Rate-limited: {_mdl} hit its usage limit"
+                + (f" (resets after {_reset.group(1).strip()})" if _reset else "")
+                + ". Switch to a lighter model (e.g. cc/claude-sonnet-4-6) in "
+                  "Settings, or wait and retry. These are placeholder ideas.")
+        else:
+            analysis_warning = f"analysis degraded: {e}"
         data = data if isinstance(data, dict) else {}
         sugs = sugs or []
 
