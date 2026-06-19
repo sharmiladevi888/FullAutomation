@@ -342,6 +342,54 @@ class ClaudeClient:
                 raise RuntimeError(
                     f"{orig_err} | fallback {fb_model} also failed: {fe}")
 
+        # 429 model cascade: when the primary model is rate-limited, try
+        # progressively lighter models on the same router before giving up.
+        # This prevents "silent placeholder topics" / "keeps loading" when
+        # the user's chosen model is throttled.
+        _RATE_LIMIT_CASCADE = ["cc/claude-sonnet-4-6", "mimo/mimo-v2.5-pro"]
+
+        def _try_cascade(orig_err):
+            """Try lighter models on the same base_url. Returns result or raises."""
+            for cm in _RATE_LIMIT_CASCADE:
+                if cm == self.model:
+                    continue  # skip the model that just failed
+                _log(f"429 cascade — trying {cm}")
+                if "claude" in cm.lower():
+                    # Use the Anthropic SDK with the lighter model
+                    try:
+                        ckwargs = dict(kwargs)
+                        ckwargs["model"] = cm
+                        with _CLAUDE_SEM:
+                            resp2 = self._sdk.messages.create(**ckwargs)
+                        out2 = []
+                        for block in resp2.content:
+                            btype = getattr(block, "type", None)
+                            if btype == "text":
+                                out2.append(block.text)
+                            elif btype == "tool_use":
+                                inp = getattr(block, "input", None)
+                                if inp:
+                                    out2.append(json.dumps(inp))
+                        _log(f"429 cascade succeeded with {cm}")
+                        return "\n".join(out2).strip()
+                    except Exception as ce:
+                        _log(f"429 cascade {cm} failed: {ce}")
+                        continue
+                else:
+                    # Use the OpenAI path for non-Claude models
+                    try:
+                        result = self._msg_openai(content_blocks, system=system,
+                                                   max_tokens=max_tokens, model=cm)
+                        _log(f"429 cascade succeeded with {cm}")
+                        return result
+                    except Exception as ce:
+                        _log(f"429 cascade {cm} failed: {ce}")
+                        continue
+            raise RuntimeError(
+                f"{orig_err} — all cascade models also rate-limited. "
+                f"Tried: {[self.model] + _RATE_LIMIT_CASCADE}. "
+                f"Wait for quota reset or switch model in Settings.")
+
         attempt = 0
         while True:
             try:
@@ -365,9 +413,11 @@ class ClaudeClient:
             except RateLimitError as e:
                 attempt += 1
                 if attempt > CLAUDE_MAX_RETRIES:
-                    raise RuntimeError(
-                        f"Claude API rate limit — gave up after {attempt-1} "
-                        f"retries: {self._format_err(e)}")
+                    # Primary model is rate-limited — try the cascade of
+                    # lighter models before giving up entirely.
+                    _emsg = (f"Claude API rate limit — {self.model} gave up "
+                             f"after {attempt-1} retries: {self._format_err(e)}")
+                    return _try_cascade(_emsg)
                 wait = _retry_after_seconds(e, default=5.0) + random.uniform(0, 1.0)
                 _log(f"429 rate_limit (attempt {attempt}) — waiting {wait:.1f}s "
                      f"then retrying")
