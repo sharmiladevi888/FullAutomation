@@ -7187,10 +7187,21 @@ def api_a2v_render(body: A2VRenderIn, request: Request):
         "base_url": _snap_settings.get("base_url", config.BASE_URL),
         "model": _snap_settings.get("model", config.MODEL),
     }
+    # Create a mock request-like object for functions that still take request
+    # (e.g. _render_one, _apply_cut_clicks) — they only access
+    # request.state.settings which we've snapshotted.
+    class _MockState:
+        pass
+    class _MockRequest:
+        pass
+    _mock_state = _MockState()
+    _mock_state.settings = _snap_settings
+    _mock_request = _MockRequest()
+    _mock_request.state = _mock_state
 
     def _run_a2v():
         try:
-            _a2v_run_pipeline(run_id, body, _snap_settings, _snap_img_cfg)
+            _a2v_run_pipeline(run_id, body, _snap_settings, _snap_img_cfg, _mock_request)
         except Exception as e:
             _a2v_prog(run_id, done=True, error=str(e)[:500])
             print(f"[a2v] async run {run_id} failed: {e}", flush=True)
@@ -7200,9 +7211,10 @@ def api_a2v_render(body: A2VRenderIn, request: Request):
     return {"ok": True, "run_id": run_id, "scenes": len(body.scenes)}
 
 
-def _a2v_run_pipeline(run_id: str, body: A2VRenderIn, s: dict, img_cfg: dict):
+def _a2v_run_pipeline(run_id: str, body: A2VRenderIn, s: dict, img_cfg: dict, request=None):
     """The actual A2V pipeline -- runs in a background thread with progress.
-    Uses snapshotted settings + image config (not the request object)."""
+    Uses snapshotted settings + image config (not the request object).
+    ``request`` is a mock object with .state.settings for functions that need it."""
     # s is already the settings dict (snapshotted before thread start)
     style_notes = (body.style_notes or "").strip()
     # Use the snapshotted image config instead of request-dependent get_image_client
@@ -7235,7 +7247,7 @@ def _a2v_run_pipeline(run_id: str, body: A2VRenderIn, s: dict, img_cfg: dict):
 
     # Step: Characters
     _a2v_prog(run_id, step="characters")
-    img_client = get_image_client(request)
+    img_client = _img_client
     chars_created = 0
     for c in (body.characters or []):
         name = (c.get("name") or "").strip()
