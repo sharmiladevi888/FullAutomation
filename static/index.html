@@ -1320,6 +1320,7 @@
     <button class="tab" data-view="sequence"><span class="n">05</span>Sequence</button>
     <button class="tab" data-view="edit"><span class="n">06</span>Edit (Audio + Video)</button>
     <button class="tab" data-view="a2v" style="color:var(--teal)">🎵→🎬 Audio→Video</button>
+    <button class="tab" data-view="audio_studio" style="color:var(--amber)">🎧 Audio Studio</button>
     <button class="tab tab-yt" data-view="thumb">🖼 Thumbnail</button>
     <button class="tab" data-view="timeline"><span class="n">07</span>Timeline</button>
     <button class="tab" data-view="usage" style="color:var(--teal)">$ Usage</button>
@@ -2125,6 +2126,87 @@ Close-up of @Mira fixing a circuit board, sparks reflecting on her goggles
         <button class="btn outline sm" id="sfxUpBtn" onclick="uploadSfx()">Add SFX</button>
       </div>
       <div id="sfxList" style="margin-top:12px"></div>
+    </section>
+
+    <!-- ============ 🎧 AUDIO STUDIO ============ -->
+    <section class="view sheet" id="view-audio_studio">
+      <h2 class="section">🎧 Audio Studio</h2>
+      <p class="sub">Generate voice, music, and sound effects in one place. The library saves every clip — replay, download, or push into the Edit tab as background music / SFX.</p>
+
+      <div class="as-grid" style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:16px; margin-top:18px">
+
+        <!-- ====== VOICE ====== -->
+        <div class="as-panel" style="background:var(--bg2); border:1px solid var(--line); border-radius:12px; padding:14px">
+          <h3 style="margin:0 0 8px; font-family:var(--disp); font-size:16px; color:var(--ink)">🗣 Voice <span class="opt-note">text → speech</span></h3>
+          <div class="fld"><label class="label">Prompt / script</label>
+            <textarea id="asVoicePrompt" rows="4" class="inp" placeholder="Type the line you want spoken. For narration keep it under 30 seconds of text (~75 words) per generation." style="width:100%; resize:vertical"></textarea>
+          </div>
+          <div class="fld" style="display:flex; gap:8px; align-items:center">
+            <div style="flex:1"><label class="label">Voice</label>
+              <select id="asVoiceVoice"></select>
+            </div>
+            <div style="text-align:right"><label class="label">&nbsp;</label>
+              <button class="btn outline sm" id="asVoiceRefresh" onclick="asRefreshVoices()" title="Refresh voice list">↻</button>
+            </div>
+          </div>
+          <details style="margin-top:6px">
+            <summary style="cursor:pointer; font-family:var(--mono); font-size:11px; letter-spacing:.06em; color:var(--faint)">Advanced (voice knobs)</summary>
+            <div class="fld"><label class="label">Stability <span class="opt-note">ElevenLabs only, 0-1</span></label>
+              <input type="number" id="asVoiceStab" min="0" max="1" step="0.05" value="0.5" /></div>
+            <div class="fld"><label class="label">Similarity boost <span class="opt-note">ElevenLabs only, 0-1</span></label>
+              <input type="number" id="asVoiceSim" min="0" max="1" step="0.05" value="0.75" /></div>
+          </details>
+          <button class="btn glow" id="asVoiceBtn" onclick="asGenerate('voice')" style="margin-top:8px; width:100%">✨ Generate voice</button>
+          <audio id="asVoiceAudio" controls style="width:100%; margin-top:10px; display:none"></audio>
+        </div>
+
+        <!-- ====== MUSIC ====== -->
+        <div class="as-panel" style="background:var(--bg2); border:1px solid var(--line); border-radius:12px; padding:14px">
+          <h3 style="margin:0 0 8px; font-family:var(--disp); font-size:16px; color:var(--ink)">🎶 Music <span class="opt-note">text → song</span></h3>
+          <div id="asMusicInstall" style="display:none; background:rgba(255,170,0,.08); border:1px solid rgba(255,170,0,.3); border-radius:8px; padding:8px; font-size:12px; margin-bottom:8px; white-space:pre-wrap"></div>
+          <div class="fld"><label class="label">Prompt</label>
+            <textarea id="asMusicPrompt" rows="4" class="inp" placeholder='e.g. "lo-fi hip hop, mellow piano, soft drums, vinyl crackle, 70 bpm"' style="width:100%; resize:vertical"></textarea>
+          </div>
+          <div class="row" style="gap:8px; flex-wrap:wrap">
+            <div class="fld" style="flex:1; min-width:120px"><label class="label">Model</label>
+              <select id="asMusicSize">
+                <option value="small">small (300M, fast)</option>
+                <option value="medium" selected>medium (1.5B)</option>
+                <option value="melody">melody (1.5B, accepts melody ref)</option>
+                <option value="large">large (3.3B, GPU only)</option>
+              </select></div>
+            <div class="fld" style="flex:1; min-width:100px"><label class="label">Duration (s)</label>
+              <input type="number" id="asMusicDur" min="1" max="30" step="1" value="10" /></div>
+            <div class="fld" style="flex:1; min-width:100px"><label class="label">Temperature</label>
+              <input type="number" id="asMusicTemp" min="0" max="2" step="0.1" value="1.0" /></div>
+          </div>
+          <button class="btn glow" id="asMusicBtn" onclick="asGenerate('music')" style="margin-top:8px; width:100%">🎼 Generate music</button>
+          <audio id="asMusicAudio" controls style="width:100%; margin-top:10px; display:none"></audio>
+        </div>
+
+        <!-- ====== SFX ====== -->
+        <div class="as-panel" style="background:var(--bg2); border:1px solid var(--line); border-radius:12px; padding:14px">
+          <h3 style="margin:0 0 8px; font-family:var(--disp); font-size:16px; color:var(--ink)">💥 SFX <span class="opt-note">text → sound effect</span></h3>
+          <div id="asSfxInstall" style="display:none; background:rgba(255,170,0,.08); border:1px solid rgba(255,170,0,.3); border-radius:8px; padding:8px; font-size:12px; margin-bottom:8px; white-space:pre-wrap"></div>
+          <div class="fld"><label class="label">Prompt</label>
+            <textarea id="asSfxPrompt" rows="4" class="inp" placeholder='e.g. "footstep on gravel, slow, single step"' style="width:100%; resize:vertical"></textarea>
+          </div>
+          <div class="fld"><label class="label">Duration (s) <span class="opt-note">1-10s</span></label>
+            <input type="number" id="asSfxDur" min="0.5" max="10" step="0.5" value="2" /></div>
+          <button class="btn glow" id="asSfxBtn" onclick="asGenerate('sfx')" style="margin-top:8px; width:100%">💥 Generate SFX</button>
+          <audio id="asSfxAudio" controls style="width:100%; margin-top:10px; display:none"></audio>
+        </div>
+      </div>
+
+      <!-- ====== LIBRARY ====== -->
+      <div style="margin-top:24px">
+        <div class="row" style="justify-content:space-between; align-items:flex-end; margin-bottom:8px">
+          <h3 style="margin:0; font-family:var(--disp); font-size:18px">📚 Library <span class="opt-note">saved clips — replay, download, push to Edit tab</span></h3>
+          <button class="btn outline sm" onclick="asRefreshLibrary()">↻ Refresh</button>
+        </div>
+        <div id="asLibrary" class="as-library" style="display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:10px"></div>
+        <div id="asLibraryEmpty" class="hint" style="margin-top:14px">No clips yet. Generate one above and it'll appear here.</div>
+      </div>
     </section>
 
     <!-- ============ USAGE DASHBOARD ============ -->
@@ -6296,6 +6378,169 @@ function engFinish(ok){
 
 function wfApply(){ const s=$("#wfStage"); if(s) s.style.transform=`translate(${wf.px}px,${wf.py}px) scale(${wf.scale})`; }
 function openView(v){ const t=document.querySelector(`.tab[data-view="${v}"]`); if(t) t.click(); }
+
+/* ---------- Audio Studio tab ---------- */
+const AS = { voiceList:[], lastVoice:null, lastMusic:null, lastSfx:null };
+
+async function asRefreshCapabilities(){
+  // Probe local-model availability for music + sfx so the UI shows the
+  // install banner instead of failing on first click.
+  for(const k of ["music","sfx"]){
+    try{
+      const d = await api("/api/audio/capability",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({kind:k})});
+      const el = $((k==="music") ? "#asMusicInstall" : "#asSfxInstall");
+      if(!el) continue;
+      if(!d.available){
+        el.style.display = "block";
+        el.textContent = "⚠ Local model not installed — install to enable:\n"+d.hint;
+      } else {
+        el.style.display = "none";
+      }
+    }catch(e){ /* offline or 501 — leave hidden */ }
+  }
+}
+
+async function asRefreshVoices(){
+  const sel = $("#asVoiceVoice");
+  if(!sel) return;
+  sel.innerHTML = '<option>Loading…</option>';
+  try{
+    // The /api/voices endpoint already returns the active provider's catalog.
+    // If the user switches providers, the dropdown updates next refresh.
+    const d = await api("/api/voices",{method:"GET"});
+    AS.voiceList = d.voices || [];
+    const provider = d.provider || "elevenlabs";
+    sel.innerHTML = AS.voiceList.map(v =>
+      `<option value="${_esc(v.id)}">${_esc(v.name)}</option>`).join("") ||
+      `<option value="">${_esc(provider)} (no voice list)</option>`;
+    if(d.current && [...sel.options].some(o => o.value === d.current)){
+      sel.value = d.current;
+    }
+  }catch(e){
+    sel.innerHTML = `<option value="">Failed: ${_esc(e.message||"")}</option>`;
+  }
+}
+
+async function asGenerate(kind){
+  const btn = $("#as"+kind[0].toUpperCase()+kind.slice(1)+"Btn");
+  const audioEl = $("#as"+kind[0].toUpperCase()+kind.slice(1)+"Audio");
+  if(!btn) return;
+  const body = { kind, save_to_library: true, name_hint: kind+"_"+Date.now() };
+  if(kind === "voice"){
+    body.prompt = ($("#asVoicePrompt").value||"").trim();
+    body.voice_id = $("#asVoiceVoice").value || null;
+    body.stability = parseFloat($("#asVoiceStab").value);
+    body.similarity_boost = parseFloat($("#asVoiceSim").value);
+  } else if(kind === "music"){
+    body.prompt = ($("#asMusicPrompt").value||"").trim();
+    body.music_size = $("#asMusicSize").value;
+    body.duration_seconds = parseFloat($("#asMusicDur").value);
+    body.temperature = parseFloat($("#asMusicTemp").value);
+  } else { // sfx
+    body.prompt = ($("#asSfxPrompt").value||"").trim();
+    body.duration_seconds = parseFloat($("#asSfxDur").value);
+  }
+  if(!body.prompt){ toast("Type a prompt first","err"); return; }
+  busy(btn,true,"Generating " + kind + "…");
+  try{
+    const d = await api("/api/audio/studio",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    if(audioEl){
+      audioEl.src = d.url + (d.url.includes("?")?"&":"?") + "t=" + Date.now();
+      audioEl.style.display = "block";
+      try{ audioEl.play(); }catch(_){}
+    }
+    if(kind==="voice") AS.lastVoice = d;
+    if(kind==="music") AS.lastMusic = d;
+    if(kind==="sfx")   AS.lastSfx   = d;
+    toast(`✓ ${kind}: ${d.size_bytes} bytes · ${(d.duration_seconds||0).toFixed(2)}s · ${d.provider}`,"ok");
+    confettiBurst();
+    asRefreshLibrary();
+  }catch(e){
+    toast(e.message,"err");
+  } finally { busy(btn,false); }
+}
+
+async function asRefreshLibrary(){
+  const grid = $("#asLibrary");
+  const empty = $("#asLibraryEmpty");
+  if(!grid) return;
+  try{
+    const d = await api("/api/audio/library",{method:"GET"});
+    const clips = d.clips || [];
+    if(!clips.length){
+      grid.innerHTML = "";
+      if(empty) empty.style.display = "block";
+      return;
+    }
+    if(empty) empty.style.display = "none";
+    grid.innerHTML = clips.map(c => asClipCard(c)).join("");
+  }catch(e){
+    grid.innerHTML = `<div class="hint">Library load failed: ${_esc(e.message||"")}</div>`;
+  }
+}
+
+function asClipCard(c){
+  const dur = (c.duration_seconds||0).toFixed(2);
+  const size = c.size_bytes ? Math.round(c.size_bytes/1024)+" KB" : "";
+  const kindBadge = {voice:"🗣",music:"🎶",sfx:"💥"}[c.provider] || "🎵";
+  const created = (c.created||"").slice(11,19) || "";
+  return `
+    <div class="as-clip" style="background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px">
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:8px">
+        <strong style="font-size:13px; color:var(--ink)">${kindBadge} ${_esc(c.provider)}</strong>
+        <span class="opt-note" style="font-size:11px">${dur}s · ${size} · ${_esc(created)}</span>
+      </div>
+      <div style="font-size:11px; color:var(--muted); margin:6px 0; max-height:48px; overflow:hidden; text-overflow:ellipsis">
+        ${_esc((c.prompt||"").slice(0,140))}${(c.prompt||"").length>140?"…":""}
+      </div>
+      <audio src="${_esc(c.url)}" controls style="width:100%; height:32px"></audio>
+      <div style="display:flex; gap:6px; margin-top:8px">
+        <a class="btn outline sm" style="flex:1; text-align:center" href="${_esc(c.url)}" download="${_esc(c.id+'.'+c.ext)}">⬇ Download</a>
+        <button class="btn outline sm" onclick="asPushToEdit('${_esc(c.id)}','${_esc(c.provider)}')">↗ Edit tab</button>
+        <button class="btn outline sm" style="color:var(--red)" onclick="asDeleteClip('${_esc(c.id)}',this)">✕</button>
+      </div>
+    </div>`;
+}
+
+async function asPushToEdit(clipId, kind){
+  try{
+    const d = await api("/api/audio/push-to-edit",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({clip_id:clipId, kind})});
+    if(!d.ok){ toast(d.detail||"push failed","err"); return; }
+    // Reload STATE so the Edit tab reflects the change. ``loadConfig``
+    // is the standard refresh path used elsewhere in the app.
+    try{
+      const ns = await api("/api/state",{method:"GET"});
+      if(ns && ns.state){ STATE = ns.state; }
+    }catch(_){ /* offline-ish — toast still shows success */ }
+    if(typeof renderMusic === "function") renderMusic();
+    if(typeof renderSfxList === "function") renderSfxList();
+    if(typeof renderAudio === "function") renderAudio();
+    const nice = {voice:"Voice",music:"Music",sfx:"SFX"}[kind] || kind;
+    toast(`✓ ${nice} pushed to Edit tab (${(d.duration||0).toFixed(2)}s)`,"ok");
+    openView("edit");
+  }catch(e){ toast(e.message,"err"); }
+}
+
+async function asDeleteClip(clipId, btn){
+  if(!confirm("Delete this clip from the library?")) return;
+  try{
+    await api("/api/audio/library/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({clip_id:clipId})});
+    const card = btn && btn.closest(".as-clip");
+    if(card) card.remove();
+    toast("Clip deleted","ok");
+  }catch(e){ toast(e.message,"err"); }
+}
+
+// Hook into tab activation so the studio refreshes voices + library on entry.
+document.addEventListener("click",(e)=>{
+  const tab = e.target && e.target.closest && e.target.closest(".tab");
+  if(!tab) return;
+  if(tab.dataset && tab.dataset.view === "audio_studio"){
+    asRefreshCapabilities();
+    asRefreshVoices();
+    asRefreshLibrary();
+  }
+});
 function wfOpen(){ if(!wf.built){ wfBuild(); wf.built=true; }
   // clear any stale engine dimming if no run is active (prevents a "buggy",
   // half-lit canvas after a run was interrupted or errored out)

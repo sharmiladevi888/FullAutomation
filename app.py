@@ -2983,6 +2983,267 @@ async def api_music(file: UploadFile = File(...), volume: float = Form(0.18)):
     return rec
 
 
+# =========================================================================== #
+#  🎵 Audio Studio — voice / music / SFX generation, dedicated tab
+# =========================================================================== #
+#
+# One tab, three providers:
+#   * Voice — text-to-speech via the active voice provider
+#             (ElevenLabs / Xiaomi MiMo / Deepgram Aura / local Piper).
+#   * Music — text-to-music via local MusicGen (Meta audiocraft, optional).
+#   * SFX   — text-to-SFX via ElevenLabs Sound Generation OR local AudioGen.
+#
+# All three write to a shared audio library (data/audio_gen/) so generated
+# clips can be replayed, downloaded, or pushed into the Edit tab as
+# background music / SFX. The library survives server restarts (sidecar JSON).
+
+import audio_gen as _audio_gen
+
+
+class AudioStudioIn(BaseModel):
+    """Request body for /api/audio/studio."""
+    kind: str                                # 'voice' | 'music' | 'sfx'
+    prompt: str = ""
+    # Voice knobs (ignored for music/sfx)
+    voice_id: Optional[str] = None
+    stability: Optional[float] = 0.5
+    similarity_boost: Optional[float] = 0.75
+    style: Optional[float] = 0.0
+    # Music + SFX knobs
+    duration_seconds: Optional[float] = None
+    music_size: Optional[str] = "small"      # small / medium / large / melody
+    temperature: Optional[float] = 1.0
+    top_k: Optional[int] = 250
+    # Behaviour
+    save_to_library: Optional[bool] = True
+    name_hint: Optional[str] = ""
+
+
+@app.post("/api/audio/studio")
+def api_audio_studio(body: AudioStudioIn, request: Request):
+    """Generate audio in the Audio Studio tab. Returns the audio bytes as a
+    JSON-friendly metadata dict (url, duration, ext, etc.). When
+    save_to_library=True (default), the clip is persisted to the audio
+    library for replay + reuse."""
+    kind = (body.kind or "").strip().lower()
+    if kind not in ("voice", "music", "sfx"):
+        raise HTTPException(400, f"unknown kind: {kind!r} — pick voice/music/sfx")
+    prompt = (body.prompt or "").strip()
+    if not prompt:
+        raise HTTPException(400, "prompt is empty — describe the audio you want")
+
+    try:
+        if kind == "voice":
+            audio, ext, alignment = _audio_gen.synth_voice(
+                request=request,
+                get_voice_client_fn=get_voice_client,
+                text=prompt,
+                voice_id=body.voice_id,
+                stability=body.stability or 0.5,
+                similarity_boost=body.similarity_boost or 0.75,
+                style=body.style or 0.0,
+            )
+        elif kind == "music":
+            if not _audio_gen.musicgen_available():
+                raise HTTPException(
+                    501, _audio_gen.musicgen_install_hint())
+            audio = _audio_gen.synth_music(
+                prompt=prompt,
+                duration_seconds=body.duration_seconds or 10.0,
+                size=body.music_size or "small",
+                temperature=body.temperature if body.temperature is not None else 1.0,
+                top_k=body.top_k or 250,
+                top_p=0.0,
+            )
+            ext = "wav"
+            alignment = None
+        else:  # sfx
+            # Try the active voice provider's generate_sfx() first (ElevenLabs
+            # Sound Generation works this way; MiMo/Deepgram/Piper raise so
+            # we fall through to AudioGen if it's installed).
+            audio, ext = _try_cloud_sfx(request, prompt, body.duration_seconds)
+            if audio is None and _audio_gen.audiogen_available():
+                audio = _audio_gen.synth_sfx_local(
+                    prompt=prompt,
+                    duration_seconds=body.duration_seconds or 2.0,
+                )
+                ext = "wav"
+            elif audio is None:
+                raise HTTPException(
+                    501,
+                    "SFX generation needs either an ElevenLabs key "
+                    "(Settings → ElevenLabs) OR local AudioGen installed "
+                    f"({_audio_gen.audiogen_install_hint()}).",
+                )
+            alignment = None
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"audio generation failed: {e}")
+
+    # Persist to library + return a URL the browser can <audio src=> directly.
+    meta = None
+    if body.save_to_library:
+        meta = _audio_gen.write_audio_clip(
+            audio, ext=ext, name_hint=body.name_hint or "",
+            prompt=prompt, provider=kind,
+        )
+        url = meta["url"]
+    else:
+        # No library write — use a temp URL via store.write_binary so the
+        # browser can still play it once.
+        url, _path = store.write_binary("audio", audio, ext=ext,
+                                        name_hint=body.name_hint or f"{kind}_clip")
+        meta = {"url": url, "ext": ext, "size_bytes": len(audio),
+                "duration_seconds": _audio_gen._wav_duration(audio) if ext == "wav" else 0,
+                "id": "tmp", "prompt": prompt[:500], "provider": kind,
+                "name_hint": body.name_hint or "", "created": store.now()}
+
+    return {
+        "ok": True, "kind": kind,
+        "url": url, "ext": ext,
+        "size_bytes": len(audio),
+        "duration_seconds": meta.get("duration_seconds", 0),
+        "library_id": meta.get("id"),
+        "has_alignment": alignment is not None,
+        # Echo knobs so the UI can show what was used.
+        "prompt": prompt[:500],
+        "provider": _provider_label(request, kind),
+    }
+
+
+def _try_cloud_sfx(request: Request, prompt: str, duration_seconds: float = None):
+    """Try the active voice client's generate_sfx() (ElevenLabs Sound API).
+    Returns (audio_bytes_or_None, ext). Raises nothing on provider missing
+    the method — just returns (None, ext)."""
+    try:
+        client = get_voice_client(request)
+    except Exception:
+        return None, "mp3"
+    if not hasattr(client, "generate_sfx"):
+        return None, "mp3"
+    try:
+        kwargs = {}
+        if duration_seconds:
+            kwargs["duration_seconds"] = float(duration_seconds)
+        audio = client.generate_sfx(prompt, **kwargs)
+    except RuntimeError:
+        return None, "mp3"
+    except Exception:
+        return None, "mp3"
+    if not audio:
+        return None, "mp3"
+    ext = "wav" if (audio[:4] == b"RIFF") else "mp3"
+    return audio, ext
+
+
+def _provider_label(request: Request, kind: str) -> str:
+    """Human-readable label of the provider actually used (for the UI toast)."""
+    if kind == "voice":
+        s = request.state.settings
+        return f"voice:{(s.get('voice_provider') or 'elevenlabs').lower()}"
+    if kind == "music":
+        return "music:musicgen"
+    if kind == "sfx":
+        s = request.state.settings
+        if (s.get("voice_provider") or "elevenlabs") == "elevenlabs":
+            return "sfx:elevenlabs"
+        return "sfx:audiogen"
+    return kind
+
+
+@app.get("/api/audio/library")
+def api_audio_library(limit: int = 200):
+    """List saved Audio Studio clips, newest first."""
+    return {"clips": _audio_gen.list_audio_clips(limit=limit)}
+
+
+@app.get("/api/audio/library/resolve")
+def api_audio_library_resolve(clip_id: str):
+    """Resolve a library clip back to its URL + filename + duration so the
+    front-end can wire it into the Edit tab (music, SFX, or voice slot)."""
+    clips = _audio_gen.list_audio_clips(limit=10000)
+    hit = next((c for c in clips if c.get("id") == clip_id), None)
+    if not hit or not os.path.exists(hit.get("path", "")):
+        raise HTTPException(404, f"clip not found: {clip_id}")
+    return {"ok": True, "id": hit["id"], "url": hit["url"],
+            "name": os.path.basename(hit["path"]), "path": hit["path"],
+            "duration": hit.get("duration_seconds", 0),
+            "provider": hit.get("provider", ""),
+            "ext": hit.get("ext", "wav")}
+
+
+class AudioPushToEditIn(BaseModel):
+    clip_id: str
+    kind: str   # 'voice' | 'music' | 'sfx'
+
+
+@app.post("/api/audio/push-to-edit")
+def api_audio_push_to_edit(body: AudioPushToEditIn, request: Request):
+    """Promote a library clip into the current project's Edit-tab slot
+    (background music / SFX / voiceover). Persists to project state."""
+    kind = (body.kind or "").strip().lower()
+    if kind not in ("voice", "music", "sfx"):
+        raise HTTPException(400, f"unknown kind: {kind!r}")
+    clips = _audio_gen.list_audio_clips(limit=10000)
+    hit = next((c for c in clips if c.get("id") == body.clip_id), None)
+    if not hit or not os.path.exists(hit.get("path", "")):
+        raise HTTPException(404, f"clip not found: {body.clip_id}")
+    st = store.load_state()
+    name = os.path.basename(hit["path"])
+    dur = hit.get("duration_seconds") or 0
+    if kind == "music":
+        st["music"] = {"id": hit["id"], "url": hit["url"],
+                       "name": name, "duration": dur, "volume": 0.18}
+    elif kind == "sfx":
+        st["sfx"] = st.get("sfx") or []
+        # Replace any existing SFX with this id (so re-pushing the same clip
+        # doesn't pile up duplicates).
+        st["sfx"] = [s for s in st["sfx"] if s.get("id") != hit["id"]]
+        st["sfx"].append({"id": hit["id"], "url": hit["url"], "name": name,
+                          "duration": dur, "volume": 0.8, "at_seconds": 0})
+    else:  # voice
+        st["audio_url"] = hit["url"]
+        st["audio_name"] = name
+        st["audio_duration"] = dur
+    store.save_state(st)
+    return {"ok": True, "kind": kind, "name": name, "duration": dur,
+            "url": hit["url"]}
+
+
+class AudioLibraryDeleteIn(BaseModel):
+    clip_id: str
+
+
+@app.post("/api/audio/library/delete")
+def api_audio_library_delete(body: AudioLibraryDeleteIn):
+    """Delete a clip from the audio library."""
+    if not body.clip_id:
+        raise HTTPException(400, "clip_id required")
+    ok = _audio_gen.delete_audio_clip(body.clip_id)
+    return {"ok": ok}
+
+
+class AudioStudioCapabilityIn(BaseModel):
+    kind: str   # 'music' | 'sfx'
+
+
+@app.post("/api/audio/capability")
+def api_audio_capability(body: AudioStudioCapabilityIn):
+    """Probe whether the requested local model is installed. The UI uses this
+    to render an 'install audiocraft' banner instead of failing on first click."""
+    kind = (body.kind or "").strip().lower()
+    if kind == "music":
+        return {"available": _audio_gen.musicgen_available(),
+                "models": list(_audio_gen.MUSICGEN_MODELS.keys()),
+                "hint": _audio_gen.musicgen_install_hint()}
+    if kind == "sfx":
+        return {"available": _audio_gen.audiogen_available(),
+                "models": list(_audio_gen.AUDIOGEN_MODELS.keys()),
+                "hint": _audio_gen.audiogen_install_hint()}
+    raise HTTPException(400, f"unknown kind: {kind!r}")
+
+
 @app.delete("/api/music")
 def api_delete_music():
     st = store.load_state()
