@@ -696,9 +696,9 @@ _PIPER_VOICES = [
     {"id": "kusal",      "name": "Kusal (EN-US, male, narration)", "quality": "medium", "lang": "en_US", "gender": "m", "hf_path": "en/en_US/kusal/medium/en_US-kusal-medium"},
     {"id": "joe",        "name": "Joe (EN-US, male, casual)",      "quality": "medium", "lang": "en_US", "gender": "m", "hf_path": "en/en_US/joe/medium/en_US-joe-medium"},
     {"id": "danny",      "name": "Danny (EN-US, male, low-pitch)", "quality": "medium", "lang": "en_US", "gender": "m", "hf_path": "en/en_US/danny/low/en_US-danny-low"},
-    {"id": "ryan",       "name": "Ryan (EN-GB, male, narration)",  "quality": "medium", "lang": "en_GB", "gender": "m", "hf_path": "en/en_GB/ryan/medium/en_GB-ryan-medium"},
+    {"id": "ryan",       "name": "Ryan (EN-US, male, narration)",  "quality": "medium", "lang": "en_US", "gender": "m", "hf_path": "en/en_US/ryan/medium/en_US-ryan-medium"},
     {"id": "alba",       "name": "Alba (EN-GB, female, soft)",     "quality": "medium", "lang": "en_GB", "gender": "f", "hf_path": "en/en_GB/alba/medium/en_GB-alba-medium"},
-    {"id": "jenny_dioco","name": "Jenny (EN-US, female, narration)","quality": "medium","lang": "en_US", "gender": "f", "hf_path": "en/en_US/jenny_dioco/medium/en_US-jenny_dioco-medium"},
+    {"id": "jenny_dioco","name": "Jenny (EN-GB, female, narration)","quality": "medium","lang": "en_GB", "gender": "f", "hf_path": "en/en_GB/jenny_dioco/medium/en_GB-jenny_dioco-medium"},
 ]
 
 _PIPER_VOICE_INDEX = {v["id"]: v for v in _PIPER_VOICES}
