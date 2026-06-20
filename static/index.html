@@ -2368,6 +2368,7 @@ Close-up of @Mira fixing a circuit board, sparks reflecting on her goggles
           <span style="font-size:11px; color:var(--muted); margin-right:4px">Provider:</span>
           <button class="prov-btn" id="imgProvDerouter" onclick="switchImageProvider('derouter')" style="font-size:11px; padding:4px 12px; border:1px solid var(--line); border-radius:6px; cursor:pointer; background:none; color:var(--ink)">derouter / OpenAI</button>
           <button class="prov-btn" id="imgProv9router" onclick="switchImageProvider('9router')" style="font-size:11px; padding:4px 12px; border:1px solid var(--line); border-radius:6px; cursor:pointer; background:none; color:var(--ink)">9Router</button>
+          <button class="prov-btn" id="imgProvPollinations" onclick="switchImageProvider('pollinations')" style="font-size:11px; padding:4px 12px; border:1px solid var(--line); border-radius:6px; cursor:pointer; background:none; color:var(--teal,#3fdc8c)">🆓 Pollinations</button>
         </div>
 
         <!-- derouter / OpenAI image section -->
@@ -2427,6 +2428,41 @@ Close-up of @Mira fixing a circuit board, sparks reflecting on her goggles
           <div class="fld" style="display:flex; gap:10px; flex-wrap:wrap">
             <button class="btn sm" onclick="connect9routerImage()">🎨 Connect 9Router images</button>
             <button class="btn outline sm" id="disconnect9routerImgBtn" onclick="disconnect9routerImage()" style="display:none">Disconnect</button>
+          </div>
+        </div>
+
+        <!-- Pollinations image section (100% free, no API key) -->
+        <div id="imgPollinationsSection" style="display:none">
+          <div id="imgPollinationsStatus" class="pill" style="margin-top:8px; width:max-content"><span class="dot ok"></span><span>free · no key required</span></div>
+          <p class="sub" style="font-size:11px; color:var(--muted); margin:6px 0 8px">
+            <strong style="color:var(--teal,#3fdc8c)">100% free</strong>, runs against the public
+            <a href="https://image.pollinations.ai" target="_blank" rel="noopener" style="color:var(--amber-soft)">image.pollinations.ai</a>
+            endpoint. No API key, no signup, no rate-limit-at-our-volume.
+            <br><span style="color:var(--red)">Caveat:</span> Pollinations does <em>not</em> accept multi-image refs — character sheets and style-anchored frames fall back to prompt-only generation. Use derouter for full continuity features.
+          </p>
+          <div class="fld"><label class="label">Model</label>
+            <select id="setPollinationsModel">
+              <option value="flux">FLUX (default — fast + good quality)</option>
+              <option value="flux-schnell">FLUX Schnell (4-step, fastest)</option>
+              <option value="turbo">SDXL Turbo (real-time, looser prompt)</option>
+              <option value="sd-xl">Stable Diffusion XL</option>
+              <option value="dall-e-3">DALL·E 3 (best prompt adherence)</option>
+              <option value="kd-midjourney">KD-Midjourney (stylised)</option>
+              <option value="sana">Sana (compact)</option>
+            </select>
+          </div>
+          <div class="fld">
+            <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer">
+              <input type="checkbox" id="setPollinationsEnhance" />
+              ✨ Enhance prompt (let Pollinations rewrite it for better results)
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer">
+              <input type="checkbox" id="setPollinationsPrivate" />
+              🔒 Private (don't show on the public feed)
+            </label>
+          </div>
+          <div class="fld" style="display:flex; gap:10px; flex-wrap:wrap">
+            <button class="btn sm" onclick="connectPollinationsImage()">🎨 Use Pollinations (free)</button>
           </div>
         </div>
       </div>
@@ -3287,6 +3323,7 @@ async function load(){
 }
 function hasImageKey(){
   if(!CFG) return false;
+  if(CFG.image_provider==="pollinations") return true;   // no key required
   if(CFG.image_provider==="9router") return !!CFG.has_ninerouter_key;
   return !!CFG.has_api_key;
 }
@@ -3378,26 +3415,33 @@ async function switchImageProvider(p){
   }catch(e){ toast(e.message,"err"); }
   renderImageProviderUI();
   refreshProviderUI();
-  const labels={derouter:"derouter / OpenAI","9router":"9Router (local)"};
+  const labels={derouter:"derouter / OpenAI","9router":"9Router (local)","pollinations":"Pollinations (free, no key)"};
   toast("Image provider → "+(labels[p]||p),"ok");
 }
 function renderImageProviderUI(){
   const p=CFG.image_provider||"derouter";
-  const btnMap={derouter:"imgProvDerouter","9router":"imgProv9router"};
+  const btnMap={derouter:"imgProvDerouter","9router":"imgProv9router","pollinations":"imgProvPollinations"};
   Object.keys(btnMap).forEach(k=>{
     const b=$("#"+btnMap[k]); if(!b) return;
     const on=p===k;
-    b.style.background=on?"rgba(255,122,24,.18)":"none";
-    b.style.color=on?"var(--amber-soft)":"var(--ink)";
-    b.style.boxShadow=on?"inset 0 -2px 0 var(--amber-soft)":"none";
+    b.style.background=on?(k==="pollinations"?"rgba(63,220,140,.18)":"rgba(255,122,24,.18)"):"none";
+    b.style.color=on?(k==="pollinations"?"var(--teal,#3fdc8c)":"var(--amber-soft)"):(k==="pollinations"?"var(--teal,#3fdc8c)":"var(--ink)");
+    b.style.boxShadow=on?(k==="pollations"?"inset 0 -2px 0 var(--teal,#3fdc8c)":"inset 0 -2px 0 var(--amber-soft)"):"none";
   });
-  const ds=$("#imgDerouterSection"), ns=$("#img9routerSection");
+  const ds=$("#imgDerouterSection"), ns=$("#img9routerSection"), ps=$("#imgPollinationsSection");
   if(ds) ds.style.display=p==="derouter"?"block":"none";
   if(ns) ns.style.display=p==="9router"?"block":"none";
+  if(ps) ps.style.display=p==="pollinations"?"block":"none";
   if(p==="9router"){
     if($("#set9rImgBase") && !$("#set9rImgBase").value) $("#set9rImgBase").value=CFG.ninerouter_image_base_url||"http://localhost:20128/v1";
     if($("#set9rImgModel") && !$("#set9rImgModel").value) $("#set9rImgModel").value=CFG.ninerouter_image_model||"gpt-image-2";
     if(CFG.has_ninerouter_key){ const db=$("#disconnect9routerImgBtn"); if(db) db.style.display="inline-flex"; }
+  }
+  if(p==="pollinations"){
+    // Restore form fields from CFG so switching back doesn't lose settings.
+    if($("#setPollinationsModel") && CFG.pollinations_model) $("#setPollinationsModel").value = CFG.pollinations_model;
+    if($("#setPollinationsEnhance")) $("#setPollinationsEnhance").checked = !!CFG.pollinations_enhance;
+    if($("#setPollinationsPrivate"))  $("#setPollinationsPrivate").checked  = !!CFG.pollinations_private;
   }
 }
 async function refresh9routerImageModels(){
@@ -3420,6 +3464,28 @@ async function refresh9routerImageModels(){
       toast("No image models listed — try gpt-image-2 and Connect to verify","");
     }
   }catch(e){ if(hint) hint.textContent=e.message; toast(e.message,"err"); }
+}
+async function connectPollinationsImage(){
+  // Pollinations needs no key — just persist the chosen model + flags
+  // and flip the active provider to "pollinations".
+  const body = {
+    image_provider: "pollinations",
+    pollinations_model: ($("#setPollinationsModel").value || "flux"),
+    pollinations_enhance: !!$("#setPollinationsEnhance") && $("#setPollinationsEnhance").checked,
+    pollinations_private:  !!$("#setPollinationsPrivate")  && $("#setPollinationsPrivate").checked,
+    pollinations_nologo: true,
+  };
+  try{
+    const d = await api("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    CFG.image_provider = d.image_provider || "pollinations";
+    CFG.pollinations_model = body.pollinations_model;
+    CFG.pollinations_enhance = body.pollinations_enhance;
+    CFG.pollinations_private  = body.pollinations_private;
+    CFG.pollinations_nologo = true;
+    renderImageProviderUI();
+    refreshProviderUI();
+    toast("Pollinations ready — free image gen ✓","ok"); confettiBurst();
+  }catch(e){ toast(e.message,"err"); }
 }
 async function connect9routerImage(){
   const key=$("#set9rImgKey").value.trim();
@@ -5487,6 +5553,10 @@ async function saveSettings(){
     const d=await api("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
     CFG.base_url=body.base_url; CFG.model=body.model; CFG.multi_image_edit=body.multi_image_edit; CFG.has_api_key=d.has_api_key;
     if(d.image_provider) CFG.image_provider=d.image_provider;
+    if(d.pollinations_model) CFG.pollinations_model=d.pollinations_model;
+    if(d.pollinations_enhance!==undefined) CFG.pollinations_enhance=d.pollinations_enhance;
+    if(d.pollinations_private !==undefined) CFG.pollinations_private =d.pollinations_private;
+    if(d.pollinations_nologo  !==undefined) CFG.pollinations_nologo  =d.pollinations_nologo;
     CFG.claude_base_url=body.claude_base_url; CFG.claude_model=body.claude_model; CFG.has_claude_key=d.has_claude_key;
     if(d.has_anthropic_key!==undefined) CFG.has_anthropic_key=d.has_anthropic_key;
     if(d.claude_provider) CFG.claude_provider=d.claude_provider;

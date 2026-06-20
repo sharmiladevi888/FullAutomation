@@ -308,9 +308,13 @@ def _resolve_claude(s: dict, model: str = None):
             model or s.get("claude_model"))
 
 def _has_image_key(request: Request) -> bool:
+    """True if the active image_provider is configured. Pollinations has
+    no key — always 'configured' (it's free and public)."""
     s = request.state.settings
     if s.get("image_provider") == "9router":
         return bool(s.get("ninerouter_api_key"))
+    if s.get("image_provider") == "pollinations":
+        return True   # no key required — public endpoint
     return bool(s.get("api_key"))
 
 
@@ -322,18 +326,41 @@ def _resolve_image(s: dict):
       - '9router'            — route image gen through a local 9Router instance's
                                OpenAI-compatible endpoint, reusing the shared
                                9Router API key.
+      - 'pollinations'       — 100% free, no API key, public pollinations.ai
+                               endpoint. Models: flux / flux-schnell / turbo /
+                               sd-xl / dall-e-3 / kd-midjourney / sana.
     """
     if s.get("image_provider") == "9router":
         return (s.get("ninerouter_api_key", ""),
                 (s.get("ninerouter_image_base_url") or config.NINEROUTER_IMAGE_BASE_URL),
                 s.get("ninerouter_image_model") or config.NINEROUTER_IMAGE_MODEL)
+    if s.get("image_provider") == "pollinations":
+        # No api_key. The model id is the short id from the Pollinations
+        # catalog (flux / flux-schnell / ...). The client translates it
+        # into the right ?model= value at request time.
+        from pollinations import DEFAULT_BASE_URL
+        return ("",
+                s.get("pollinations_base_url") or DEFAULT_BASE_URL,
+                s.get("pollinations_model") or "flux")
     return (s.get("api_key", ""),
             s.get("base_url", config.BASE_URL),
             s.get("model", config.MODEL))
 
 
 def get_image_client(request: Request):
+    """Return the right ImageClient for the active image_provider.
+    Pollinations gets its own client class (no key, different API shape);
+    derouter/9router/direct share ``derouter.ImageClient``."""
     api_key, base_url, model = _resolve_image(request.state.settings)
+    if request.state.settings.get("image_provider") == "pollinations":
+        from pollinations import PollinationsImageClient
+        return PollinationsImageClient(
+            base_url=base_url,
+            model=model,
+            enhance=bool(request.state.settings.get("pollinations_enhance", False)),
+            private=bool(request.state.settings.get("pollinations_private", False)),
+            nologo=bool(request.state.settings.get("pollinations_nologo", True)),
+        )
     return ImageClient(api_key=api_key, base_url=base_url, model=model)
 
 def get_claude_client(request: Request = None) -> ClaudeClient:
@@ -390,6 +417,19 @@ def _has_voice_key(s) -> bool:
     if provider == "piper":
         return True   # no key required — local model
     return bool(s.get("elevenlabs_api_key"))
+
+
+def _pollinations_model_catalog():
+    """Return the bundled Pollinations model list (id + display name) so the
+    Settings panel can render a dropdown. Lazy-import so the import chain
+    doesn't fail when the user hasn't installed the deps yet (none
+    actually required — just stdlib + requests)."""
+    try:
+        from pollinations import POLLINATIONS_MODELS
+        return [{"id": m["id"], "name": m["name"], "model": m["model"]}
+                for m in POLLINATIONS_MODELS]
+    except Exception:
+        return []
 
 
 def _piper_voices_list():
@@ -465,6 +505,11 @@ def api_state(request: Request):
             "vault_encrypted": vault_crypto.is_encrypted(),
             "google_configured": bool(config.GOOGLE_CLIENT_ID),
             "image_provider": s.get("image_provider", "derouter"),
+            "pollinations_model": s.get("pollinations_model", "flux"),
+            "pollinations_enhance": bool(s.get("pollinations_enhance", False)),
+            "pollinations_private": bool(s.get("pollinations_private", False)),
+            "pollinations_nologo": bool(s.get("pollinations_nologo", True)),
+            "pollinations_models": _pollinations_model_catalog(),
             "has_anthropic_key": bool(s.get("anthropic_api_key")),
             "claude_provider": s.get("claude_provider", "derouter"),
             "has_gemini_key": bool(s.get("gemini_api_key")),
@@ -563,6 +608,11 @@ class SettingsIn(BaseModel):
     piper_length_scale: Optional[float] = None
     piper_noise_scale: Optional[float] = None
     piper_noise_w_scale: Optional[float] = None
+    pollinations_model: Optional[str] = None
+    pollinations_enhance: Optional[bool] = None
+    pollinations_private: Optional[bool] = None
+    pollinations_nologo: Optional[bool] = None
+    pollinations_base_url: Optional[str] = None
     webhook_url: Optional[str] = None
     image_provider: Optional[str] = None
     anthropic_api_key: Optional[str] = None
@@ -622,6 +672,11 @@ def api_settings(s: SettingsIn, request: Request):
     if s.gemini_api_key is not None: user_settings["gemini_api_key"] = s.gemini_api_key.strip()
     if s.gemini_model: user_settings["gemini_model"] = s.gemini_model.strip()
     if s.gemini_base_url: user_settings["gemini_base_url"] = s.gemini_base_url.strip().rstrip("/")
+    if s.pollinations_model: user_settings["pollinations_model"] = s.pollinations_model.strip()
+    if s.pollinations_enhance is not None: user_settings["pollinations_enhance"] = bool(s.pollinations_enhance)
+    if s.pollinations_private is not None: user_settings["pollinations_private"] = bool(s.pollinations_private)
+    if s.pollinations_nologo is not None: user_settings["pollinations_nologo"] = bool(s.pollinations_nologo)
+    if s.pollinations_base_url: user_settings["pollinations_base_url"] = s.pollinations_base_url.strip().rstrip("/")
 
     vault[email] = user_settings
     save_vault(vault)
@@ -629,6 +684,13 @@ def api_settings(s: SettingsIn, request: Request):
     return {
         "ok": True,
         "has_api_key": bool(user_settings.get("api_key")),
+        "has_image_key": (
+            True
+            if user_settings.get("image_provider") == "pollinations"
+            else bool(user_settings.get("ninerouter_api_key"))
+            if user_settings.get("image_provider") == "9router"
+            else bool(user_settings.get("api_key"))
+        ),
         "has_claude_key": bool(user_settings.get("claude_api_key") or user_settings.get("anthropic_api_key") or user_settings.get("agentrouter_api_key")),
         "has_elevenlabs_key": bool(user_settings.get("elevenlabs_api_key")),
         "voice_provider": user_settings.get("voice_provider", "elevenlabs"),
