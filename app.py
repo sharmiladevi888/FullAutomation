@@ -1241,7 +1241,7 @@ class GenerateIn(BaseModel):
 
 def _render_one(g_prompt, size, quality, continue_prev, style_lock,
                 character_ids=None, request: Request = None,
-                shot_relation="cut"):
+                shot_relation="cut", scene_vo=None):
     """Shared engine for /api/generate and /api/generate-batch.
 
     shot_relation: "continue" = micro-cut of the SAME moment as the previous
@@ -1378,6 +1378,11 @@ def _render_one(g_prompt, size, quality, continue_prev, style_lock,
             "characters": [c["name"] for c in matched],
             "refs": ref_meta,
             "continued_from": prev["id"] if prev else None,
+            # Carry the EXACT narration line this frame was rendered for. A/V sync
+            # reads VO from the frame itself, so a failed/missing frame can never
+            # shift the VO-to-frame mapping (positional mapping desyncs when a
+            # render is dropped mid-run — e.g. on a transient image-API 502).
+            "vo": (scene_vo or "").strip(),
             "created": store.now(),
         }
         fresh["sequence"].append(rec)
@@ -1550,6 +1555,8 @@ def _render_one_for_queue(g_prompt, params, settings, project_id):
             "characters": [c["name"] for c in matched],
             "refs": ref_meta,
             "continued_from": prev["id"] if prev else None,
+            # Per-frame VO so A/V sync survives dropped frames (see _render_one).
+            "vo": (params.get("scene_vo") or "").strip(),
             "created": store.now(),
         }
         st["sequence"].append(rec)
@@ -4062,9 +4069,22 @@ def _build_flow_video(st, request, *, voice_id, text, transition="cut",
     # 1. ONE continuous narration track — synthesized from per-scene VO lines
     #    joined with double-newlines so that character timestamps map directly
     #    to scene boundaries.  trim_silence removes dead air.
-    lines = _scene_vo_lines(st)
+    #
+    #    Prefer the VO stored ON each rendered frame (rec["vo"]) over the script's
+    #    positional scene list. If some frames failed to render (e.g. a transient
+    #    image-API 502), the surviving sequence is shorter than the script, and a
+    #    positional script->frame mapping would shift every line after the gap —
+    #    desyncing narration from picture. Reading VO from the frame itself keeps
+    #    each image paired with the exact words it was generated for.
     n = len(seq)
-    tts_lines = [lines[i].strip() if i < len(lines) else "" for i in range(n)]
+    frame_vos = [(seq[i].get("vo") or "").strip() for i in range(n)]
+    if any(frame_vos):
+        tts_lines = frame_vos
+        lines = frame_vos
+    else:
+        # Older sequences (pre-vo-on-frame) fall back to the positional script.
+        lines = _scene_vo_lines(st)
+        tts_lines = [lines[i].strip() if i < len(lines) else "" for i in range(n)]
     tts_text = "\n\n".join(l for l in tts_lines if l) or text
 
     vc = get_voice_client(request, voice_id)
@@ -6836,7 +6856,9 @@ def api_autopilot(body: AutopilotIn, request: Request):
         try:
             rec = _render_one(p, size, quality, True, True,
                               character_ids=_scene_ids, request=request,
-                              shot_relation=sc.get("shot_relation", "cut"))
+                              shot_relation=sc.get("shot_relation", "cut"),
+                              scene_vo=(sc.get("vo") or sc.get("narration")
+                                        or sc.get("voice_over") or ""))
             frames_ok += 1
             _ap_prog(run_id, frames_done=frames_ok + frames_fail,
                      frames_failed=frames_fail,
