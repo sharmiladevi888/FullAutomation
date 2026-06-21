@@ -131,8 +131,40 @@ def _is_flat_style(*texts):
     return any(h in blob for h in _FLAT_STYLE_HINTS)
 
 
+def ref_manifest(ref_meta):
+    """When references are sent as SEPARATE images (multi_image_edit=True) the
+    per-image captions that the contact-sheet would burn in are not visible to
+    the model. Describe the attachments in order as a text manifest so the model
+    still knows which image is the style swatch vs a character vs the previous
+    frame — preserving 'copy style not composition' + identity guidance."""
+    if not ref_meta:
+        return ""
+    lines = []
+    for i, m in enumerate(ref_meta, 1):
+        t = m.get("type")
+        if t == "style":
+            lines.append(f"  Image {i}: STYLE REF (source-video frame) — copy "
+                         "its ART STYLE only (palette, line work, shading, "
+                         "texture, proportions). Do NOT copy its composition, "
+                         "camera, poses or background.")
+        elif t == "character":
+            nm = (m.get("name") or "").strip()
+            lines.append(f"  Image {i}: CHARACTER SHEET for {nm} — match this "
+                         "person's face, hair, build and outfit exactly. "
+                         "Identity reference ONLY, not a composition.")
+        elif t == "previous":
+            lines.append(f"  Image {i}: PREVIOUS FRAME — continuity of the SAME "
+                         "moment; keep setting/wardrobe/lighting, change only "
+                         "the camera angle as the prompt says.")
+    if not lines:
+        return ""
+    return ("ATTACHED REFERENCE IMAGES (in order) — read each for its stated "
+            "purpose ONLY:\n" + "\n".join(lines))
+
+
 def build_full_prompt(master_prompt, shot_prompt, matched, has_previous,
-                      style_locked, style_notes="", micro_cut=False):
+                      style_locked, style_notes="", micro_cut=False,
+                      ref_meta=None):
     parts = [_MASTER_HINT]
     _flat = _is_flat_style(style_notes, master_prompt)
 
@@ -187,10 +219,14 @@ def build_full_prompt(master_prompt, shot_prompt, matched, has_previous,
         parts.append(
             "STYLE ANCHORS: the FIRST attached reference images are frames taken "
             "straight from the source video (in a labelled grid they are marked "
-            "\"STYLE REF\"). They define the EXACT rendering technique, line work, "
-            "colour palette, shading, lighting, texture and proportions to "
-            "reproduce. Copy that look faithfully — do NOT drift toward a generic "
-            "or more detailed/realistic style. Any character-sheet image defines "
+            "\"STYLE REF\"). Use them for ART STYLE ONLY — the EXACT rendering "
+            "technique, line work, colour palette, shading, lighting, texture and "
+            "proportions. CRITICAL: do NOT copy their composition, camera angle, "
+            "subject placement, poses or background. They are a style swatch, NOT "
+            "a layout to reproduce. This new frame must have its OWN distinct "
+            "composition driven by the prompt below — never re-stage what a STYLE "
+            "REF shows. Copy the LOOK, invent the SHOT. Do not drift toward a "
+            "generic or more realistic style. Any character-sheet image defines "
             "character identity ONLY. If the reference look and your defaults "
             "disagree, the source video frames win."
         )
@@ -202,6 +238,13 @@ def build_full_prompt(master_prompt, shot_prompt, matched, has_previous,
     if (style_notes or "").strip() and not raw_shot.lower().startswith(
             style_notes.strip()[:20].lower()):
         raw_shot = style_notes.strip().rstrip(".") + ". " + raw_shot
+
+    # When refs are fed as SEPARATE images, the contact-sheet captions don't
+    # exist — describe each attachment in order so the model still knows which
+    # image is style vs character vs previous frame.
+    _manifest = ref_manifest(ref_meta)
+    if _manifest:
+        parts.append(_manifest)
 
     parts.append("NEW FRAME TO RENDER:\n" + raw_shot)
     return "\n\n".join(parts)
@@ -236,9 +279,75 @@ def build_sheet_prompt(master_prompt, name, description, style_notes=""):
 
 
 # --------------------------------------------------------------------------- #
+#  Aspect-ratio enforcement
+# --------------------------------------------------------------------------- #
+def parse_size(size):
+    """'1536x1024' -> (1536, 1024). Returns None for 'auto'/blank/garbage."""
+    if not size or str(size).lower() in ("auto", ""):
+        return None
+    try:
+        w, h = str(size).lower().split("x")
+        w, h = int(w), int(h)
+        if w > 0 and h > 0:
+            return (w, h)
+    except Exception:
+        pass
+    return None
+
+
+def enforce_aspect(image_bytes, size, tol=0.04):
+    """Guarantee the returned image matches the requested aspect ratio.
+
+    gpt-image's /images/edits endpoint frequently ignores the `size` param and
+    anchors the output to the *reference* image's aspect (so a portrait-shaped
+    contact-sheet of refs yields a 9:16 frame even when 1536x1024 was asked).
+    This is the root cause of "I selected 16:9 but got 9:16".
+
+    We fix it deterministically, provider-agnostic: if the produced image's
+    aspect is off by more than ``tol``, CENTER-CROP it to the target aspect
+    (never stretch — that would distort faces), then resize to exactly the
+    requested pixels. If it's already correct, only resize to exact dims.
+    """
+    target = parse_size(size)
+    if target is None:
+        return image_bytes
+    tw, th = target
+    target_ar = tw / th
+    try:
+        im = Image.open(BytesIO(image_bytes)).convert("RGB")
+    except Exception:
+        return image_bytes
+    w, h = im.size
+    if w <= 0 or h <= 0:
+        return image_bytes
+    cur_ar = w / h
+    # Only crop when the aspect is genuinely wrong (e.g. landscape asked,
+    # portrait returned). A small rounding mismatch is left to the final resize.
+    if abs(cur_ar - target_ar) / target_ar > tol:
+        if cur_ar > target_ar:
+            # too wide -> crop left/right
+            new_w = int(round(h * target_ar))
+            x0 = (w - new_w) // 2
+            im = im.crop((x0, 0, x0 + new_w, h))
+        else:
+            # too tall (the 9:16 bug) -> crop top/bottom
+            new_h = int(round(w / target_ar))
+            y0 = (h - new_h) // 2
+            im = im.crop((0, y0, w, y0 + new_h))
+    # Resize to the exact requested pixel dims so downstream video assembly
+    # gets a uniform frame size (mixed sizes break ffmpeg concat / scaling).
+    if im.size != (tw, th):
+        im = im.resize((tw, th), Image.LANCZOS)
+    out = BytesIO()
+    im.save(out, format="PNG")
+    return out.getvalue()
+
+
+# --------------------------------------------------------------------------- #
 #  Contact sheet fallback
 # --------------------------------------------------------------------------- #
-def contact_sheet(images, labels=None, max_cols=2, cell=896, bg=(17, 17, 19)):
+def contact_sheet(images, labels=None, max_cols=2, cell=896, bg=(17, 17, 19),
+                  target_size=None):
     """Composite reference images into one grid. When ``labels`` is given, each
     cell gets a readable caption (e.g. "STYLE REF", "CHAR: Maya", "PREV FRAME")
     so the image model can tell the style anchor from a character sheet from the
@@ -319,6 +428,7 @@ def contact_sheet(images, labels=None, max_cols=2, cell=896, bg=(17, 17, 19)):
             r, c = divmod(j, ocols)
             _paste(canvas, draw, imgs[oi], c * small, big_h + r * small, small,
                    labels[oi] if oi < len(labels) else "", sm_lbl)
+        canvas = _fit_canvas_to_aspect(canvas, target_size, bg)
         out = BytesIO()
         canvas.save(out, format="PNG")
         return out.getvalue()
@@ -333,9 +443,38 @@ def contact_sheet(images, labels=None, max_cols=2, cell=896, bg=(17, 17, 19)):
         r, c = divmod(idx, cols)
         _paste(canvas, draw, im, c * cell, r * cell, cell,
                labels[idx] if idx < len(labels) else "", lbl_px)
+    canvas = _fit_canvas_to_aspect(canvas, target_size, bg)
     out = BytesIO()
     canvas.save(out, format="PNG")
     return out.getvalue()
+
+
+def _fit_canvas_to_aspect(canvas, target_size, bg):
+    """Letterbox/pillarbox the ref grid onto a canvas with the TARGET aspect.
+
+    The edit model anchors its output aspect to the input image. If we hand it a
+    portrait-shaped grid while the user asked for 16:9, we get a portrait frame.
+    Padding the grid into a target-aspect canvas biases the model toward the
+    right orientation (enforce_aspect() is still the hard guarantee downstream).
+    """
+    target = parse_size(target_size)
+    if target is None:
+        return canvas
+    tw, th = target
+    target_ar = tw / th
+    w, h = canvas.size
+    cur_ar = w / h
+    if abs(cur_ar - target_ar) / target_ar <= 0.02:
+        return canvas
+    if cur_ar < target_ar:
+        new_w = int(round(h * target_ar))
+        out = Image.new("RGB", (new_w, h), bg)
+        out.paste(canvas, ((new_w - w) // 2, 0))
+    else:
+        new_h = int(round(w / target_ar))
+        out = Image.new("RGB", (w, new_h), bg)
+        out.paste(canvas, (0, (new_h - h) // 2))
+    return out
 
 
 # Bounded LRU cache of vision-downsized bytes keyed by (sha1(source), max_side,

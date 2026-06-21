@@ -201,6 +201,13 @@ SUPPORTED_SIZES = [
 ]
 SUPPORTED_QUALITIES = ["low", "medium", "high", "auto"]
 
+# How many source-video style frames to feed as art-style anchors. Character
+# sheets and scene frames both pull up to this many "STYLE REF" images from the
+# pinned style_frames. 4-5 gives the model a fuller read of the source look
+# (palette, line weight, lighting variation) without overcrowding the contact
+# sheet. Raise via STYLE_REF_COUNT in .env.
+STYLE_REF_COUNT = int(_get("STYLE_REF_COUNT", "5"))
+
 AUTH_REQUIRED = _get("AUTH_REQUIRED", "false").lower() in ("1", "true", "yes")
 SESSION_SECRET = _get("SESSION_SECRET", "continuity-studio-default-session-key")
 

@@ -928,7 +928,8 @@ def api_create_character(c: CharacterIn, request: Request):
         raise HTTPException(400, "name is required")
     st = store.load_state()
     client = get_image_client(request)
-    prompt = pipeline.build_sheet_prompt(st["master_prompt"], c.name, c.description)
+    prompt = pipeline.build_sheet_prompt(st["master_prompt"], c.name, c.description,
+                                         style_notes=st.get("style_notes", ""))
     try:
         img = client.generate(
             prompt,
@@ -974,25 +975,34 @@ def api_create_characters_batch(b: CharacterBatchIn, request: Request):
             # If YT/style frames are pinned, use them as STYLE refs for the sheet
             # so generated characters match the analysed source look.
             _style_refs, _labels = [], []
-            for _sf in (st.get("style_frames") or [])[:3]:
+            for _sf in (st.get("style_frames") or [])[:config.STYLE_REF_COUNT]:
                 try:
                     _style_refs.append(store.read_image(_sf["url"]))
-                    _labels.append("STYLE REF — match this art style")
+                    _labels.append("STYLE REF — match art style ONLY")
                 except Exception:
                     pass
             if _style_refs:
+                _multi = bool(request and request.state.settings.get("multi_image_edit"))
+                _sheet_size = b.size or config.DEFAULT_SIZE
                 _edit_prompt = (prompt + "\n\nUse the attached image(s) ONLY as "
                                 "art-style references from the source video. "
                                 "Copy their line work, palette, texture, face/body "
                                 "simplicity and proportions; draw THIS named "
-                                "character, not the people in the references.")
-                _multi = bool(request and request.state.settings.get("multi_image_edit"))
+                                "character, not the people, poses or scenes in the "
+                                "references.")
+                if _multi and len(_style_refs) > 1:
+                    _edit_prompt += ("\n\nATTACHED REFERENCE IMAGES (in order) — "
+                                     "every one is a STYLE REF (source-video frame). "
+                                     "Use them ONLY for art style; ignore their "
+                                     "content, composition and characters.")
                 _send = (_style_refs if _multi else
-                         ([pipeline.contact_sheet(_style_refs, labels=_labels)]
+                         ([pipeline.contact_sheet(_style_refs, labels=_labels,
+                                                  target_size=_sheet_size)]
                           if len(_style_refs) > 1 else _style_refs))
                 img = client.edit(_edit_prompt, _send,
-                                  size=b.size or config.DEFAULT_SIZE,
-                                  quality=b.quality or config.DEFAULT_QUALITY)
+                                  size=_sheet_size,
+                                  quality=b.quality or config.DEFAULT_QUALITY,
+                                  multi_image_edit=_multi)
             else:
                 img = client.generate(
                     prompt,
@@ -1262,7 +1272,7 @@ def _render_one(g_prompt, size, quality, continue_prev, style_lock,
     # Style frames lead so they get the most prominent position in the contact
     # sheet (top-left, highest visual weight) and are seen first in multi-image mode.
     refs, ref_meta = [], []
-    for sf in style_frames[:4]:
+    for sf in style_frames[:config.STYLE_REF_COUNT]:
         try:
             refs.append(store.read_image(sf["url"]))
             ref_meta.append({"type": "style"})
@@ -1288,10 +1298,16 @@ def _render_one(g_prompt, size, quality, continue_prev, style_lock,
         except Exception:
             micro_cut = False
 
+    # Decide ref delivery mode up front: separate images vs one contact sheet.
+    _multi = (request.state.settings["multi_image_edit"]
+              if request else config.MULTI_IMAGE_EDIT)
     full_prompt = pipeline.build_full_prompt(
         st["master_prompt"], g_prompt, matched,
         has_previous=bool(prev), style_locked=bool(style_frames),
         style_notes=style_notes, micro_cut=micro_cut,
+        # In multi-image mode the contact-sheet captions are gone, so describe
+        # each attached image in the prompt instead.
+        ref_meta=(ref_meta if (_multi and len(refs) > 1) else None),
     )
 
     if refs:
@@ -1300,7 +1316,7 @@ def _render_one(g_prompt, size, quality, continue_prev, style_lock,
         def _ref_label(m):
             t = m.get("type")
             if t == "style":
-                return "STYLE REF — COPY THIS LOOK"
+                return "STYLE REF — COPY ART STYLE, NOT COMPOSITION"
             if t == "character":
                 return f"CHAR: {(m.get('name') or '').strip()}"[:22]
             if t == "previous":
@@ -1310,17 +1326,18 @@ def _render_one(g_prompt, size, quality, continue_prev, style_lock,
         # If the proxy isn't confirmed to support repeated `image[]` fields,
         # composite multiple refs into a single LABELED contact-sheet PNG so we
         # hit the documented one-`image`-field path without blending the refs.
-        multi_image_edit = (request.state.settings["multi_image_edit"]
-                            if request else config.MULTI_IMAGE_EDIT)
+        multi_image_edit = _multi
         if not multi_image_edit and len(refs) > 1:
-            send = [pipeline.contact_sheet(refs, labels=ref_labels)]
+            send = [pipeline.contact_sheet(refs, labels=ref_labels,
+                                           target_size=size)]
             mode_note = f"edit (labeled contact-sheet of {len(refs)} refs)"
         else:
             send = refs
             mode_note = f"edit ({len(refs)} refs)"
         print(f"[render] {mode_note} prompt_len={len(full_prompt)}", flush=True)
         try:
-            img = client.edit(full_prompt, send, size=size, quality=quality)
+            img = client.edit(full_prompt, send, size=size, quality=quality,
+                              multi_image_edit=multi_image_edit)
         except Exception as edit_err:
             # Multi-image `image[]` mode isn't supported by every proxy. If we
             # sent more than one ref and it failed, fall back to compositing all
@@ -1330,8 +1347,10 @@ def _render_one(g_prompt, size, quality, continue_prev, style_lock,
                 print(f"[render] multi-ref edit failed ({edit_err}); "
                       f"retrying as contact-sheet", flush=True)
                 img = client.edit(full_prompt,
-                                  [pipeline.contact_sheet(refs, labels=ref_labels)],
-                                  size=size, quality=quality)
+                                  [pipeline.contact_sheet(refs, labels=ref_labels,
+                                                          target_size=size)],
+                                  size=size, quality=quality,
+                                  multi_image_edit=False)
             else:
                 raise
         mode = "edit"
@@ -1452,7 +1471,7 @@ def _render_one_for_queue(g_prompt, params, settings, project_id):
     # contact sheet (and is seen first in multi-image mode) — this is the look
     # every frame must copy. Then character sheets (identity), then the previous
     # frame (only on a micro-cut).
-    for sf in style_frames[:4]:
+    for sf in style_frames[:config.STYLE_REF_COUNT]:
         try:
             refs.append(store.read_image(sf["url"]))
             ref_meta.append({"type": "style"})
@@ -1475,7 +1494,10 @@ def _render_one_for_queue(g_prompt, params, settings, project_id):
     full_prompt = pipeline.build_full_prompt(
         st["master_prompt"], g_prompt, matched,
         has_previous=bool(prev), style_locked=bool(style_frames),
-        style_notes=_queue_style_notes, micro_cut=micro_cut)
+        style_notes=_queue_style_notes, micro_cut=micro_cut,
+        # Multi-image mode: contact-sheet captions are gone, so name each
+        # attached image in the prompt so the model keeps style/identity roles.
+        ref_meta=(ref_meta if (multi_image_edit and len(refs) > 1) else None))
 
     if refs:
         # Per-ref captions so the model can tell the STYLE anchor from a
@@ -1484,7 +1506,7 @@ def _render_one_for_queue(g_prompt, params, settings, project_id):
         def _ref_label(m):
             t = m.get("type")
             if t == "style":
-                return "STYLE REF — COPY THIS LOOK"
+                return "STYLE REF — COPY ART STYLE, NOT COMPOSITION"
             if t == "character":
                 return f"CHAR: {(m.get('name') or '').strip()}"[:22]
             if t == "previous":
@@ -1492,18 +1514,21 @@ def _render_one_for_queue(g_prompt, params, settings, project_id):
             return ""
         ref_labels = [_ref_label(m) for m in ref_meta]
         if not multi_image_edit and len(refs) > 1:
-            send = [pipeline.contact_sheet(refs, labels=ref_labels)]
+            send = [pipeline.contact_sheet(refs, labels=ref_labels,
+                                           target_size=size)]
         else:
             send = refs
         try:
             img = client.edit(full_prompt, send, size=size, quality=quality,
-                              retry=False)
+                              retry=False, multi_image_edit=multi_image_edit)
         except Exception:
             if len(send) > 1:
                 img = client.edit(
                     full_prompt,
-                    [pipeline.contact_sheet(refs, labels=ref_labels)],
-                    size=size, quality=quality, retry=False)
+                    [pipeline.contact_sheet(refs, labels=ref_labels,
+                                            target_size=size)],
+                    size=size, quality=quality, retry=False,
+                    multi_image_edit=False)
             else:
                 raise
         mode = "edit"
@@ -1686,13 +1711,14 @@ def _shot_image(st, prev, g_prompt, size, quality, request):
             [pipeline.contact_sheet(refs, labels=ref_labels)]
             if len(refs) > 1 else refs)
         try:
-            img = client.edit(full_prompt, send, size=size, quality=quality)
+            img = client.edit(full_prompt, send, size=size, quality=quality,
+                              multi_image_edit=multi)
         except Exception:
             if len(send) > 1:
                 img = client.edit(
                     full_prompt,
                     [pipeline.contact_sheet(refs, labels=ref_labels)],
-                    size=size, quality=quality)
+                    size=size, quality=quality, multi_image_edit=False)
             else:
                 img = client.generate(full_prompt, size=size, quality=quality)
     else:
@@ -6640,24 +6666,31 @@ def api_autopilot(body: AutopilotIn, request: Request):
             # pinned frames (the same ones the scene images use) so characters
             # match the source look — not just the text description.
             _style_refs, _labels = [], []
-            for _sf in (_cur.get("style_frames") or [])[:3]:
+            for _sf in (_cur.get("style_frames") or [])[:config.STYLE_REF_COUNT]:
                 try:
                     _style_refs.append(store.read_image(_sf["url"]))
-                    _labels.append("STYLE REF — match this art style")
+                    _labels.append("STYLE REF — match art style ONLY")
                 except Exception:
                     pass
             if _style_refs:
+                _multi = bool(request and request.state.settings.get("multi_image_edit"))
                 _edit_prompt = (prompt + "\n\nReproduce the EXACT art style of the "
                                 "attached reference frame(s) from the source video — "
                                 "same rendering technique, colour palette, line work, "
                                 "shading, texture and proportions. Draw THIS character "
-                                "in that style; do not copy the people in the "
-                                "reference frames.")
-                _multi = bool(request and request.state.settings.get("multi_image_edit"))
+                                "in that style; do not copy the people, poses or "
+                                "scenes in the reference frames.")
+                if _multi and len(_style_refs) > 1:
+                    _edit_prompt += ("\n\nATTACHED REFERENCE IMAGES (in order) — "
+                                     "every one is a STYLE REF (source-video frame). "
+                                     "Use them ONLY for art style; ignore their "
+                                     "content, composition and characters.")
                 _send = (_style_refs if _multi
-                         else ([pipeline.contact_sheet(_style_refs, labels=_labels)]
+                         else ([pipeline.contact_sheet(_style_refs, labels=_labels,
+                                                       target_size=size)]
                                if len(_style_refs) > 1 else _style_refs))
-                img = img_client.edit(_edit_prompt, _send, size=size, quality=quality)
+                img = img_client.edit(_edit_prompt, _send, size=size, quality=quality,
+                                      multi_image_edit=_multi)
             else:
                 img = img_client.generate(prompt, size=size, quality=quality)
             sheet_url = store.write_image("characters", img)

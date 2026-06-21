@@ -26,6 +26,21 @@ def _log(msg):
     print(f"[derouter] {msg}", file=sys.stderr, flush=True)
 
 
+def _enforce_aspect(image_bytes, size):
+    """Force the produced image to the requested aspect/pixels. Lazy-imports
+    pipeline to avoid a circular import at module load. Never raises — on any
+    failure it returns the original bytes so a render is never lost."""
+    try:
+        import pipeline
+        fixed = pipeline.enforce_aspect(image_bytes, size)
+        if fixed and fixed != image_bytes:
+            _log(f"enforced aspect -> {size}")
+        return fixed
+    except Exception as e:
+        _log(f"aspect-enforce skipped ({type(e).__name__}: {e})")
+        return image_bytes
+
+
 # Base URLs whose images/edits endpoint is known broken (9Router returns 500);
 # edit() renders prompt-only via generate() for these instead of failing.
 _EDITS_UNSUPPORTED = set()
@@ -234,23 +249,32 @@ class ImageClient:
             raise RuntimeError(
                 f"image API returned no b64_json (got: {r.model_dump_json()[:300]})"
             )
-        return base64.b64decode(r.data[0].b64_json)
+        return _enforce_aspect(base64.b64decode(r.data[0].b64_json), size)
 
     def edit(self, prompt, images, size=None, quality=None, mask=None,
-             retry=True, index=0):
+             retry=True, index=0, multi_image_edit=None):
         """Reference image(s) + prompt -> image. See ``generate`` for the retry
         semantics; ``retry=True`` (default) routes through the image_queue
-        throttle (backoff + cooldown + concurrency)."""
+        throttle (backoff + cooldown + concurrency).
+
+        ``multi_image_edit`` overrides ``config.MULTI_IMAGE_EDIT`` for this call
+        only (set True to send refs as repeated `image[]` fields, False to
+        composite into a single contact-sheet). Falls back to the env default."""
+        use_multi = (config.MULTI_IMAGE_EDIT if multi_image_edit is None
+                     else bool(multi_image_edit))
         if not retry:
             return self._edit_once(prompt, images, size=size, quality=quality,
-                                   mask=mask)
+                                   mask=mask, multi_image_edit=use_multi)
         return image_queue.run_with_retry(
             lambda: self._edit_once(prompt, images, size=size, quality=quality,
-                                    mask=mask),
+                                    mask=mask, multi_image_edit=use_multi),
             index=index, model=self.model, label="edit")
 
-    def _edit_once(self, prompt, images, size=None, quality=None, mask=None):
+    def _edit_once(self, prompt, images, size=None, quality=None, mask=None,
+                   multi_image_edit=None):
         """Reference image(s) + prompt -> image. ``images`` is list[bytes].
+        ``multi_image_edit`` (None=use config) toggles repeated `image[]` vs
+        single contact-sheet delivery.
 
         ``mask`` (optional PNG bytes) enables inpainting: transparent areas of
         the mask are the regions the model repaints (OpenAI images/edits spec).
@@ -280,8 +304,10 @@ class ImageClient:
             _log("edits unsupported on this base — generate() fallback (no refs)")
             return self._generate_once(prompt, size, quality)
 
+        use_multi = (config.MULTI_IMAGE_EDIT if multi_image_edit is None
+                     else bool(multi_image_edit))
         files = []
-        if config.MULTI_IMAGE_EDIT and len(images) > 1:
+        if use_multi and len(images) > 1:
             for i, img in enumerate(images):
                 files.append(("image[]", (f"ref_{i}.png", img, "image/png")))
             mode = f"image[]x{len(images)}"
@@ -354,7 +380,7 @@ class ImageClient:
             raise RuntimeError(
                 f"image edit returned no b64_json: {json.dumps(out)[:400]}"
             )
-        return base64.b64decode(out["data"][0]["b64_json"])
+        return _enforce_aspect(base64.b64decode(out["data"][0]["b64_json"]), size)
 
 
 class OpenRouterImageClient:
