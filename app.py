@@ -4185,21 +4185,21 @@ def _build_flow_video(st, request, *, voice_id, text, transition="cut",
                     print(f"[video] Claude smart-edit skipped: {_se}", flush=True)
 
     shots, scene_map = [], []
-    # Duration floor: if the narration came out materially shorter than the
-    # user's requested length (e.g. 300s asked but Claude only wrote ~180s of
-    # speech), gently stretch the per-frame holds so the video runs closer to
-    # the target instead of ending early. Capped at 1.5x so frames never freeze
-    # absurdly; a background music/rumble bed (added below) covers the extra
-    # tail so it isn't dead silence. The real fix is enough narration upstream;
-    # this is a safety net so the output length roughly honours the request.
-    if target_seconds and dur > 0.1 and holds and len(holds) == n:
+    # NOTE: do NOT blindly stretch holds to hit a target duration — the VO audio
+    # is a fixed length, so stretching frames while audio stays put DESYNCS the
+    # narration from the picture (the image runs ahead of the words). A/V sync is
+    # sacred. Holds here are already locked to the narration timing. If the
+    # finished video is shorter than the requested target, that's because the
+    # script's narration is shorter than the target — the correct fix is more
+    # narration (enforced in the script word-count target), not frame-stretching.
+    # We keep target_seconds only for logging the gap so it's visible.
+    if target_seconds and dur > 0.1:
         _tgt = float(target_seconds)
-        if _tgt > dur * 1.10:                      # >10% short of target
-            _factor = min(1.5, _tgt / dur)
-            holds = [round(h * _factor, 3) for h in holds]
-            print(f"[video] duration floor: narration {dur:.1f}s -> "
-                  f"holds x{_factor:.2f} toward {_tgt:.0f}s target "
-                  f"(music bed covers the tail)", flush=True)
+        if _tgt > dur * 1.10:
+            print(f"[video] note: narration is {dur:.1f}s but target was "
+                  f"{_tgt:.0f}s — video length follows the narration to keep "
+                  f"A/V sync. Increase script length / words for a longer video.",
+                  flush=True)
     for i in range(n):
         try:
             img_path = store.url_to_path(seq[i]["image_url"])
