@@ -308,13 +308,15 @@ def _resolve_claude(s: dict, model: str = None):
             model or s.get("claude_model"))
 
 def _has_image_key(request: Request) -> bool:
-    """True if the active image_provider is configured. Pollinations has
-    no key — always 'configured' (it's free and public)."""
+    """True if the active image_provider is configured. Pollinations + local
+    have no key — always 'configured' (they're free)."""
     s = request.state.settings
     if s.get("image_provider") == "9router":
         return bool(s.get("ninerouter_api_key"))
     if s.get("image_provider") == "pollinations":
         return True   # no key required — public endpoint
+    if s.get("image_provider") == "local":
+        return True   # no key required — local model
     return bool(s.get("api_key"))
 
 
@@ -329,6 +331,11 @@ def _resolve_image(s: dict):
       - 'pollinations'       — 100% free, no API key, public pollinations.ai
                                endpoint. Models: flux / flux-schnell / turbo /
                                sd-xl / dall-e-3 / kd-midjourney / sana.
+      - 'local'              — 100% free, runs entirely on this machine via
+                               HuggingFace diffusers. Models: sdxl-turbo
+                               (1-step, fastest, batch-friendly) / sdxl-base
+                               (high quality) / flux-schnell (best quality,
+                               needs ~12 GB VRAM).
     """
     if s.get("image_provider") == "9router":
         return (s.get("ninerouter_api_key", ""),
@@ -342,6 +349,10 @@ def _resolve_image(s: dict):
         return ("",
                 s.get("pollinations_base_url") or DEFAULT_BASE_URL,
                 s.get("pollinations_model") or "flux")
+    if s.get("image_provider") == "local":
+        # Local diffusers — model id is the short name (sdxl-turbo /
+        # sdxl-base / flux-schnell). No base_url / api_key needed.
+        return ("", "", s.get("diffusers_model") or "sdxl-turbo")
     return (s.get("api_key", ""),
             s.get("base_url", config.BASE_URL),
             s.get("model", config.MODEL))
@@ -349,17 +360,25 @@ def _resolve_image(s: dict):
 
 def get_image_client(request: Request):
     """Return the right ImageClient for the active image_provider.
-    Pollinations gets its own client class (no key, different API shape);
+    Pollinations + local get their own client classes (different APIs);
     derouter/9router/direct share ``derouter.ImageClient``."""
-    api_key, base_url, model = _resolve_image(request.state.settings)
-    if request.state.settings.get("image_provider") == "pollinations":
+    s = request.state.settings
+    api_key, base_url, model = _resolve_image(s)
+    if s.get("image_provider") == "pollinations":
         from pollinations import PollinationsImageClient
         return PollinationsImageClient(
             base_url=base_url,
             model=model,
-            enhance=bool(request.state.settings.get("pollinations_enhance", False)),
-            private=bool(request.state.settings.get("pollinations_private", False)),
-            nologo=bool(request.state.settings.get("pollinations_nologo", True)),
+            enhance=bool(s.get("pollinations_enhance", False)),
+            private=bool(s.get("pollinations_private", False)),
+            nologo=bool(s.get("pollinations_nologo", True)),
+        )
+    if s.get("image_provider") == "local":
+        from diffusers import DiffusersImageClient
+        return DiffusersImageClient(
+            model=model,
+            steps=s.get("diffusers_steps"),
+            guidance=s.get("diffusers_guidance"),
         )
     return ImageClient(api_key=api_key, base_url=base_url, model=model)
 
@@ -417,6 +436,29 @@ def _has_voice_key(s) -> bool:
     if provider == "piper":
         return True   # no key required — local model
     return bool(s.get("elevenlabs_api_key"))
+
+
+def _diffusers_model_catalog():
+    """Return the bundled diffusers model list (id + display name + size)
+    so the Settings panel can render a dropdown. Lazy-import so the import
+    chain doesn't fail when the user hasn't installed diffusers yet."""
+    try:
+        from diffusers import DIFFUSERS_MODELS
+        return [{"id": m["id"], "name": m["name"],
+                 "hf_repo": m["hf_repo"],
+                 "approx_size_gb": m.get("approx_size_gb", 0)}
+                for m in DIFFUSERS_MODELS]
+    except Exception:
+        return []
+
+
+def _diffusers_available():
+    """Wrapper for the lazy-import diffusers_available() — handles import errors."""
+    try:
+        from diffusers import diffusers_available as _da
+        return _da()
+    except Exception:
+        return False
 
 
 def _pollinations_model_catalog():
@@ -510,6 +552,9 @@ def api_state(request: Request):
             "pollinations_private": bool(s.get("pollinations_private", False)),
             "pollinations_nologo": bool(s.get("pollinations_nologo", True)),
             "pollinations_models": _pollinations_model_catalog(),
+            "diffusers_model": s.get("diffusers_model", "sdxl-turbo"),
+            "diffusers_models": _diffusers_model_catalog(),
+            "diffusers_available": _diffusers_available(),
             "has_anthropic_key": bool(s.get("anthropic_api_key")),
             "claude_provider": s.get("claude_provider", "derouter"),
             "has_gemini_key": bool(s.get("gemini_api_key")),
@@ -613,6 +658,9 @@ class SettingsIn(BaseModel):
     pollinations_private: Optional[bool] = None
     pollinations_nologo: Optional[bool] = None
     pollinations_base_url: Optional[str] = None
+    diffusers_model: Optional[str] = None
+    diffusers_steps: Optional[int] = None
+    diffusers_guidance: Optional[float] = None
     webhook_url: Optional[str] = None
     image_provider: Optional[str] = None
     anthropic_api_key: Optional[str] = None
@@ -677,6 +725,9 @@ def api_settings(s: SettingsIn, request: Request):
     if s.pollinations_private is not None: user_settings["pollinations_private"] = bool(s.pollinations_private)
     if s.pollinations_nologo is not None: user_settings["pollinations_nologo"] = bool(s.pollinations_nologo)
     if s.pollinations_base_url: user_settings["pollinations_base_url"] = s.pollinations_base_url.strip().rstrip("/")
+    if s.diffusers_model: user_settings["diffusers_model"] = s.diffusers_model.strip()
+    if s.diffusers_steps is not None: user_settings["diffusers_steps"] = int(s.diffusers_steps)
+    if s.diffusers_guidance is not None: user_settings["diffusers_guidance"] = float(s.diffusers_guidance)
 
     vault[email] = user_settings
     save_vault(vault)
@@ -686,7 +737,7 @@ def api_settings(s: SettingsIn, request: Request):
         "has_api_key": bool(user_settings.get("api_key")),
         "has_image_key": (
             True
-            if user_settings.get("image_provider") == "pollinations"
+            if user_settings.get("image_provider") in ("pollinations", "local")
             else bool(user_settings.get("ninerouter_api_key"))
             if user_settings.get("image_provider") == "9router"
             else bool(user_settings.get("api_key"))

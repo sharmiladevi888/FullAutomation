@@ -2369,6 +2369,7 @@ Close-up of @Mira fixing a circuit board, sparks reflecting on her goggles
           <button class="prov-btn" id="imgProvDerouter" onclick="switchImageProvider('derouter')" style="font-size:11px; padding:4px 12px; border:1px solid var(--line); border-radius:6px; cursor:pointer; background:none; color:var(--ink)">derouter / OpenAI</button>
           <button class="prov-btn" id="imgProv9router" onclick="switchImageProvider('9router')" style="font-size:11px; padding:4px 12px; border:1px solid var(--line); border-radius:6px; cursor:pointer; background:none; color:var(--ink)">9Router</button>
           <button class="prov-btn" id="imgProvPollinations" onclick="switchImageProvider('pollinations')" style="font-size:11px; padding:4px 12px; border:1px solid var(--line); border-radius:6px; cursor:pointer; background:none; color:var(--teal,#3fdc8c)">🆓 Pollinations</button>
+          <button class="prov-btn" id="imgProvLocal" onclick="switchImageProvider('local')" style="font-size:11px; padding:4px 12px; border:1px solid var(--line); border-radius:6px; cursor:pointer; background:none; color:var(--amber,#f0ac6b)">💻 Local (diffusers)</button>
         </div>
 
         <!-- derouter / OpenAI image section -->
@@ -2464,6 +2465,34 @@ Close-up of @Mira fixing a circuit board, sparks reflecting on her goggles
           <div class="fld" style="display:flex; gap:10px; flex-wrap:wrap">
             <button class="btn sm" onclick="connectPollinationsImage()">🎨 Use Pollinations (free)</button>
           </div>
+        </div>
+
+        <!-- Local diffusers image section (100% free, runs on this machine) -->
+        <div id="imgLocalSection" style="display:none">
+          <div id="imgLocalStatus" class="pill" style="margin-top:8px; width:max-content"><span class="dot"></span><span>checking...</span></div>
+          <p class="sub" style="font-size:11px; color:var(--muted); margin:6px 0 8px">
+            <strong style="color:var(--amber,#f0ac6b)">100% free, runs on YOUR machine</strong> via HuggingFace diffusers. No API key, no internet at inference time once the model is downloaded, no per-image cost.
+            <br><span style="color:var(--red)">One-time install:</span> <code style="font-family:var(--mono); background:var(--bg2); padding:1px 6px; border-radius:3px">pip install diffusers transformers accelerate safetensors</code> + a torch build matching your GPU.
+            <br><span style="color:var(--amber-soft)">Caveat:</span> first generate() downloads the model (~5 GB for SDXL-Turbo) into <code style="font-family:var(--mono)">data/diffusers_models/</code>. GPU is strongly recommended; CPU works but is ~10× slower.
+          </p>
+          <div class="fld"><label class="label">Model</label>
+            <select id="setDiffusersModel">
+              <option value="sdxl-turbo">SDXL Turbo (1-step, fastest — batch-friendly, ~5 GB)</option>
+              <option value="sdxl-base">Stable Diffusion XL (25-50 steps, high quality, ~7 GB)</option>
+              <option value="flux-schnell">FLUX.1-schnell (4 steps, best free local quality, ~24 GB)</option>
+            </select>
+          </div>
+          <details style="margin-top:6px">
+            <summary style="cursor:pointer; font-family:var(--mono); font-size:11px; letter-spacing:.06em; color:var(--faint)">Advanced (steps, guidance)</summary>
+            <div class="fld"><label class="label">Steps <span class="opt-note">default per model: turbo=1, sdxl=30, flux=4</span></label>
+              <input type="number" id="setDiffusersSteps" min="1" max="100" step="1" placeholder="auto" /></div>
+            <div class="fld"><label class="label">Guidance scale <span class="opt-note">turbo/flux=0, sdxl=7.5</span></label>
+              <input type="number" id="setDiffusersGuidance" min="0" max="20" step="0.1" placeholder="auto" /></div>
+          </details>
+          <div class="fld" style="display:flex; gap:10px; flex-wrap:wrap">
+            <button class="btn sm" onclick="connectLocalImage()">💻 Use local model (free)</button>
+          </div>
+          <div id="imgLocalInstall" style="display:none; background:rgba(255,170,0,.08); border:1px solid rgba(255,170,0,.3); border-radius:8px; padding:8px; font-size:12px; margin-top:8px; white-space:pre-wrap"></div>
         </div>
       </div>
 
@@ -3324,6 +3353,7 @@ async function load(){
 function hasImageKey(){
   if(!CFG) return false;
   if(CFG.image_provider==="pollinations") return true;   // no key required
+  if(CFG.image_provider==="local") return true;          // local model, no key required
   if(CFG.image_provider==="9router") return !!CFG.has_ninerouter_key;
   return !!CFG.has_api_key;
 }
@@ -3415,33 +3445,54 @@ async function switchImageProvider(p){
   }catch(e){ toast(e.message,"err"); }
   renderImageProviderUI();
   refreshProviderUI();
-  const labels={derouter:"derouter / OpenAI","9router":"9Router (local)","pollinations":"Pollinations (free, no key)"};
+  const labels={derouter:"derouter / OpenAI","9router":"9Router (local)","pollinations":"Pollinations (free, no key)","local":"Local diffusers (free, runs on this machine)"};
   toast("Image provider → "+(labels[p]||p),"ok");
 }
 function renderImageProviderUI(){
   const p=CFG.image_provider||"derouter";
-  const btnMap={derouter:"imgProvDerouter","9router":"imgProv9router","pollinations":"imgProvPollinations"};
+  const btnMap={derouter:"imgProvDerouter","9router":"imgProv9router","pollinations":"imgProvPollinations","local":"imgProvLocal"};
+  const accent={derouter:"var(--amber-soft)",pollinations:"var(--teal,#3fdc8c)",local:"var(--amber,#f0ac6b)"};
   Object.keys(btnMap).forEach(k=>{
     const b=$("#"+btnMap[k]); if(!b) return;
     const on=p===k;
-    b.style.background=on?(k==="pollinations"?"rgba(63,220,140,.18)":"rgba(255,122,24,.18)"):"none";
-    b.style.color=on?(k==="pollinations"?"var(--teal,#3fdc8c)":"var(--amber-soft)"):(k==="pollinations"?"var(--teal,#3fdc8c)":"var(--ink)");
-    b.style.boxShadow=on?(k==="pollations"?"inset 0 -2px 0 var(--teal,#3fdc8c)":"inset 0 -2px 0 var(--amber-soft)"):"none";
+    const col = accent[k] || "var(--amber-soft)";
+    b.style.background=on?col.replace(")",",.18)").replace("rgb","rgba"):"none";
+    b.style.color=on?col:(k==="derouter"?"var(--ink)":col);
+    b.style.boxShadow=on?("inset 0 -2px 0 "+col):"none";
   });
-  const ds=$("#imgDerouterSection"), ns=$("#img9routerSection"), ps=$("#imgPollinationsSection");
+  const ds=$("#imgDerouterSection"), ns=$("#img9routerSection"), ps=$("#imgPollinationsSection"), ls=$("#imgLocalSection");
   if(ds) ds.style.display=p==="derouter"?"block":"none";
   if(ns) ns.style.display=p==="9router"?"block":"none";
   if(ps) ps.style.display=p==="pollinations"?"block":"none";
+  if(ls) ls.style.display=p==="local"?"block":"none";
   if(p==="9router"){
     if($("#set9rImgBase") && !$("#set9rImgBase").value) $("#set9rImgBase").value=CFG.ninerouter_image_base_url||"http://localhost:20128/v1";
     if($("#set9rImgModel") && !$("#set9rImgModel").value) $("#set9rImgModel").value=CFG.ninerouter_image_model||"gpt-image-2";
     if(CFG.has_ninerouter_key){ const db=$("#disconnect9routerImgBtn"); if(db) db.style.display="inline-flex"; }
   }
   if(p==="pollinations"){
-    // Restore form fields from CFG so switching back doesn't lose settings.
     if($("#setPollinationsModel") && CFG.pollinations_model) $("#setPollinationsModel").value = CFG.pollinations_model;
     if($("#setPollinationsEnhance")) $("#setPollinationsEnhance").checked = !!CFG.pollinations_enhance;
     if($("#setPollinationsPrivate"))  $("#setPollinationsPrivate").checked  = !!CFG.pollinations_private;
+  }
+  if(p==="local"){
+    // Probe install state and show install banner if needed.
+    const inst = $("#imgLocalInstall");
+    if(inst){
+      if(CFG.diffusers_available === false){
+        inst.style.display = "block";
+        inst.textContent = "⚠ diffusers not installed. Run ONCE:\n    pip install diffusers transformers accelerate safetensors\n(+ torch matching your GPU). See README for details.";
+      } else if(CFG.diffusers_available === true){
+        inst.style.display = "none";
+      }
+    }
+    if($("#setDiffusersModel") && CFG.diffusers_model) $("#setDiffusersModel").value = CFG.diffusers_model;
+    const st = $("#imgLocalStatus");
+    if(st){
+      st.innerHTML = CFG.diffusers_available
+        ? `<span class="dot ok"></span><span>diffusers installed · ready</span>`
+        : `<span class="dot" style="background:var(--amber)"></span><span>diffusers not installed</span>`;
+    }
   }
 }
 async function refresh9routerImageModels(){
@@ -3464,6 +3515,29 @@ async function refresh9routerImageModels(){
       toast("No image models listed — try gpt-image-2 and Connect to verify","");
     }
   }catch(e){ if(hint) hint.textContent=e.message; toast(e.message,"err"); }
+}
+async function connectLocalImage(){
+  // No key — just persist the chosen model + flags and flip the
+  // active provider to "local" (diffusers). First generate() will trigger
+  // the model download.
+  const body = {
+    image_provider: "local",
+    diffusers_model: ($("#setDiffusersModel").value || "sdxl-turbo"),
+  };
+  const steps = parseInt($("#setDiffusersSteps").value);
+  if(!isNaN(steps) && steps > 0) body.diffusers_steps = steps;
+  const guide = parseFloat($("#setDiffusersGuidance").value);
+  if(!isNaN(guide) && guide >= 0) body.diffusers_guidance = guide;
+  try{
+    const d = await api("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    CFG.image_provider = d.image_provider || "local";
+    CFG.diffusers_model = body.diffusers_model;
+    renderImageProviderUI();
+    refreshProviderUI();
+    const size = (CFG.diffusers_models.find(m=>m.id===body.diffusers_model)||{}).approx_size_gb || "?";
+    toast("Local diffusers ready · "+body.diffusers_model+" (~"+size+" GB will download on first use)","ok");
+    confettiBurst();
+  }catch(e){ toast(e.message,"err"); }
 }
 async function connectPollinationsImage(){
   // Pollinations needs no key — just persist the chosen model + flags
@@ -5557,6 +5631,9 @@ async function saveSettings(){
     if(d.pollinations_enhance!==undefined) CFG.pollinations_enhance=d.pollinations_enhance;
     if(d.pollinations_private !==undefined) CFG.pollinations_private =d.pollinations_private;
     if(d.pollinations_nologo  !==undefined) CFG.pollinations_nologo  =d.pollinations_nologo;
+    if(d.diffusers_model) CFG.diffusers_model=d.diffusers_model;
+    if(d.diffusers_models) CFG.diffusers_models=d.diffusers_models;
+    if(d.diffusers_available!==undefined) CFG.diffusers_available=d.diffusers_available;
     CFG.claude_base_url=body.claude_base_url; CFG.claude_model=body.claude_model; CFG.has_claude_key=d.has_claude_key;
     if(d.has_anthropic_key!==undefined) CFG.has_anthropic_key=d.has_anthropic_key;
     if(d.claude_provider) CFG.claude_provider=d.claude_provider;
